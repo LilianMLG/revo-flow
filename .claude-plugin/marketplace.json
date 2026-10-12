@@ -1,0 +1,5 @@
+{
+  "name": "revo-flow",
+  "owner": { "name": "Lilian Malinge" },
+  "plugins": [{ "name": "revo-flow", "source": "./" }]
+}
