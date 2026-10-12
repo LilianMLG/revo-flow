@@ -4,15 +4,31 @@ Mod Claude Code qui orchestre une demande avec une équipe de sous-agents, et mo
 
 ## Installation
 
-Dans une session Claude Code **en terminal** :
+Rien à télécharger : Claude Code récupère le dépôt tout seul depuis GitHub. Deux façons, au choix.
+
+**Depuis une session Claude Code en terminal :**
 
 ```
 /plugin install revo-flow --marketplace LilianMLG/revo-flow
 ```
 
-Réponds `y` pour ajouter le marketplace, puis choisis la portée **user** (Entrée). Le mod est actif tout de suite, et dans chaque nouvelle session, terminal comme app desktop.
+Réponds `y` pour ajouter le marketplace, puis Entrée pour la portée **user**. Le mod est actif tout de suite.
 
-Mise à jour : `/plugin marketplace update revo-flow`, puis `/reload-plugins`.
+**Depuis n'importe quel terminal (PowerShell, bash…), sans ouvrir Claude :**
+
+```
+claude plugin marketplace add LilianMLG/revo-flow
+claude plugin install revo-flow@revo-flow
+```
+
+Dans les deux cas, le mod est ensuite chargé dans chaque nouvelle session, en terminal comme dans l'app desktop.
+
+**Mise à jour :**
+
+```
+claude plugin marketplace update revo-flow
+claude plugin update revo-flow@revo-flow
+```
 
 ## Utilisation
 
