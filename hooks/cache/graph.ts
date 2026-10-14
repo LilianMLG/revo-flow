@@ -54,10 +54,17 @@ export const EXCLUS_DEFAUT: string[] = [
   'playwright-report/',
   'test-results/',
   '*.min.js',
+  '.dart_tool/',
+  '*.g.dart',
+  '*.freezed.dart',
+  '*.mocks.dart',
 ]
 
-/** Les extensions indexées : code, gabarits GraphQL et docs. */
-export const SOURCE_EXT = /\.(vue|ts|tsx|js|jsx|mjs|cjs|graphql|gql|md)$/i
+/** Les extensions indexées : code (dont Dart), gabarits GraphQL et docs. */
+export const SOURCE_EXT = /\.(vue|ts|tsx|js|jsx|mjs|cjs|dart|graphql|gql|md)$/i
+
+/** Version du format de la couche mécanique : un graphe d'une autre version est reconstruit en entier (fiches gardées). */
+export const MECA_FORMAT = 2
 
 /** Chemin relatif, séparateur /, sans ./ de tête. */
 const norm = (p: string) => p.replace(/\\/g, '/').replace(/^(\.\/)+/, '')
@@ -123,14 +130,37 @@ const DIR_KIND: Record<string, NodeKind> = {
   docs: 'doc',
 }
 
+/** Dossiers d'une app Flutter, cherchés du plus profond au moins profond sous lib/ (lib/features/x/presentation/widgets/…). */
+const DART_DIR_KIND: Record<string, NodeKind> = {
+  ...DIR_KIND,
+  lib: 'autre',
+  screens: 'page',
+  pages: 'page',
+  widgets: 'composant',
+  providers: 'store',
+  notifiers: 'store',
+  blocs: 'store',
+  bloc: 'store',
+  domain: 'service',
+  data: 'service',
+  entities: 'type',
+}
+
 /** Le type d'un fichier, d'après son chemin. */
 export function kindOf(p: string): NodeKind {
   const l = norm(p).toLowerCase()
   if (l.endsWith('.md')) return 'doc'
-  if (/(^|\/)(tests?|__tests__|e2e|specs?)\//.test(l) || /\.(spec|test|e2e)\.[cm]?[jt]sx?$/.test(l)) return 'test'
+  if (/(^|\/)(tests?|__tests__|e2e|specs?|integration_test)\//.test(l) || /\.(spec|test|e2e)\.[cm]?[jt]sx?$/.test(l) || l.endsWith('_test.dart')) return 'test'
   if (/\.(graphql|gql)$/.test(l)) return 'gql'
   if (l.endsWith('.d.ts')) return 'type'
   const segs = l.split('/')
+  if (l.endsWith('.dart')) {
+    for (let i = segs.length - 2; i >= 0; i--) {
+      const k = DART_DIR_KIND[segs[i]!]
+      if (k && k !== 'autre') return k
+    }
+    return 'autre'
+  }
   if (segs.length === 1) return /config|rc\.|^\./.test(l) ? 'config' : 'autre'
   const top = SRC_DIRS.has(segs[0]!) && segs.length > 2 ? segs[1]! : segs[0]!
   return DIR_KIND[top] ?? 'autre'
@@ -186,8 +216,43 @@ export function projectKey(racine: string): string {
   return `${slug(base) || 'projet'}-${hashPath(racine)}`
 }
 
-/** « Nuxt 3, Pinia, Apollo, Vuetify, vitest » d'après package.json et la liste des fichiers. */
-export function detectStack(pkgJson: string | undefined, files: string[]): string {
+/** Le nom du paquet d'un pubspec.yaml (`name: router_app`), qui préfixe ses imports `package:router_app/…`. */
+export function dartPackageOf(pubspec: string | undefined): string | undefined {
+  return /^name:\s*['"]?([A-Za-z_]\w*)/m.exec(pubspec ?? '')?.[1]
+}
+
+/** Les dépendances d'un pubspec.yaml (dependencies et dev_dependencies), sans parseur YAML : clés indentées sous ces sections. */
+function pubspecDeps(pubspec: string): Set<string> {
+  const deps = new Set<string>()
+  let inDeps = false
+  for (const line of pubspec.split(/\r?\n/)) {
+    if (/^\S/.test(line)) inDeps = /^(dev_)?dependencies\s*:/.test(line)
+    else if (inDeps) {
+      const m = /^ {1,4}([A-Za-z_]\w*)\s*:/.exec(line)
+      if (m) deps.add(m[1]!)
+    }
+  }
+  return deps
+}
+
+/** « Flutter, Riverpod, Supabase » d'après pubspec.yaml. */
+function dartStack(pubspec: string): string[] {
+  const deps = pubspecDeps(pubspec)
+  const has = (...n: string[]) => n.some(x => deps.has(x))
+  const out = [has('flutter') ? 'Flutter' : 'Dart']
+  if (has('flutter_riverpod', 'hooks_riverpod', 'riverpod')) out.push('Riverpod')
+  if (has('flutter_bloc', 'bloc')) out.push('Bloc')
+  if (has('provider')) out.push('Provider')
+  if (has('go_router')) out.push('go_router')
+  if (has('supabase_flutter', 'supabase')) out.push('Supabase')
+  if (has('firebase_core')) out.push('Firebase')
+  if (has('freezed')) out.push('freezed')
+  if (has('mocktail', 'mockito')) out.push(has('mocktail') ? 'mocktail' : 'mockito')
+  return out
+}
+
+/** « Nuxt 3, Pinia, Apollo, Vuetify, vitest » d'après package.json et la liste des fichiers ; « Flutter, Riverpod » d'après pubspec.yaml. */
+export function detectStack(pkgJson: string | undefined, files: string[], pubspec?: string): string {
   let deps: Record<string, string> = {}
   try {
     const j = JSON.parse(pkgJson ?? '{}') as { dependencies?: Record<string, string>; devDependencies?: Record<string, string> }
@@ -228,6 +293,7 @@ export function detectStack(pkgJson: string | undefined, files: string[]): strin
   if (has('jest')) out.push('Jest')
   if (has('@playwright/test') || has('playwright')) out.push('Playwright')
   if (has('cypress')) out.push('Cypress')
+  if (pubspec !== undefined) out.unshift(...dartStack(pubspec))
   return out.length ? out.join(', ') : 'inconnue'
 }
 // ── L'indexeur : définitions (1re passe) ─────────────────────────────────
@@ -251,10 +317,19 @@ const GQL_OP = /\b(query|mutation|subscription)\s+([A-Za-z_]\w*)\s*[({@]/g
 
 type Defs = { exp: string[]; ops: { op: string; c?: string }[] }
 
+/** Déclarations publiques de premier niveau d'un fichier Dart (colonne 0, comme `dart format` les pose) : types, variables, fonctions. */
+const DART_TYPE_DECL = /^(?:(?:abstract|sealed|final|base|interface|mixin)\s+)*(?:class|enum|mixin|extension\s+type|extension|typedef)\s+([A-Za-z]\w*)/gm
+const DART_VAR_DECL = /^(?:final|const|late\s+final|var)\s+(?:[\w<>?,. ]+?\s+)?([A-Za-z]\w*)\s*=/gm
+const DART_FUN_DECL = /^(?!(?:import|export|part|library|return|if|for|while|switch)\b)(?:[\w<>?][\w<>?,. ]*?\s+)?([A-Za-z]\w*)\s*(?:<[^<>()]*>)?\(/gm
+
 /** Noms exportés et opérations GraphQL déclarées par un fichier. */
 function scanDefs(p: string, text: string): Defs {
   const exp = new Set<string>()
   const ops: Defs['ops'] = []
+  if (/\.dart$/i.test(p)) {
+    for (const re of [DART_TYPE_DECL, DART_VAR_DECL, DART_FUN_DECL]) for (const m of text.matchAll(re)) if (m[1] !== 'on') exp.add(m[1]!)
+    return { exp: [...exp], ops }
+  }
   if (/\.(vue|[cm]?[jt]sx?)$/i.test(p)) {
     for (const m of text.matchAll(EXPORT_DECL)) exp.add(m[1]!)
     for (const m of text.matchAll(EXPORT_LIST))
@@ -303,6 +378,8 @@ type Ctx = {
   /** Middlewares : nom → fichier. */
   mw: Map<string, string>
   pagesDir: string
+  /** Nom du paquet Dart du projet (pubspec.yaml), pour résoudre `package:<nom>/…` vers lib/. */
+  dart?: string
 }
 
 /** srcDir Nuxt : '' ou 'src/' ou 'app/', d'après l'emplacement de pages/, components/, store/… */
@@ -325,7 +402,7 @@ function componentNames(rel: string): string[] {
   return [...new Set([full, fileWords.join('')])]
 }
 
-function makeCtx(files: Record<string, FileNode>, noeuds: Record<string, GraphNode>, stack: string, exclus: string[]): Ctx {
+function makeCtx(files: Record<string, FileNode>, noeuds: Record<string, GraphNode>, stack: string, exclus: string[], dart?: string): Ctx {
   const paths = Object.keys(files)
   const src = srcDirOf(paths)
   const compDir = `${src}components/`
@@ -373,7 +450,7 @@ function makeCtx(files: Record<string, FileNode>, noeuds: Record<string, GraphNo
     const m = mwRe.exec(p)
     if (m) mw.set(m[1]!, p)
   }
-  return { files, src, exclus, comp, auto, vuex, gql, mw, pagesDir: `${src}pages/` }
+  return { files, src, exclus, comp, auto, vuex, gql, mw, pagesDir: `${src}pages/`, ...(dart ? { dart } : {}) }
 }
 // ── L'indexeur : arêtes d'un fichier ─────────────────────────────────────
 
@@ -392,6 +469,7 @@ const API_RE =
   /(?:\$fetch|\bfetch|\buseFetch|\buseLazyFetch|\$?axios|\$http|\bhttp|\bapi|\bapiClient)(?:\.\$?(get|post|put|patch|delete|head))?\s*(?:<[^<>()]*>)?\(\s*(['"`])([^'"`\n]*?)\2/g
 const MIDDLEWARE_RE = /\bmiddleware\s*:\s*(\[[^\]]*\]|['"][\w-]+['"])/g
 const DOC_REF = /`([^`\s]+)`|\]\(([^)\s]+)\)/g
+const DART_IMPORT_RE = /^\s*(?:import|export|part(?:\s+of)?)\s+['"]([^'"\n]+)['"]/gm
 
 function joinPath(dir: string, rel: string): string {
   const out = dir ? dir.split('/') : []
@@ -417,6 +495,18 @@ function resolveSpec(from: string, spec: string, ctx: Ctx): string | undefined {
   if (base.endsWith('.js') && ctx.files[`${base.slice(0, -3)}.ts`]) return `${base.slice(0, -3)}.ts`
   if (isExcluded(`${base}/`, ctx.exclus) || isExcluded(base, ctx.exclus)) return `x:${base.split('/').slice(0, 2).join('/')}`
   return undefined
+}
+
+/** Résout un import Dart : `package:<paquet du projet>/x.dart` → lib/x.dart, relatif → à côté ; dart:, autres paquets → rien. */
+function resolveDart(from: string, spec: string, ctx: Ctx): string | undefined {
+  const pkg = /^package:(\w+)\/(.+)$/.exec(spec)
+  let base: string
+  if (pkg) {
+    if (pkg[1] !== ctx.dart) return undefined
+    base = `lib/${pkg[2]}`
+  } else if (/^[a-z][\w+.-]*:/i.test(spec)) return undefined
+  else base = joinPath(dirOf(from), spec)
+  return ctx.files[base] ? base : undefined
 }
 
 /** Les noms importés par une clause : [nom d'origine, nom local] (« default » pour l'import par défaut). */
@@ -505,6 +595,13 @@ function parseFile(p: string, text: string, ctx: Ctx): Parsed {
     }
     return { out: toEdges(e), nodes, guards }
   }
+  if (p.endsWith('.dart')) {
+    for (const m of text.matchAll(DART_IMPORT_RE)) {
+      const t = resolveDart(p, m[1]!, ctx)
+      if (t && t !== p) addEdge(e, 'importe', t)
+    }
+    return { out: toEdges(self.k === 'test' ? asTest(e, ctx) : e), nodes, guards }
+  }
   if (!/\.(vue|[cm]?[jt]sx?)$/i.test(p)) return { out: toEdges(e), nodes, guards }
 
   // Imports explicites ; une constante gql importée donne « appelle » vers l'opération
@@ -585,15 +682,15 @@ function parseFile(p: string, text: string, ctx: Ctx): Parsed {
   // Middlewares nommés par la page (definePageMeta({ middleware }) ou Options API)
   if (self.k === 'page') for (const m of text.matchAll(MIDDLEWARE_RE)) for (const s of m[1]!.matchAll(/['"]([\w-]+)['"]/g)) guards.push(s[1]!)
 
-  // Un test « teste » ce qu'il importe, utilise ou rend
-  if (self.k === 'test') {
-    const t = new Map<EdgeKind, Set<string>>()
-    for (const [k, set] of e)
-      for (const to of set)
-        addEdge(t, (k === 'importe' || k === 'utilise' || k === 'rend') && !to.includes(':') && ctx.files[to]?.k !== 'test' ? 'teste' : k, to)
-    return { out: toEdges(t), nodes, guards }
-  }
-  return { out: toEdges(e), nodes, guards }
+  return { out: toEdges(self.k === 'test' ? asTest(e, ctx) : e), nodes, guards }
+}
+
+/** Un test « teste » ce qu'il importe, utilise ou rend. */
+function asTest(e: Map<EdgeKind, Set<string>>, ctx: Ctx): Map<EdgeKind, Set<string>> {
+  const t = new Map<EdgeKind, Set<string>>()
+  for (const [k, set] of e)
+    for (const to of set) addEdge(t, (k === 'importe' || k === 'utilise' || k === 'rend') && !to.includes(':') && ctx.files[to]?.k !== 'test' ? 'teste' : k, to)
+  return t
 }
 // ── Assemblage du graphe ─────────────────────────────────────────────────
 
@@ -696,6 +793,7 @@ export function buildGraph(input: {
   nom: string
   files: SourceFile[]
   pkgJson?: string
+  pubspec?: string
   commit: string
   branche: string
   le: string
@@ -705,7 +803,8 @@ export function buildGraph(input: {
 }): Graph {
   const prev = input.prev ?? undefined
   const exclus = input.exclus ?? prev?.projet.exclus ?? EXCLUS_DEFAUT
-  const stack = detectStack(input.pkgJson, input.files.map(f => f.p))
+  const stack = detectStack(input.pkgJson, input.files.map(f => f.p), input.pubspec)
+  const dart = dartPackageOf(input.pubspec)
   const files = input.files.map(f => ({ ...f, p: norm(f.p) })).filter(f => isIndexable(f.p, exclus))
   const g: Graph = {
     v: 1,
@@ -715,6 +814,8 @@ export function buildGraph(input: {
       racine: input.racine,
       nom: input.nom,
       stack,
+      format: MECA_FORMAT,
+      ...(dart ? { dart } : {}),
       ...(prev?.projet.conventions ? { conventions: prev.projet.conventions } : {}),
       indexe: { commit: input.commit, branche: input.branche, le: input.le, fichiers: 0, tok: 0 },
       exclus,
@@ -734,7 +835,7 @@ export function buildGraph(input: {
     g.fichiers[f.p] = n
     addOps(g, f.p, d.ops)
   }
-  const ctx = makeCtx(g.fichiers, g.noeuds, stack, exclus)
+  const ctx = makeCtx(g.fichiers, g.noeuds, stack, exclus, dart)
   const guards = new Map<string, string[]>()
   for (const f of files) {
     const r = parseFile(f.p, f.text, ctx)
@@ -805,7 +906,7 @@ export function updateFiles(
     g.fichiers[f.p] = n
     addOps(g, f.p, d.ops)
   }
-  const c = makeCtx(g.fichiers, g.noeuds, g.projet.stack, g.projet.exclus)
+  const c = makeCtx(g.fichiers, g.noeuds, g.projet.stack, g.projet.exclus, g.projet.dart)
   const guards = new Map<string, string[]>()
   for (const f of files) {
     const r = parseFile(f.p, f.text, c)
@@ -1532,7 +1633,9 @@ export function neighborsText(graph: Graph, p: string, depth = 1): string {
   }
   const list = (arr: string[]) => arr.slice(0, 20).map(item).join(', ') + (arr.length > 20 ? ` … et ${arr.length - 20} autres` : '')
   const L = [
-    `Voisins de ${key} (${desc}) — liste indicative : imports, auto-imports Nuxt, Vuex par chaîne et balises résolus ; <component :is>, provide/inject et apollo: {} non vus.`,
+    graph.projet.dart
+      ? `Voisins de ${key} (${desc}) — liste indicative : imports package:${graph.projet.dart}/ et relatifs résolus ; fichiers générés (*.g.dart, *.freezed.dart) exclus, providers lus par ref.watch non vus.`
+      : `Voisins de ${key} (${desc}) — liste indicative : imports, auto-imports Nuxt, Vuex par chaîne et balises résolus ; <component :is>, provide/inject et apollo: {} non vus.`,
   ]
   if (n?.exp?.length) L.push(`Exporte : ${n.exp.slice(0, 15).join(', ')}${n.exp.length > 15 ? '…' : ''}`)
   if (n?.sum) L.push(`Résumé : ${n.sum}`)

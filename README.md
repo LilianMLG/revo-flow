@@ -64,7 +64,7 @@ Sans `/revo-flow`, le mod ne fait rien.
 
 revo-flow garde pour chaque projet un **graphe de connaissances** dans `~/.claude/revo-flow/graphs/<front-projet>.json`, hors des dépôts.
 
-- **Couche mécanique**, sans LLM : fichiers, imports (alias, auto-imports Nuxt 3, Vuex par chaîne, balises de composants), routes, stores, opérations GraphQL, endpoints, tests et docs. Reconstruite en 1 à 2 s, vérifiée par hash git à chaque usage.
+- **Couche mécanique**, sans LLM : fichiers, imports (alias, auto-imports Nuxt 3, Vuex par chaîne, balises de composants ; en Dart, `package:<projet>/` et relatifs, avec la stack lue dans `pubspec.yaml`), routes, stores, opérations GraphQL, endpoints, tests et docs. Reconstruite en 1 à 2 s, vérifiée par hash git à chaque usage ; un graphe d'un format plus ancien est reconstruit tout seul, fiches gardées.
 - **Fiches de feature**, écrites par un modèle : résumé, flux, points d'entrée, fichiers et rôles, pièges, confiance. Apprises par l'orchestrateur **à la fin de chaque flow** (≈ 0,02 €), ou construites à la demande par `cache build` (≈ 0,20 €). Une fiche périmée n'est jamais supprimée : elle signale les fichiers modifiés depuis, et masque son flux au-delà de 50 % de changements.
 
 **Au lancement de `/revo-flow <demande>`** : si une fiche correspond à la demande, un dialogue propose **Utiliser** ou **Ignorer** (sous `claude -p`, elle est utilisée). Un brief d'au plus 1 200 tokens est alors injecté à l'orchestrateur, qui transmet lui-même les extraits utiles à ses sous-agents. Le brief est une carte, pas la vérité : l'orchestrateur vérifie dans le code ce qu'il modifie. Sans fiche, seule la liste des features connues part (≈ 200 tokens).

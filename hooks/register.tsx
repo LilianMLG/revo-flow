@@ -20,7 +20,7 @@ import {
   servedFiles,
   tokensOf,
 } from './cache/graph'
-import { buildMechanical, deleteGraph, fileTokens, listGraphs, loadGraph, refreshGraph, resolveProject, saveGraph, type Io } from './cache/store'
+import { buildMechanical, deleteGraph, fileTokens, isOutdated, listGraphs, loadGraph, refreshGraph, resolveProject, saveGraph, type Io } from './cache/store'
 import {
   CACHE_TOOL,
   EMPTY,
@@ -454,7 +454,9 @@ async function graphOf($: $, ref: ProjectRef, opt: { build?: boolean; force?: bo
   const held = graphCache.get(ref.cle)
   if (held && !opt.force && now - held.refreshedAt < REFRESH_MS) return held.graph
   let graph = (await loadGraph(ioOf($), ref).catch(() => null)) ?? held?.graph ?? null
-  if (graph) {
+  if (graph && isOutdated(graph)) {
+    graph = await saveGraph(ioOf($), await buildMechanical(ioOf($), ref, graph))
+  } else if (graph) {
     const r = await refreshGraph(ioOf($), graph)
     graph = r.graph
     if (r.changed.length || r.removed.length) graph = await saveGraph(ioOf($), r.graph).catch(() => r.graph)

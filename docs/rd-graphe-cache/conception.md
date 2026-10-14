@@ -97,7 +97,7 @@ On s'arrête au fichier : pas de nœud par fonction. Les exports (noms seulement
 
 | Arête | Sens | Comment on la trouve |
 |---|---|---|
-| `importe` | fichier → fichier | `import … from`, `import()`, alias `~/` `@/` `~~/` et chemins relatifs, extensions .ts/.js/.vue/index |
+| `importe` | fichier → fichier | `import … from`, `import()`, alias `~/` `@/` `~~/` et chemins relatifs, extensions .ts/.js/.vue/index ; Dart : `import`/`export`/`part` en `package:<nom du pubspec>/` (→ lib/) ou relatifs |
 | `rend` | page/composant → composant | import d'un `.vue` ou balise `<PascalCase>` / `<kebab-case>` résolue sur components/ (règle de préfixe de dossier Nuxt) |
 | `utilise` | fichier → composable/store/util | auto-imports Nuxt 3 (nom exporté par composables/, utils/, stores/ puis appel `nom(`), Vuex par chaîne (`'module/…'`), `mixins: [...]` |
 | `appelle` | service/store → gql ou api | identifiant importé depuis graphql/ (`mutationSaveBasket` → `q:saveBasket`), URL littérale `fetch`/axios |

@@ -79,6 +79,10 @@ export type Graph = {
     racine: string
     nom: string
     stack: string
+    /** Version du format de la couche mécanique (MECA_FORMAT) ; absente = 1. */
+    format?: number
+    /** Nom du paquet Dart (pubspec.yaml), quand le projet en a un. */
+    dart?: string
     conventions?: string
     indexe: { commit: string; branche: string; le: string; fichiers: number; tok: number }
     exclus: string[]

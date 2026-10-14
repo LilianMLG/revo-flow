@@ -27,6 +27,7 @@ import {
   servedFiles,
   tokensOf,
   updateFiles,
+  MECA_FORMAT,
 } from './graph'
 import type { Feature, FlowCache, Graph, LearnContext, SourceFile } from '../../types/cache'
 
@@ -509,6 +510,116 @@ test('graphText ≤ 60 lignes, candidatesFromLog par scope', () => {
 })
 
 // ── Bases ────────────────────────────────────────────────────────────────
+
+// ── Mini projet Flutter ──────────────────────────────────────────────────
+
+const PUBSPEC = `name: router_app
+description: "A new Flutter project."
+environment:
+  sdk: ^3.9.0
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_riverpod: ^3.0.0
+  supabase_flutter: ^2.9.0
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  mocktail: ^1.0.0
+`
+
+const FL: Record<string, string> = {
+  'lib/main.dart': `import 'package:flutter/material.dart';
+import 'package:router_app/features/map/presentation/screens/map_screen.dart';
+
+void main() => runApp(const MapScreen());
+`,
+  'lib/features/map/presentation/screens/map_screen.dart': `import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:other_pkg/features/map/domain/road_graph.dart';
+import '../providers/graph_providers.dart';
+import '../widgets/legend.dart' show Legend;
+
+class MapScreen extends ConsumerWidget {
+  const MapScreen({super.key});
+}
+`,
+  'lib/features/map/presentation/providers/graph_providers.dart': `import 'package:router_app/features/map/domain/road_graph.dart';
+part 'graph_providers.g.dart';
+
+final graphProvider = Provider<RoadGraph?>((ref) => null);
+`,
+  'lib/features/map/presentation/providers/graph_providers.g.dart': `part of 'graph_providers.dart';`,
+  'lib/features/map/presentation/widgets/legend.dart': `class Legend {}`,
+  'lib/features/map/domain/road_graph.dart': `import 'dart:math' as math;
+
+/// A graph.
+const double kRoadGraphToleranceM = 0.5;
+
+class RoadGraph {
+  RoadGraph(this.edges);
+  final List<int> edges;
+  int degree(int node) => 0;
+}
+
+sealed class RoadEvent {}
+
+enum RoadFlow { direct, inverse }
+
+extension on RoadGraph {}
+
+typedef Clock = DateTime Function();
+
+RoadGraph buildRoadGraph(List<int> sections, {double toleranceM = 0.5}) => RoadGraph(sections);
+
+List<RoadGraph> _private() => [];
+`,
+  'test/features/map/road_graph_test.dart': `import 'package:flutter_test/flutter_test.dart';
+import 'package:router_app/features/map/domain/road_graph.dart';
+
+void main() {}
+`,
+  '.dart_tool/flutter_build/x.dart': `void x() {}`,
+}
+
+test('buildGraph Flutter : pubspec, package: et relatifs, types de fichiers, exports, tests, générés exclus', () => {
+  const g = buildGraph({ cle: 'dev/router-app', racine: '/Users/x/Dev/router_app', nom: 'router_app', files: files(FL), pubspec: PUBSPEC, ...CTX })
+  expect(g.projet.stack).toBe('Flutter, Riverpod, Supabase, mocktail')
+  expect(g.projet.dart).toBe('router_app')
+  expect(g.projet.format).toBe(MECA_FORMAT)
+  expect(g.fichiers['lib/features/map/presentation/providers/graph_providers.g.dart']).toBeUndefined()
+  expect(g.fichiers['.dart_tool/flutter_build/x.dart']).toBeUndefined()
+  expect(g.fichiers['lib/main.dart']!.k).toBe('autre')
+  expect(g.fichiers['lib/features/map/presentation/screens/map_screen.dart']!.k).toBe('page')
+  expect(g.fichiers['lib/features/map/presentation/providers/graph_providers.dart']!.k).toBe('store')
+  expect(g.fichiers['lib/features/map/presentation/widgets/legend.dart']!.k).toBe('composant')
+  expect(g.fichiers['lib/features/map/domain/road_graph.dart']!.k).toBe('service')
+  expect(g.fichiers['test/features/map/road_graph_test.dart']!.k).toBe('test')
+
+  expect(g.fichiers['lib/main.dart']!.out!.importe).toEqual(['lib/features/map/presentation/screens/map_screen.dart'])
+  // other_pkg n'est pas le paquet du projet : son chemin homonyme dans lib/ n'est pas un import.
+  expect(g.fichiers['lib/features/map/presentation/screens/map_screen.dart']!.out!.importe!.sort()).toEqual([
+    'lib/features/map/presentation/providers/graph_providers.dart',
+    'lib/features/map/presentation/widgets/legend.dart',
+  ])
+  expect(g.fichiers['lib/features/map/presentation/providers/graph_providers.dart']!.out!.importe).toEqual(['lib/features/map/domain/road_graph.dart'])
+  expect(g.fichiers['test/features/map/road_graph_test.dart']!.out!.teste).toEqual(['lib/features/map/domain/road_graph.dart'])
+
+  expect(g.fichiers['lib/features/map/domain/road_graph.dart']!.exp!.sort()).toEqual(
+    ['Clock', 'RoadEvent', 'RoadFlow', 'RoadGraph', 'buildRoadGraph', 'kRoadGraphToleranceM'].sort(),
+  )
+  expect(g.fichiers['lib/features/map/presentation/providers/graph_providers.dart']!.exp).toEqual(['graphProvider'])
+
+  const n = neighbors(g, 'lib/features/map/domain/road_graph.dart')
+  expect(n.in.importe ?? []).toContain('lib/features/map/presentation/providers/graph_providers.dart')
+  expect([...(n.in.teste ?? []), ...n.tests]).toContain('test/features/map/road_graph_test.dart')
+
+  const { rejected } = learn(g, { feature: 'graphe', fichiers: [{ p: 'lib/features/map/domain/road_graph.dart' }] }, LEARN)
+  expect(rejected).toEqual([])
+
+  const u = updateFiles(g, [{ p: 'lib/features/map/presentation/widgets/legend.dart', h: 'h2', text: `import '../../domain/road_graph.dart';\nclass Legend {}` }], [], [], CTX)
+  expect(u.fichiers['lib/features/map/presentation/widgets/legend.dart']!.out!.importe).toEqual(['lib/features/map/domain/road_graph.dart'])
+})
 
 test('kindOf, isExcluded, detectStack, projectKey, hashPath', () => {
   expect(kindOf('components/a/B.vue')).toBe('composant')

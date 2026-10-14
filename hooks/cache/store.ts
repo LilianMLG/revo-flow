@@ -4,7 +4,7 @@
 import type { EngineInterface } from 'claude-code'
 
 import type { Graph, SourceFile } from '../../types/cache'
-import { EXCLUS_DEFAUT, buildGraph, isExcluded, isIndexable, projectKey, updateFiles } from './graph'
+import { EXCLUS_DEFAUT, MECA_FORMAT, buildGraph, isExcluded, isIndexable, projectKey, updateFiles } from './graph'
 
 type $ = EngineInterface
 
@@ -576,6 +576,9 @@ async function nowIso(io: Io): Promise<string> {
   return new Date(await io.now()).toISOString()
 }
 
+/** Le graphe vient-il d'un format plus ancien de la couche mécanique (extensions, résolution) : il faut le reconstruire. */
+export const isOutdated = (graph: Graph) => (graph.projet.format ?? 1) < MECA_FORMAT
+
 /**
  * Construit la couche mécanique d'un projet : fichiers retenus (isIndexable : exclusions, extensions ; moins de 4 Mio), package.json, commit, branche, historique git, puis buildGraph.
  * prev conserve les fiches. Sans git, on parcourt le dossier avec io.fs.list (hash = taille-mtime).
@@ -588,11 +591,14 @@ export async function buildMechanical(io: Io, ref: ProjectRef, prev?: Graph | nu
   } catch {
     throw new Error(`dossier illisible : ${racine}`)
   }
-  const exclus = prev?.projet.exclus ?? EXCLUS_DEFAUT
+  // Un graphe d'un ancien format reçoit les exclusions par défaut ajoutées depuis (*.g.dart…).
+  const kept = prev?.projet.exclus
+  const exclus = kept ? (isOutdated(prev!) ? [...new Set([...kept, ...EXCLUS_DEFAUT])] : kept) : EXCLUS_DEFAUT
   const { hashes, usesGit } = await diskState(io, racine, exclus)
   const paths = Object.keys(hashes).sort()
   const files = await readSources(io, racine, hashes, paths, onProgress)
   const pkg = await readTextSafe(io, `${racine}/package.json`)
+  const pubspec = await readTextSafe(io, `${racine}/pubspec.yaml`)
   const head = usesGit ? await headInfo(io, racine) : { commit: '', branche: '' }
   const log = usesGit ? (await git(io, racine, ['log', '-n', '500', '--pretty=format:%s', '--name-only'])).out : ''
   return buildGraph({
@@ -601,6 +607,7 @@ export async function buildMechanical(io: Io, ref: ProjectRef, prev?: Graph | nu
     nom: ref.nom,
     files,
     ...(pkg !== undefined ? { pkgJson: pkg } : {}),
+    ...(pubspec !== undefined ? { pubspec } : {}),
     commit: head.commit,
     branche: head.branche,
     le: await nowIso(io),
