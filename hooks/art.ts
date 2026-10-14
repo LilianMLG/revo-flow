@@ -143,6 +143,10 @@ export type BarOptions = {
   agents: number
   /** Toutes les étapes sont faites : la mascotte dort. */
   isDone?: boolean
+  /** Remplissage de la fenêtre de contexte, en %. */
+  context?: number
+  /** Le dernier prompt en une phrase courte (« 3,2k ↑ 850 ↓ · 0,04 € »), si la largeur le permet. */
+  lastPrompt?: string
 }
 
 type Tier = 'full' | 'compact' | 'tiny'
@@ -183,7 +187,19 @@ export function barSvg(stages: readonly BarStage[], o: BarOptions): string {
   const title = clip(o.title, tier === 'full' ? 30 : 12)
   const titleW = showTitle ? Math.min(title.length * 7.4, tier === 'full' ? 232 : 92) : 0
   const x0 = 16 + 8 + (showTitle ? 8 + titleW : 0) + 14
-  const x1 = (retryW > 0 ? retryX : pctRight - pctW + 6) - 12
+  const groupX = (retryW > 0 ? retryX : pctRight - pctW + 6) - 12
+  // Le contexte et le dernier prompt, à gauche du groupe de droite, seulement quand il reste de la place.
+  const ctxText = o.context !== undefined && tier !== 'tiny' ? `ctx ${Math.round(o.context)} %` : ''
+  const promptText = o.lastPrompt && W >= 900 ? o.lastPrompt : ''
+  const ctxW = ctxText ? Math.round(ctxText.length * 6.8) + 10 : 0
+  const promptW = promptText ? Math.round(promptText.length * 6.4) + 12 : 0
+  const x1 = groupX - ctxW - promptW
+  const ctxColor = (o.context ?? 0) >= 85 ? PALETTE.redText : (o.context ?? 0) >= 70 ? PALETTE.orange : PALETTE.muted
+  const extra =
+    (ctxText ? `<text x="${num(groupX)}" y="26" text-anchor="end" font-family="${MONO}" font-size="11" fill="${ctxColor}">${esc(ctxText)}</text>` : '') +
+    (promptText
+      ? `<text x="${num(groupX - ctxW)}" y="26" text-anchor="end" font-family="${MONO}" font-size="11" fill="${PALETTE.muted}">${esc(promptText)}</text>`
+      : '')
   const gap = 4
   const usable = Math.max(60, x1 - x0) - gap * (n - 1)
   const weights = stages.map((_, i) => (i === active ? (tier === 'full' ? 1.5 : 3) : 1))
@@ -240,7 +256,7 @@ export function barSvg(stages: readonly BarStage[], o: BarOptions): string {
   const count = `<text x="${num(countX)}" y="26" font-family="${MONO}" font-size="11" fill="${PALETTE.muted}">×${o.agents}</text>`
   const close = `<path d="M${closeX + 11} 18 l10 8 M${closeX + 21} 18 l-10 8" fill="none" stroke="${PALETTE.muted}" stroke-width="1.5" stroke-linecap="round"/>`
 
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}"><rect x=".5" y=".5" width="${W - 1}" height="${H - 1}" rx="22" fill="${PALETTE.bar}" stroke="${isError ? PALETTE.redBorder : PALETTE.border}"/>${left}${seg}${retry}${pct}${mascot}${count}${close}<title>${esc(`${o.title} — ${reached}/${n} étapes, ${Math.round(o.percent)} %`)}</title></svg>`
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}"><rect x=".5" y=".5" width="${W - 1}" height="${H - 1}" rx="22" fill="${PALETTE.bar}" stroke="${isError ? PALETTE.redBorder : PALETTE.border}"/>${left}${seg}${extra}${retry}${pct}${mascot}${count}${close}<title>${esc(`${o.title} — ${reached}/${n} étapes, ${Math.round(o.percent)} %`)}</title></svg>`
 }
 
 // ── Les cartes d'agent ───────────────────────────────────────────────────
@@ -252,11 +268,11 @@ export function modelPillSvg(text: string, color: string): string {
 }
 
 /** Une pastille d'état : « Review · 68 % », « Terminé · 100 % », « Échec · Review ». */
-export function statusPillSvg(text: string, tone: 'outline' | 'silver' | 'red'): string {
+export function statusPillSvg(text: string, tone: 'outline' | 'silver' | 'red' | 'orange'): string {
   const w = Math.round(text.length * 6.7 + 20)
   const fill = tone === 'silver' ? PALETTE.silver : tone === 'red' ? PALETTE.redBg : 'none'
-  const stroke = tone === 'silver' ? PALETTE.silver : tone === 'red' ? PALETTE.redBorder : PALETTE.border
-  const color = tone === 'silver' ? PALETTE.onSilver : tone === 'red' ? PALETTE.redText : PALETTE.text
+  const stroke = tone === 'silver' ? PALETTE.silver : tone === 'red' ? PALETTE.redBorder : tone === 'orange' ? PALETTE.orange : PALETTE.border
+  const color = tone === 'silver' ? PALETTE.onSilver : tone === 'red' ? PALETTE.redText : tone === 'orange' ? PALETTE.orange : PALETTE.text
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} 22" width="${w}" height="22"><rect x=".5" y=".5" width="${w - 1}" height="21" rx="10.5" fill="${fill}" stroke="${stroke}"/><text x="${w / 2}" y="15" text-anchor="middle" font-family="${FONT}" font-size="11" font-weight="600" fill="${color}">${esc(text)}</text></svg>`
 }
 
@@ -299,7 +315,8 @@ export function miniBarSvg(stages: readonly BarStage[], width: number, fraction 
 // ── Consommation ─────────────────────────────────────────────────────────
 
 /** La couleur d'une jauge selon son niveau : argent, orange dès 80 %, rouge dès 95 %. */
-export const gaugeTone = (percent: number) => (percent >= 95 ? 'red' : percent >= 80 ? 'orange' : 'silver')
+export const gaugeTone = (percent: number, warnAt: readonly [number, number] = [80, 95]) =>
+  percent >= warnAt[1] ? 'red' : percent >= warnAt[0] ? 'orange' : 'silver'
 
 /** Une jauge horizontale de 4 px. */
 export function gaugeSvg(percent: number, width: number): string {
@@ -366,12 +383,18 @@ export type AgentHead = {
   status: string
   tone: 'live' | 'wait' | 'done' | 'fail'
   width: number
+  /** « 3 m 12 », affiché avant l'état. */
+  duration?: string
+  /** Une alerte en orange, à côté de la durée : « inactif depuis 1 m 30 ». */
+  note?: string
 }
 
 /** La tête d'une carte d'agent : avatar, nom, pastille du modèle, état à droite. */
 export function agentHeadSvg(o: AgentHead): string {
   const W = Math.max(220, Math.round(o.width))
-  const reserve = 46 + Math.round(o.modelLabel.length * 6.9 + 18) + 8 + o.status.length * 6.2 + 28
+  const durW = o.duration ? o.duration.length * 6.6 + 10 : 0
+  const noteW = o.note ? o.note.length * 6.2 + 10 : 0
+  const reserve = 46 + Math.round(o.modelLabel.length * 6.9 + 18) + 8 + o.status.length * 6.2 + 28 + durW + noteW
   const name = clip(o.name, Math.max(6, Math.floor((W - reserve) / 7.4)))
   const nameW = name.length * 7.4
   const pillW = Math.round(o.modelLabel.length * 6.9 + 18)
@@ -383,8 +406,15 @@ export function agentHeadSvg(o: AgentHead): string {
     o.tone === 'wait'
       ? `<circle cx="${num(mx)}" cy="18" r="3" fill="none" stroke="${PALETTE.muted}" stroke-width="1.3"/>`
       : `<circle cx="${num(mx)}" cy="18" r="3" fill="${dot}">${o.tone === 'live' ? `<animate attributeName="opacity" values="1;.4;1" dur="1.8s" repeatCount="indefinite"/>` : ''}</circle>`
+  const durX = mx - 10
+  const duration = o.duration
+    ? `<text x="${num(durX)}" y="22" text-anchor="end" font-family="${MONO}" font-size="11" fill="${PALETTE.muted}">${esc(o.duration)}</text>`
+    : ''
+  const note = o.note
+    ? `<text x="${num(durX - durW)}" y="22" text-anchor="end" font-family="${FONT}" font-size="11" font-weight="600" fill="${PALETTE.orange}">${esc(o.note)}</text>`
+    : ''
   const avatar = avatarSvg(o.kind, o.tone === 'done').replace('<svg ', '<svg x="0" y="0" ')
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} 36" width="${W}" height="36">${avatar}<text x="46" y="23" font-family="${FONT}" font-size="13" font-weight="600" fill="${PALETTE.text}">${esc(name)}</text><svg x="${num(px)}" y="8" width="${pillW}" height="20" viewBox="0 0 ${pillW} 20"><rect x=".5" y=".5" width="${pillW - 1}" height="19" rx="9.5" fill="${o.modelColor}" fill-opacity=".1" stroke="${o.modelColor}" stroke-opacity=".3"/><text x="${pillW / 2}" y="14" text-anchor="middle" font-family="${FONT}" font-size="11" font-weight="500" fill="${o.modelColor}">${esc(o.modelLabel)}</text></svg>${marker}<text x="${W - 4}" y="22" text-anchor="end" font-family="${FONT}" font-size="11.5" fill="${color}">${esc(o.status)}</text></svg>`
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} 36" width="${W}" height="36">${avatar}<text x="46" y="23" font-family="${FONT}" font-size="13" font-weight="600" fill="${PALETTE.text}">${esc(name)}</text><svg x="${num(px)}" y="8" width="${pillW}" height="20" viewBox="0 0 ${pillW} 20"><rect x=".5" y=".5" width="${pillW - 1}" height="19" rx="9.5" fill="${o.modelColor}" fill-opacity=".1" stroke="${o.modelColor}" stroke-opacity=".3"/><text x="${pillW / 2}" y="14" text-anchor="middle" font-family="${FONT}" font-size="11" font-weight="500" fill="${o.modelColor}">${esc(o.modelLabel)}</text></svg>${marker}${duration}${note}<text x="${W - 4}" y="22" text-anchor="end" font-family="${FONT}" font-size="11.5" fill="${color}">${esc(o.status)}</text></svg>`
 }
 
 /** La ligne « ● 212k tokens · 1,86 € » à droite de la mini-barre (avec son point d'activité). */
@@ -400,10 +430,12 @@ export function usageRowSvg(o: {
   note: string
   percent: number | undefined
   width: number
+  /** Seuils orange et rouge ; 80 et 95 par défaut. */
+  warnAt?: readonly [number, number]
 }): string {
   const W = Math.max(160, Math.round(o.width))
   const p = o.percent ?? 0
-  const tone = gaugeTone(p)
+  const tone = gaugeTone(p, o.warnAt)
   const fill = tone === 'red' ? PALETTE.red : tone === 'orange' ? PALETTE.orange : PALETTE.silver
   const color = tone === 'red' ? PALETTE.redText : tone === 'orange' ? PALETTE.orange : PALETTE.text
   const warn = tone !== 'silver' ? '▲ ' : ''
@@ -411,16 +443,24 @@ export function usageRowSvg(o: {
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} 30" width="${W}" height="30"><text x="0" y="12" font-family="${FONT}" font-size="12.5" font-weight="600" fill="${PALETTE.text}">${esc(o.label)}</text><text x="${W}" y="12" text-anchor="end" font-family="${MONO}" font-size="12" fill="${color}">${esc(right)}</text><rect x="0" y="22" width="${W}" height="4" rx="2" fill="${PALETTE.border}"/><rect x="0" y="22" width="${num(Math.max(o.percent ? 3 : 0, (p / 100) * W))}" height="4" rx="2" fill="${fill}"/></svg>`
 }
 
-/** Un fichier modifié : son chemin en mono, et dessous la phrase qui résume la modification. */
-export function fileRowSvg(o: { path: string; summary: string; count: number; width: number }): string {
+/** Un fichier modifié : son chemin en mono, et dessous la phrase qui résume la modification (et qui l'a faite). */
+export function fileRowSvg(o: { path: string; summary: string; count: number; width: number; by?: string; conflict?: string }): string {
   const W = Math.max(200, Math.round(o.width))
   const room = Math.max(8, Math.floor((W - 40) / 7.2))
   const path = o.path.length > room ? `…${o.path.slice(-(room - 1))}` : o.path
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} 38" width="${W}" height="38"><text x="0" y="14" font-family="${MONO}" font-size="12" fill="${PALETTE.text}">${esc(path)}</text>${
+  const by = o.by ? clip(o.by, 18) : ''
+  const byW = by ? by.length * 6.6 + 12 : 0
+  const H = o.conflict ? 54 : 38
+  const conflict = o.conflict
+    ? `<text x="0" y="48" font-family="${FONT}" font-size="11.5" font-weight="600" fill="${PALETTE.orange}">${esc(clip(`⚠ aussi modifié par ${o.conflict}`, Math.floor(W / 6.2)))}</text>`
+    : ''
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}"><text x="0" y="14" font-family="${MONO}" font-size="12" fill="${PALETTE.text}">${esc(path)}</text>${
     o.count > 1
       ? `<text x="${W}" y="14" text-anchor="end" font-family="${MONO}" font-size="11" fill="${PALETTE.muted}">×${o.count}</text>`
       : ''
-  }<text x="0" y="31" font-family="${FONT}" font-size="12" fill="${PALETTE.muted}">${esc(clip(o.summary, Math.floor(W / 6.1)))}</text></svg>`
+  }<text x="0" y="31" font-family="${FONT}" font-size="12" fill="${PALETTE.muted}">${esc(clip(o.summary, Math.floor((W - byW) / 6.1)))}</text>${
+    by ? `<text x="${W}" y="31" text-anchor="end" font-family="${MONO}" font-size="11" fill="${PALETTE.text2}">${esc(by)}</text>` : ''
+  }${conflict}</svg>`
 }
 
 // ── La barre d'un agent : un segment par étape de SA tâche ───────────────

@@ -1,8 +1,34 @@
 {
   "name": "revo-flow",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "/revo-flow <demande> : l'orchestrateur lit les specs, fait un plan, répartit les tâches entre des sous-agents (modèle et effort choisis pour chacun) et affiche une barre de progression par agent dans le panneau latéral",
-  "author": { "name": "Lilian Malinge" },
+  "author": {
+    "name": "Lilian Malinge"
+  },
   "repository": "https://github.com/LilianMLG/revo-flow",
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "validerPlan": {
+      "type": "boolean",
+      "title": "Valider le plan",
+      "description": "Avant de lancer les agents, revo-flow affiche le plan (agents, modèles, efforts, nombre de tâches) et attend « Lancer » ou « Annuler ». Sans personne à qui demander (claude -p), le plan part tout seul.",
+      "default": true
+    },
+    "conflits": {
+      "type": "string",
+      "title": "Fichier modifié par deux agents",
+      "description": "avertir : un toast signale qu'un autre agent encore au travail a déjà modifié le fichier ; refuser : la modification est refusée et l'agent doit se coordonner ou attendre.",
+      "default": "avertir",
+      "options": [
+        "avertir",
+        "refuser"
+      ]
+    },
+    "notifier": {
+      "type": "boolean",
+      "title": "Notifications",
+      "description": "Une notification système quand un flow se termine (durée, coût, fichiers) ou qu'un agent échoue ; un toast quand elle ne peut pas partir.",
+      "default": true
+    }
+  }
 }

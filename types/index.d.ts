@@ -38,6 +38,14 @@ export type FlowAgent = Activity & {
   hasEndedTurn?: boolean
   tokens: Tally
   costUsd: number
+  /** Lancé (agent.spawn accepté). */
+  startedAt?: number
+  /** Fini, en succès ou en échec. */
+  endedAt?: number
+  /** Dernier signe de vie : un appel d'outil ou une requête au modèle. */
+  lastActiveAt?: number
+  /** Nombre de lancements : 1 au premier, +1 à chaque relance. */
+  attempts?: number
 }
 
 /**
@@ -59,6 +67,10 @@ export type Flow = {
   agents: FlowAgent[]
   /** Fermé à la main pendant ce flow : on ne le rouvre pas tout seul. */
   isPaneClosed?: boolean
+  /** Passé en done. */
+  endedAt?: number
+  /** Le plan a été validé (ou n'avait pas à l'être) : en dispatch sans cela, il attend l'utilisateur. */
+  isApproved?: boolean
 }
 
 /** L'orchestrateur : le fil principal, sur le modèle de la session. */
@@ -69,7 +81,23 @@ export type Tokens = { dayKey: string; weekKey: string; day: Tally; week: Tally 
 export type Limit = { kind: string; percentUsed: number; resetsAt?: string }
 
 /** Un fichier modifié pendant le flow, avec la raison en une phrase. */
-export type Entry = { path: string; rel: string; reason: string; count: number; at: number }
+export type Entry = {
+  path: string
+  rel: string
+  reason: string
+  count: number
+  at: number
+  /** Qui l'a modifié en dernier : 'lead' ou la clé de l'agent. */
+  by?: string
+  /** Les clés des autres agents qui ont aussi touché ce fichier pendant qu'il tournait. */
+  conflict?: string[]
+}
+
+/** Le dernier tour de l'orchestrateur : en cours (isLive, cumul via turn.step) puis figé par turn.complete. */
+export type LastTurn = { at: number; durationMs: number; tokens: Tally; modelId: string; costUsd: number; isLive: boolean }
+
+/** Fenêtre de contexte de l'orchestrateur. */
+export type Context = { percent: number; tokens: number; window: number }
 
 declare module 'claude-code' {
   interface PluginState {
@@ -81,6 +109,9 @@ declare module 'claude-code' {
       limits: Limit[]
       session: Tally
       entries: Entry[]
+      lastTurn: LastTurn | null
+      context: Context | null
+      sessionCostUsd: number
     }
   }
 }

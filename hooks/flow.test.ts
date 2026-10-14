@@ -2,7 +2,8 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { applyStep, finishTasks, parsePlan, progress } from './lib'
+import { applyStep, finishTasks, flowRecap, fmtDuration, matchAgent, parsePlan, planQuestion, progress, remainingTasks } from './lib'
+import type { Flow, FlowAgent } from '../types'
 
 const ROOT = 'C:\\Users\\x\\Documents\\Front\\ui-vel'
 const FILE = `${ROOT}\\components\\Basket.vue`
@@ -47,7 +48,38 @@ function world(on: On) {
   on('session.usage', () => ({ value: { rateLimits: [] } }) as never)
   on('session.messages', () => ({ value: [] }) as never)
   on('tool.register', () => ({ value: undefined }) as never)
-  on('tool.call', () => ({ result: {} as never }))
+  // Le dialogue ui.ask (outil AskUserQuestion) : la réponse est celle que le test décide ; sans réponse, il reste ouvert.
+  const asked: string[] = []
+  const notified: string[] = []
+  const stopped: string[] = []
+  const toasts: string[] = []
+  const aborted: string[] = []
+  const ctl: { answer: string | undefined; pending: ((a: string) => void) | undefined } = { answer: 'Lancer', pending: undefined }
+  on('tool.call', (_$, e) => {
+    if (e.tool === 'AskUserQuestion') {
+      asked.push(JSON.stringify(e))
+      const questions = (e as unknown as { questions: { question: string }[] }).questions
+      const reply = (a: string) => ({ result: { questions, answers: { [questions[0]!.question]: a } } as never })
+      if (ctl.answer !== undefined) return reply(ctl.answer)
+      return new Promise<ReturnType<typeof reply>>(resolve => {
+        ctl.pending = a => resolve(reply(a))
+      })
+    }
+    if (e.tool === 'TaskStop') stopped.push(String((e as unknown as { task_id?: string }).task_id))
+    return { result: {} as never }
+  })
+  on('ui.notify', (_$, e) => {
+    notified.push(e.text)
+    return { value: { isSent: true } } as never
+  })
+  on('ui.toast', (_$, e) => {
+    toasts.push((e as unknown as { text: string }).text)
+    return { value: undefined } as never
+  })
+  on('turn.abort', (_$, e) => {
+    aborted.push(e.turnId)
+    return { value: undefined } as never
+  })
   on('ui.panes', () => ({ value: shown ? [{ id: 'revo-flow', title: 'revo-flow', isPlaced: true }] : [] }) as never)
   on('ui.open', (_$, e) => {
     opened.push(e.id)
@@ -72,7 +104,7 @@ function world(on: On) {
   on('turn.complete', () => ({ text: '' }))
   // Ce que l'engine dessinerait sans le mod : une boîte vide.
   on('ui.render', (hook$, e) => h(hook$.ui.resolve(e).Box as never, {}) as never)
-  return { clock, sent, opened, prompts, status }
+  return { clock, sent, opened, prompts, status, ctl, asked, notified, stopped, toasts, aborted }
 }
 
 const run = async ($: Engine, args: string) => (await $.command.run({ command: 'revo-flow', args } as never)).text ?? ''
@@ -212,11 +244,14 @@ test('/revo-flow : le panneau attend le plan, puis plan, répartition et exécut
   expect(await run($, 'statut')).toMatch(/Code promo panier — terminé/)
 })
 
-test('un agent lancé sous un autre nom prend le premier agent prévu encore libre ; un agent interrompu est en échec', async ($, on) => {
+test('un Agent hors plan n’est pas suivi ; un agent interrompu est en échec', async ($, on) => {
   const w = world(on)
+  w.ctl.answer = 'Lancer'
   await launch($, w)
   await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN } as never)
-  const r = await spawn($, 'Quelque chose')
+  const stray = await spawn($, 'Quelque chose')
+  expect(stray.model).toBe('inherit')
+  const r = await spawn($, 'Front panier')
   expect(r.model).toBe('claude-sonnet-5-5')
   await $.tool.call({ tool: 'mcp__revo-flow__step', agentId: r.agentId, tache: 1, statut: 'fait' } as never)
   w.status[r.agentId!] = 'killed'
@@ -259,4 +294,226 @@ test('progress : « n/total » sur la tâche en cours, le titre dessous, et tota
   expect(progress(finishTasks(two, false), 'done', false)).toMatchObject({ count: '3/3', percent: 100 })
   expect(finishTasks(two, true).map(t => t.status)).toEqual(['completed', 'failed', 'pending'])
   expect(applyStep(tasks, 9, 'fait')).toBeUndefined()
+})
+
+// ── Validation du plan ───────────────────────────────────────────────────
+
+test('plan validé (« Lancer ») : le dialogue décrit le plan, puis agent.spawn est accepté', async ($, on) => {
+  const w = world(on)
+  w.ctl.answer = 'Lancer'
+  await launch($, w)
+  const ok = await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN } as never)
+  expect(JSON.stringify(ok)).toMatch(/plan « Code promo panier » enregistré/)
+  expect(w.asked.length).toBe(1)
+  expect(w.asked[0]!).toMatch(/Front panier — Sonnet 5\.5, effort medium, 3 tâches/)
+  const r = await spawn($, 'Front panier')
+  expect(r.deny).toBeUndefined()
+  expect(r.model).toBe('claude-sonnet-5-5')
+})
+
+test('plan en attente de validation : agent.spawn refusé tant que l’utilisateur n’a pas répondu', async ($, on) => {
+  const w = world(on)
+  w.ctl.answer = undefined
+  await launch($, w)
+  const planned = $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN } as never)
+  await w.clock.settle()
+  expect(w.ctl.pending).toBeDefined()
+  const early = await spawn($, 'Front panier')
+  expect(early.deny).toMatch(/attend la validation/)
+  w.ctl.pending!('Lancer')
+  await planned
+  const r = await spawn($, 'Front panier')
+  expect(r.deny).toBeUndefined()
+  expect(r.model).toBe('claude-sonnet-5-5')
+})
+
+test('plan annulé : retour à la planification, aucun agent avant un nouveau plan', async ($, on) => {
+  const w = world(on)
+  w.ctl.answer = 'Annuler'
+  await launch($, w)
+  const res = await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN } as never)
+  expect(JSON.stringify(res)).toMatch(/plan annulé par l’utilisateur/)
+  const r = await spawn($, 'Front panier')
+  expect(r.deny).toMatch(/aucun sous-agent avant le plan/)
+})
+
+test('validerPlan désactivé : le plan part sans dialogue', { options: { validerPlan: false } }, async ($, on) => {
+  const w = world(on)
+  await launch($, w)
+  await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN } as never)
+  expect(w.asked.length).toBe(0)
+  expect((await spawn($, 'API promo')).model).toBe('claude-opus-5-5')
+}, )
+
+// ── Dernier tour, conflits, arrêt, notifications ────────────────────────
+
+test('lastTurn : alimenté par turn.step puis figé par turn.complete, affiché sur la ligne de fin de tour', async ($, on) => {
+  const w = world(on)
+  on('turn.step', async function* (_$, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: STEP_USAGE } as never
+  })
+  await launch($, w)
+  await $.turn.start({ turnId: 't' } as never)
+  for await (const _ of $.turn.step({ turnId: 't', index: 0, model: 'claude-opus-5-5', effort: 'high', messageCount: 1 })) void _
+  let band = await drawn($, 'terminal', 'AbovePrompt')
+  expect(band.text).toMatch(/Prompt en cours/)
+  await $.turn.complete({
+    answer: '',
+    durationMs: 192000,
+    isAborted: false,
+    turnId: 't',
+    reason: 'answer',
+    usage: { model: 'claude-opus-5-5', input_tokens: 300, output_tokens: 80, cache_read_input_tokens: 2000, cache_creation_input_tokens: 0 },
+  } as never)
+  band = await drawn($, 'terminal', 'AbovePrompt')
+  expect(band.text).toMatch(/Dernier prompt/)
+  expect(band.text).toMatch(/300 ↑/)
+  const ui = await $.ui.mount({
+    plugin: 'revo-flow',
+    surface: 'terminal',
+    component: 'TurnDuration',
+    props: { word: 'Baked', durationMs: 192000 } as never,
+  } as never)
+  const text = (await ui.findAll({ text: /./ })).map(x => x.text).join('\n')
+  await ui.unmount()
+  expect(text).toMatch(/⏱ 3 m 12/)
+  expect(text).toMatch(/300 in/)
+  expect(text).toMatch(/80 out/)
+})
+
+async function twoRunning($: Engine, w: ReturnType<typeof world>) {
+  await launch($, w)
+  await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN } as never)
+  const front = await spawn($, 'Front panier')
+  const api = await spawn($, 'API promo')
+  return { front: front.agentId!, api: api.agentId! }
+}
+
+test('conflit de fichiers, mode avertir : un toast prévient et la modification passe', async ($, on) => {
+  const w = world(on)
+  const { front, api } = await twoRunning($, w)
+  const first = await $.tool.call({ tool: 'Edit', file_path: FILE, agentId: front, tool_use_id: 'u1' } as never)
+  expect(first.deny).toBeUndefined()
+  const second = await $.tool.call({ tool: 'Edit', file_path: FILE, agentId: api, tool_use_id: 'u2' } as never)
+  expect(second.deny).toBeUndefined()
+  expect(w.toasts.join('\n')).toMatch(/aussi modifié par « Front panier »/)
+})
+
+test('conflit de fichiers, mode refuser : la modification du second agent est refusée', { options: { conflits: 'refuser' } }, async ($, on) => {
+  const w = world(on)
+  const { front, api } = await twoRunning($, w)
+  await $.tool.call({ tool: 'Edit', file_path: FILE, agentId: front, tool_use_id: 'u1' } as never)
+  const second = await $.tool.call({ tool: 'Edit', file_path: FILE, agentId: api, tool_use_id: 'u2' } as never)
+  expect(second.deny).toMatch(/en cours de modification par l’agent « Front panier »/)
+  expect(w.toasts.length).toBe(0)
+})
+
+test('/revo-flow stop : TaskStop sur chaque agent en cours, tour de l’orchestrateur interrompu', async ($, on) => {
+  const w = world(on)
+  const { front, api } = await twoRunning($, w)
+  w.ctl.answer = 'Tout arrêter'
+  await $.turn.start({ turnId: 'lead-1' } as never)
+  const text = await run($, 'stop')
+  expect(w.stopped.sort()).toEqual([api, front].sort())
+  expect(w.aborted).toEqual(['lead-1'])
+  expect(text).toMatch(/agents et orchestrateur interrompus/)
+  expect(await run($, '')).toMatch(/aucun flow en cours/)
+})
+
+test('/revo-flow stop : « Garder les agents » ne touche à aucun agent', async ($, on) => {
+  const w = world(on)
+  await twoRunning($, w)
+  w.ctl.answer = 'Garder les agents'
+  const text = await run($, 'stop')
+  expect(w.stopped).toEqual([])
+  expect(w.aborted).toEqual([])
+  expect(text).toMatch(/continuent jusqu’au bout/)
+})
+
+test('notification quand un agent échoue', async ($, on) => {
+  const w = world(on)
+  const { front } = await twoRunning($, w)
+  w.status[front] = 'killed'
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 'q', reason: 'aborted', agentId: front } as never)
+  expect(w.notified.join('\n')).toMatch(/agent « Front panier » en échec/)
+})
+
+test('notifier désactivé : aucune notification', { options: { notifier: false } }, async ($, on) => {
+  const w = world(on)
+  const { front } = await twoRunning($, w)
+  w.status[front] = 'killed'
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 'q', reason: 'aborted', agentId: front } as never)
+  expect(w.notified).toEqual([])
+})
+
+// ── Fonctions pures ──────────────────────────────────────────────────────
+
+const agentOf = (over: Partial<FlowAgent>): FlowAgent =>
+  ({
+    key: 'front-panier',
+    name: 'Front panier',
+    model: 'sonnet',
+    effort: 'medium',
+    status: 'running',
+    tasks: [],
+    tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    costUsd: 0,
+    ...over,
+  }) as unknown as FlowAgent
+
+test('fmtDuration : secondes, minutes, heures', () => {
+  expect(fmtDuration(0)).toBe('0 s')
+  expect(fmtDuration(45_000)).toBe('45 s')
+  expect(fmtDuration(59_600)).toBe('1 m 00')
+  expect(fmtDuration(192_000)).toBe('3 m 12')
+  expect(fmtDuration(3_840_000)).toBe('1 h 04')
+  expect(fmtDuration(-5)).toBe('0 s')
+})
+
+test('remainingTasks : ni faites ni en échec', () => {
+  const t = (title: string, status: string) => ({ title, kind: 'codage', status }) as never
+  const a = agentOf({ tasks: [t('A', 'completed'), t('B', 'in_progress'), t('C', 'failed'), t('D', 'pending')] })
+  expect(remainingTasks(a).map(x => x.title)).toEqual(['B', 'D'])
+})
+
+test('matchAgent : par nom, sans repli ; un Agent hors plan renvoie undefined', () => {
+  const agents = [agentOf({ key: 'front-panier', status: 'waiting' }), agentOf({ key: 'api-promo', name: 'API promo', status: 'waiting' })]
+  expect(matchAgent(agents, 'Front panier')?.key).toBe('front-panier')
+  expect(matchAgent(agents, 'API promo')?.key).toBe('api-promo')
+  expect(matchAgent(agents, 'Explorer le code')).toBeUndefined()
+  expect(matchAgent(agents, '', undefined)).toBeUndefined()
+  expect(matchAgent([{ ...agents[0]!, agentId: 'x' }], 'Front panier')).toBeUndefined()
+})
+
+test('planQuestion : titre, une ligne par agent, question finale', () => {
+  const parsed = parsePlan(PLAN as never)
+  if (!('plan' in parsed)) throw new Error('plan invalide')
+  const q = planQuestion(parsed.plan)
+  expect(q.split('\n')[0]).toBe('Plan « Code promo panier » : 2 agents.')
+  expect(q).toMatch(/• Front panier — Sonnet 5\.5, effort medium, 3 tâches/)
+  expect(q).toMatch(/• API promo — Opus 5\.5, effort high, 7 tâches/)
+  expect(q.endsWith('Lancer ce plan ?')).toBe(true)
+})
+
+test('flowRecap : rôle d’orchestrateur, phase, et ce qui reste à chaque agent', () => {
+  const t = (title: string, status: string) => ({ title, kind: 'codage', status }) as never
+  const flow = {
+    id: '1',
+    request: 'r',
+    title: 'Code promo panier',
+    summary: 'Un champ code promo.',
+    phase: 'running',
+    startedAt: 0,
+    agents: [
+      agentOf({ tasks: [t('Lire', 'completed'), t('Coder', 'pending')] }),
+      agentOf({ key: 'api', name: 'API promo', model: 'opus', effort: 'high', tasks: [t('Tout', 'completed')] }),
+    ],
+  } as unknown as Flow
+  const r = flowRecap(flow)
+  expect(r).toMatch(/orchestrateur/)
+  expect(r).toMatch(/Code promo panier » — phase : agents au travail/)
+  expect(r).toMatch(/Plan : Un champ code promo\./)
+  expect(r).toMatch(/« Front panier » \(Sonnet 5\.5, effort medium\) \[running\] — reste : Coder/)
+  expect(r).toMatch(/« API promo » .* plus rien à faire/)
+  expect(flowRecap({ ...flow, agents: [], summary: '' })).toMatch(/Aucun agent prévu/)
 })

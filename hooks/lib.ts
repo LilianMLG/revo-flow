@@ -98,15 +98,17 @@ function kindOf(raw: string): TaskKind {
   return 'codage'
 }
 
-/** Le sous-agent prévu que lance cet appel Agent : par son nom, sinon le premier pas encore lancé. */
+/**
+ * Le sous-agent prévu que lance cet appel Agent, d'après son nom (description ou name), ou rien.
+ * Pas de repli sur « le premier libre » : un Agent hors plan ne doit pas prendre la carte d'un agent prévu.
+ */
 export function matchAgent(agents: readonly FlowAgent[], description: string, name?: string): FlowAgent | undefined {
   const free = agents.filter(a => !a.agentId)
   const d = slug(description)
   const n = slug(name ?? '')
   return (
     free.find(a => a.key === d || a.key === n) ??
-    free.find(a => (d && (d.includes(a.key) || a.key.includes(d))) || (n && n.includes(a.key))) ??
-    free[0]
+    free.find(a => (d && (d.includes(a.key) || a.key.includes(d))) || (n && n.includes(a.key)))
   )
 }
 
@@ -240,8 +242,47 @@ export function dispatchText(plan: PlanInput): string {
   return [
     `revo-flow : plan « ${plan.title} » enregistré, ${plan.agents.length} sous-agent${plan.agents.length > 1 ? 's' : ''}.`,
     ...lines,
-    `Lance-les maintenant avec l'outil Agent (description = le nom exact entre guillemets), dans un même message quand ils sont indépendants. Leur modèle, leur effort et leur liste de tâches sont ajoutés par revo-flow.`,
+    `Lance-les maintenant avec l'outil Agent (description = le nom exact entre guillemets), dans un même message quand ils sont indépendants. Leur modèle, leur effort et leur liste de tâches sont ajoutés par revo-flow. Un agent dont la description ne reprend pas un de ces noms n'est pas suivi.`,
   ].join('\n')
+}
+
+const PHASE_LABEL: Record<Phase, string> = {
+  planning: 'planification',
+  dispatch: 'plan posé, agents à lancer',
+  running: 'agents au travail',
+  review: 'vérification finale',
+  done: 'terminé',
+}
+
+/** Les tâches qui restent à un agent (ni faites, ni en échec). */
+export const remainingTasks = (a: FlowAgent) => a.tasks.filter(t => t.status === 'pending' || t.status === 'in_progress')
+
+/**
+ * Réinjecté après une compaction : la compaction résume la conversation et peut perdre le rôle d'orchestrateur
+ * et l'état du flow ; on les redonne tels quels au modèle.
+ */
+export function flowRecap(flow: Flow): string {
+  const rows = flow.agents.map(a => {
+    const left = remainingTasks(a)
+    const todo = left.length ? `reste : ${left.map(t => t.title).join(' ; ')}` : 'plus rien à faire'
+    return `- « ${a.name} » (${MODELS[a.model].label}, effort ${a.effort}) [${a.status}] — ${todo}`
+  })
+  return [
+    LEAD_BRIEF,
+    '',
+    `# État du flow revo-flow (rappel après compaction)`,
+    `Feature : « ${flow.title} » — phase : ${PHASE_LABEL[flow.phase]}.`,
+    ...(flow.summary ? [`Plan : ${flow.summary}`] : []),
+    ...(rows.length ? ['Agents :', ...rows] : ['Aucun agent prévu pour l’instant : le plan reste à poser.']),
+  ].join('\n')
+}
+
+/** Le texte du dialogue de validation du plan : chaque agent, son modèle, son effort et son nombre de tâches. */
+export function planQuestion(plan: PlanInput): string {
+  const rows = plan.agents.map(
+    a => `• ${a.name} — ${MODELS[a.model].label}, effort ${a.effort}, ${a.tasks.length} tâche${a.tasks.length > 1 ? 's' : ''}`,
+  )
+  return [`Plan « ${plan.title} » : ${plan.agents.length} agent${plan.agents.length > 1 ? 's' : ''}.`, ...rows, 'Lancer ce plan ?'].join('\n')
 }
 
 /** Ajouté au prompt du sous-agent : ses tâches et comment les signaler. */
@@ -300,6 +341,15 @@ export function fmt(n: number): string {
   if (n >= 1_000_000) return `${one(n / 1_000_000)} M`
   if (n >= 1_000) return `${one(n / 1_000)}k`
   return String(n)
+}
+
+/** 45 000 → « 45 s » ; 192 000 → « 3 m 12 » ; 3 840 000 → « 1 h 04 ». */
+export function fmtDuration(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000))
+  const two = (n: number) => String(n).padStart(2, '0')
+  if (s < 60) return `${s} s`
+  if (s < 3600) return `${Math.floor(s / 60)} m ${two(s % 60)}`
+  return `${Math.floor(s / 3600)} h ${two(Math.floor((s % 3600) / 60))}`
 }
 
 export const LIMIT_LABEL: Record<string, string> = { five_hour: '5h', seven_day: 'hebdo', spend_limit: 'budget' }

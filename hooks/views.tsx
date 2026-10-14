@@ -1,6 +1,6 @@
 import type { Elements } from 'claude-code'
 
-import type { Entry, Flow, FlowAgent, FlowTask, Lead, Limit, Tally, Tokens } from '../types'
+import type { Context, Entry, Flow, FlowAgent, FlowTask, Lead, LastTurn, Limit, Tally, Tokens } from '../types'
 import {
   AGENT_COLORS,
   PALETTE,
@@ -26,6 +26,7 @@ import {
   euros,
   flowPercent,
   fmt,
+  fmtDuration,
   leadTasks,
   modelKey,
   modelLabel,
@@ -46,6 +47,19 @@ export type ViewData = {
   session: Tally
   limits: Limit[]
   now: number
+  lastTurn: LastTurn | null
+  context: Context | null
+  sessionCostUsd: number
+}
+
+/** Ce que les boutons du panneau déclenchent : branchés par register.tsx. */
+export type PaneActions = {
+  clear(): unknown
+  stopAll(): unknown
+  stopAgent(key: string): unknown
+  retryAgent(key: string): unknown
+  approvePlan(): unknown
+  cancelPlan(): unknown
 }
 
 const MODEL_COLOR = { haiku: PALETTE.haiku, sonnet: PALETTE.sonnet, opus: PALETTE.opus } as const
@@ -79,7 +93,25 @@ export type Card = {
   prog: Progress
   usage: string
   lines: Line[]
+  /** « 3 m 12 » : depuis son lancement, ou sa durée totale une fois fini. */
+  duration?: string
+  /** « inactif depuis 1 m 30 » : un agent actif qui ne fait plus rien depuis plus de 90 s. */
+  idle?: string
+  isLead: boolean
 }
+
+const IDLE_AFTER_MS = 90_000
+const PLAN_PENDING = 'Plan à valider'
+const isPendingPlan = (d: ViewData) => d.flow?.phase === 'dispatch' && !d.flow.isApproved
+/** Le nom court de qui a touché un fichier : « orchestrateur » ou le nom de l'agent. */
+const whoName = (d: ViewData, key: string) => (key === 'lead' ? 'orchestrateur' : (d.flow?.agents.find(a => a.key === key)?.name ?? key))
+const ctxColor = (percent: number) => (percent >= 85 ? PALETTE.red : percent >= 70 ? PALETTE.orange : PALETTE.silver)
+const cacheOf = (t: Tally) => t.cacheRead + t.cacheWrite
+const turnCost = (t: LastTurn) => (t.costUsd === 0 && !modelKey(t.modelId) ? '—' : euros(t.costUsd))
+/** « 3,2k ↑ · 850 ↓ · 41k cache · 0,04 € » */
+const promptText = (t: LastTurn) => `${fmt(t.tokens.input)} ↑ · ${fmt(t.tokens.output)} ↓ · ${fmt(cacheOf(t.tokens))} cache · ${turnCost(t)}`
+const planCount = (a: FlowAgent) => `${a.tasks.length} tâche${a.tasks.length > 1 ? 's' : ''}`
+const planModel = (a: FlowAgent) => `${modelLabel(a.modelId || MODELS[a.model].id)} · ${a.effort}`
 
 const STATUS: Record<Tone, string> = { live: 'Actif', wait: 'En attente', done: 'Terminé', fail: 'Échec' }
 
@@ -118,10 +150,12 @@ function leadCard(d: ViewData, flow: Flow): Card {
     prog: p,
     usage: usageText(d.lead.tokens, d.lead.costUsd),
     lines: lines(tasks, p, d.lead, tone === 'wait' ? 'live' : tone),
+    duration: fmtDuration(Math.max(0, (flow.endedAt ?? d.now) - flow.startedAt)),
+    isLead: true,
   }
 }
 
-function agentCard(a: FlowAgent, index: number): Card {
+function agentCard(a: FlowAgent, index: number, now: number): Card {
   const tone: Tone = a.status === 'failed' ? 'fail' : a.status === 'done' ? 'done' : a.status === 'running' ? 'live' : 'wait'
   const p = progress(a.tasks, a.status, a.status === 'running')
   const modelId = a.modelId || MODELS[a.model].id
@@ -137,6 +171,13 @@ function agentCard(a: FlowAgent, index: number): Card {
     prog: p,
     usage: usageText(a.tokens, a.costUsd),
     lines: lines(a.tasks, p, a, tone),
+    ...(a.startedAt !== undefined
+      ? { duration: fmtDuration(Math.max(0, (a.endedAt ?? (a.status === 'running' ? now : (a.lastActiveAt ?? now))) - a.startedAt)) }
+      : {}),
+    ...(a.status === 'running' && a.lastActiveAt !== undefined && now - a.lastActiveAt > IDLE_AFTER_MS
+      ? { idle: `inactif depuis ${fmtDuration(now - a.lastActiveAt)}` }
+      : {}),
+    isLead: false,
   }
 }
 
@@ -147,7 +188,7 @@ const RANK: Record<Tone, number> = { live: 0, wait: 1, fail: 2, done: 3 }
 export function cards(d: ViewData): Card[] {
   if (!d.flow || d.flow.phase === 'planning') return []
   // La couleur suit l'ordre du plan (elle ne change pas quand l'agent change de place) ; le tri garde cet ordre à rang égal.
-  const agents = d.flow.agents.map(agentCard).sort((a, b) => RANK[a.tone] - RANK[b.tone])
+  const agents = d.flow.agents.map((a, i) => agentCard(a, i, d.now)).sort((a, b) => RANK[a.tone] - RANK[b.tone])
   return [leadCard(d, d.flow), ...agents]
 }
 
@@ -187,8 +228,16 @@ export function DesktopBand(t: Elements['desktop'], d: ViewData, widthPx: number
   return (
     <Box key="bar">
       <Svg
-        source={barSvg(m.stages, { title: m.flow.title, width, percent: m.percent, agents: m.agents, isDone: m.isDone })}
-        alt={`revo-flow ${m.flow.title} : ${stageAlt(m.stages)}, ${m.percent} %, ${m.agents} agent${m.agents > 1 ? 's' : ''} actif${m.agents > 1 ? 's' : ''}`}
+        source={barSvg(m.stages, {
+          title: m.flow.title,
+          width,
+          percent: m.percent,
+          agents: m.agents,
+          isDone: m.isDone,
+          ...(d.context ? { context: d.context.percent } : {}),
+          ...(d.lastTurn ? { lastPrompt: `${d.lastTurn.isLive ? '…' : ''}${fmt(d.lastTurn.tokens.input)}↑ ${fmt(d.lastTurn.tokens.output)}↓ · ${turnCost(d.lastTurn)}` } : {}),
+        })}
+        alt={`revo-flow ${m.flow.title} : ${stageAlt(m.stages)}, ${m.percent} %, ${m.agents} agent${m.agents > 1 ? 's' : ''} actif${m.agents > 1 ? 's' : ''}${d.context ? `, contexte ${Math.round(d.context.percent)} %` : ''}`}
         width={width}
         isInteractive
       />
@@ -196,13 +245,14 @@ export function DesktopBand(t: Elements['desktop'], d: ViewData, widthPx: number
   )
 }
 
-/** Terminal : une ligne sobre — titre, étape de l'orchestrateur, avancement, agents actifs. */
+/** Terminal : une ligne sobre — titre, étape de l'orchestrateur, avancement, agents actifs — et dessous le dernier prompt et le contexte. */
 export function TerminalBand(t: Elements['terminal'], d: ViewData) {
   const m = bandModel(d)
   if (!m) return null
   const { Box, Text } = t
+  const lt = d.lastTurn
   return (
-    <Box borderStyle="round" borderColor={PALETTE.border} paddingX={1}>
+    <Box borderStyle="round" borderColor={PALETTE.border} paddingX={1} flexDirection="column">
       <Text wrap="truncate-end">
         <Text bold>{m.flow.title}</Text>
         <Text dimColor>{'  ·  '}</Text>
@@ -212,8 +262,47 @@ export function TerminalBand(t: Elements['terminal'], d: ViewData) {
         <Text bold>{` ${m.percent}%`}</Text>
         {m.agents > 0 && <Text color={PALETTE.live}>{`  ● ${m.agents} actif${m.agents > 1 ? 's' : ''}`}</Text>}
       </Text>
+      {(lt || d.context) && (
+        <Box justifyContent="space-between">
+          <Text dimColor wrap="truncate-end">
+            {lt ? `${lt.isLive ? 'Prompt en cours' : 'Dernier prompt'} : ${promptText(lt)}` : ' '}
+          </Text>
+          {d.context && (
+            <Box flexShrink={0} marginLeft={2}>
+              <Text color={d.context.percent >= 70 ? ctxColor(d.context.percent) : undefined} dimColor={d.context.percent < 70}>
+                {`ctx ${Math.round(d.context.percent)} %`}
+              </Text>
+            </Box>
+          )}
+        </Box>
+      )}
     </Box>
   )
+}
+
+/** Terminal : remplace la ligne native « Baked for 12s » par une ligne dim avec la durée, les tokens, le coût et le modèle du tour. */
+export function TerminalTurnLine(t: Elements['terminal'], d: ViewData, props: { word: string; durationMs: number }) {
+  const lt = d.lastTurn
+  if (!lt || lt.isLive) return null
+  const { Text } = t
+  const parts = [
+    `⏱ ${fmtDuration(props.durationMs)}`,
+    `${fmt(lt.tokens.input)} in`,
+    `${fmt(lt.tokens.output)} out`,
+    `${fmt(cacheOf(lt.tokens))} cache`,
+    turnCost(lt),
+    modelLabel(lt.modelId),
+  ]
+  return (
+    <Text dimColor wrap="truncate-end">
+      {parts.join(' · ')}
+    </Text>
+  )
+}
+
+/** Mobile : la surface a `Svg`, on réutilise la barre du bureau. */
+export function MobileBand(t: Elements['mobile'], d: ViewData, widthPx: number) {
+  return DesktopBand(t as unknown as Elements['desktop'], d, widthPx)
 }
 
 // ── La fenêtre latérale ──────────────────────────────────────────────────
@@ -222,6 +311,7 @@ function pill(d: ViewData) {
   const flow = d.flow
   if (!flow) return null
   if (flow.phase === 'planning') return { text: 'Analyse des specs', tone: 'outline' as const }
+  if (isPendingPlan(d)) return { text: PLAN_PENDING, tone: 'orange' as const }
   const failed = flow.agents.filter(a => a.status === 'failed').length
   if (flow.phase === 'done') return { text: failed ? `Terminé · ${failed} échec${failed > 1 ? 's' : ''}` : 'Terminé · 100 %', tone: failed ? ('red' as const) : ('silver' as const) }
   const done = flow.agents.filter(a => a.status === 'done').length
@@ -229,17 +319,22 @@ function pill(d: ViewData) {
   return { text, tone: failed ? ('red' as const) : ('outline' as const) }
 }
 
-export function DesktopPane(t: Elements['desktop'], d: ViewData, onClear: () => unknown, columns: number) {
+/** Les noms des autres agents qui ont touché un fichier : « Front, orchestrateur ». */
+const conflictNames = (d: ViewData, x: Entry) => (x.conflict ?? []).map(k => whoName(d, k)).join(', ')
+
+export function DesktopPane(t: Elements['desktop'], d: ViewData, actions: PaneActions, columns: number) {
   const { Box, Text, Svg, Button } = t
   const inner = Math.max(240, Math.min(700, pixels(columns) - 56))
   const cardInner = inner - 28
   const flow = d.flow
   const all = cards(d)
-  const running = all.filter(c => c.tone === 'live').length
+  const running = all.filter(c => c.tone === 'live' && !c.isLead).length
+  const liveCount = all.filter(c => c.tone === 'live').length
   const day = d.tokens ? total(d.tokens.day) : 0
   const week = d.tokens ? total(d.tokens.week) : 0
   const pct = usagePercents(d.limits, day, week)
   const p = pill(d)
+  const isPending = isPendingPlan(d)
 
   const line = (l: Line, i: number) => (
     <Text
@@ -269,8 +364,41 @@ export function DesktopPane(t: Elements['desktop'], d: ViewData, onClear: () => 
           </Text>
         ) : null}
 
+        {running > 0 && (
+          <Box justifyContent="flex-end" width="100%">
+            <Button key="stop-all" plain label="Tout arrêter" onPress={() => actions.stopAll()} />
+          </Box>
+        )}
+
+        {isPending && flow && (
+          <Box
+            key="plan"
+            flexDirection="column"
+            gap={1}
+            width="100%"
+            backgroundColor={PALETTE.card}
+            borderStyle="round"
+            borderColor={PALETTE.orange}
+            padding={1}
+          >
+            <Svg source={sectionSvg('PLAN À VALIDER', `${flow.agents.length} agent${flow.agents.length > 1 ? 's' : ''}`, cardInner)} alt="Plan à valider" width={cardInner} />
+            {flow.agents.map(a => (
+              <Box key={a.key} flexDirection="column">
+                <Text bold wrap="truncate-end">
+                  {a.name}
+                </Text>
+                <Text color={PALETTE.muted} wrap="truncate-end">{`${planModel(a)} · ${planCount(a)}`}</Text>
+              </Box>
+            ))}
+            <Box flexDirection="row" gap={2}>
+              <Button key="approve" label="Lancer" onPress={() => actions.approvePlan()} />
+              <Button key="cancel" plain label="Annuler" onPress={() => actions.cancelPlan()} />
+            </Box>
+          </Box>
+        )}
+
         <Svg
-          source={sectionSvg('AGENTS', all.length ? `${all.length} · ${running} actif${running > 1 ? 's' : ''}` : '', inner)}
+          source={sectionSvg('AGENTS', all.length ? `${all.length} · ${liveCount} actif${liveCount > 1 ? 's' : ''}` : '', inner)}
           alt={`Agents : ${all.length}`}
           width={inner}
         />
@@ -304,8 +432,10 @@ export function DesktopPane(t: Elements['desktop'], d: ViewData, onClear: () => 
                   status: c.status,
                   tone: c.tone,
                   width: cardInner,
+                  ...(c.duration ? { duration: c.duration } : {}),
+                  ...(c.idle ? { note: c.idle } : {}),
                 })}
-                alt={`${c.name}, ${modelLabel(c.modelId)}, ${c.pill}, ${c.status}`}
+                alt={`${c.name}, ${modelLabel(c.modelId)}, ${c.pill}, ${c.status}${c.duration ? `, ${c.duration}` : ''}${c.idle ? `, ${c.idle}` : ''}`}
                 width={cardInner}
               />
               {/* Sa barre : un segment par tâche que l'orchestrateur lui a confiée, la tâche en cours dessous et « n/total ». */}
@@ -325,6 +455,16 @@ export function DesktopPane(t: Elements['desktop'], d: ViewData, onClear: () => 
               </Box>
               {c.lines.length > 0 && <Svg source={ruleSvg(cardInner)} alt="" width={cardInner} />}
               <Box flexDirection="column">{c.lines.map(line)}</Box>
+              {!c.isLead && c.tone === 'live' && (
+                <Box justifyContent="flex-end" width="100%">
+                  <Button key={`stop-${c.id}`} plain label="Arrêter" onPress={() => actions.stopAgent(c.id)} />
+                </Box>
+              )}
+              {!c.isLead && c.tone === 'fail' && (
+                <Box justifyContent="flex-end" width="100%">
+                  <Button key={`retry-${c.id}`} plain label="Relancer" onPress={() => actions.retryAgent(c.id)} />
+                </Box>
+              )}
             </Box>
           )
         })}
@@ -337,15 +477,26 @@ export function DesktopPane(t: Elements['desktop'], d: ViewData, onClear: () => 
             {d.entries
               .slice(-6)
               .reverse()
-              .map(x => (
-                <Svg
-                  key={x.path}
-                  source={fileRowSvg({ path: x.rel, summary: x.reason, count: x.count, width: inner })}
-                  alt={`${x.rel} : ${x.reason}`}
-                  width={inner}
-                />
-              ))}
-            <Button key="clear" plain label="vider la liste" onPress={onClear} />
+              .map(x => {
+                const who = x.by ? whoName(d, x.by) : ''
+                const others = conflictNames(d, x)
+                return (
+                  <Svg
+                    key={x.path}
+                    source={fileRowSvg({
+                      path: x.rel,
+                      summary: x.reason,
+                      count: x.count,
+                      width: inner,
+                      ...(who ? { by: who } : {}),
+                      ...(others ? { conflict: others } : {}),
+                    })}
+                    alt={`${x.rel} : ${x.reason}${who ? `, par ${who}` : ''}${others ? `, aussi modifié par ${others}` : ''}`}
+                    width={inner}
+                  />
+                )
+              })}
+            <Button key="clear" plain label="vider la liste" onPress={() => actions.clear()} />
           </Box>
         )}
       </Box>
@@ -353,10 +504,30 @@ export function DesktopPane(t: Elements['desktop'], d: ViewData, onClear: () => 
       <Box flexDirection="column" gap={1} padding={2} width="100%" backgroundColor={PALETTE.panelFoot}>
         <Svg source={sectionSvg('CONSOMMATION', 'tokens', inner)} alt="Consommation" width={inner} />
         <Svg
-          source={usageRowSvg({ label: 'Session', value: fmt(total(d.session)), note: pct.session !== undefined ? `${Math.round(pct.session)} %` : '', percent: pct.session, width: inner })}
-          alt={`Session : ${fmt(total(d.session))}`}
+          source={usageRowSvg({
+            label: d.sessionCostUsd > 0 ? `Session · ${euros(d.sessionCostUsd)}` : 'Session',
+            value: fmt(total(d.session)),
+            note: pct.session !== undefined ? `${Math.round(pct.session)} %` : '',
+            percent: pct.session,
+            width: inner,
+          })}
+          alt={`Session : ${fmt(total(d.session))}${d.sessionCostUsd > 0 ? `, ${euros(d.sessionCostUsd)}` : ''}`}
           width={inner}
         />
+        {d.context && (
+          <Svg
+            source={usageRowSvg({
+              label: 'Contexte',
+              value: `${fmt(d.context.tokens)} / ${fmt(d.context.window)}`,
+              note: `${Math.round(d.context.percent)} %`,
+              percent: d.context.percent,
+              width: inner,
+              warnAt: [70, 85],
+            })}
+            alt={`Contexte : ${Math.round(d.context.percent)} %`}
+            width={inner}
+          />
+        )}
         <Svg
           source={usageRowSvg({ label: 'Semaine', value: fmt(week), note: pct.week !== undefined ? `${Math.round(pct.week)} %` : '', percent: pct.week, width: inner })}
           alt={`Semaine : ${fmt(week)}`}
@@ -367,11 +538,16 @@ export function DesktopPane(t: Elements['desktop'], d: ViewData, onClear: () => 
   )
 }
 
+/** Mobile : la surface a `Svg` et `Button` : même panneau que le bureau. */
+export function MobilePane(t: Elements['mobile'], d: ViewData, actions: PaneActions, columns: number) {
+  return DesktopPane(t as unknown as Elements['desktop'], d, actions, columns)
+}
+
 /**
- * Terminal : la même chose que le bureau, en sobre. Deux lignes par agent (nom, modèle, statut ; sa barre colorée,
- * n/total et la tâche en cours), une troisième pour l'action en direct quand il est actif ; un terminé tient en une ligne de barre sans titre.
+ * Terminal : la même chose que le bureau, en sobre. Deux lignes par agent (nom, modèle, statut et durée ; sa barre colorée,
+ * n/total et la tâche en cours), une troisième pour l'action en direct quand il est actif, puis ses tokens ; un terminé tient en une ligne de barre sans titre.
  */
-export function TerminalPane(t: Elements['terminal'], d: ViewData, onClear: () => unknown) {
+export function TerminalPane(t: Elements['terminal'], d: ViewData, actions: PaneActions) {
   const { Box, Text, Button } = t
   const flow = d.flow
   const all = cards(d)
@@ -379,6 +555,8 @@ export function TerminalPane(t: Elements['terminal'], d: ViewData, onClear: () =
   const week = d.tokens ? total(d.tokens.week) : 0
   const pct = usagePercents(d.limits, day, week)
   const p = pill(d)
+  const isPending = isPendingPlan(d)
+  const running = all.filter(c => c.tone === 'live' && !c.isLead).length
   const where = flow ? [flow.project, flow.branch].filter(Boolean).join(' · ') : ''
   const icon = (tone: Tone) => (tone === 'live' ? '●' : tone === 'wait' ? '○' : tone === 'fail' ? '✕' : '✓')
   const segs = (c: Card) => c.prog.segs.map(s => (s.kind === 'todo' ? '▱' : s.kind === 'failed' ? '✕' : '▰')).join('')
@@ -394,10 +572,13 @@ export function TerminalPane(t: Elements['terminal'], d: ViewData, onClear: () =
             </Text>
             <Text color={isDone ? PALETTE.muted : colorOf(c.modelId)}>{`  ${c.pill}`}</Text>
           </Text>
-          <Text
-            color={c.tone === 'live' ? PALETTE.live : c.tone === 'fail' ? PALETTE.redText : PALETTE.muted}
-            bold={c.tone === 'live'}
-          >{`${icon(c.tone)} ${c.status}`}</Text>
+          <Text wrap="truncate-end">
+            <Text
+              color={c.tone === 'live' ? PALETTE.live : c.tone === 'fail' ? PALETTE.redText : PALETTE.muted}
+              bold={c.tone === 'live'}
+            >{`${icon(c.tone)} ${c.status}`}</Text>
+            {c.duration ? <Text dimColor>{` · ${c.duration}`}</Text> : null}
+          </Text>
         </Box>
         <Text wrap="truncate-end">
           <Text color={isDone ? PALETTE.muted : c.color}>{`  ${segs(c)}`}</Text>
@@ -409,18 +590,34 @@ export function TerminalPane(t: Elements['terminal'], d: ViewData, onClear: () =
             {`    ↳ ${c.doing}`}
           </Text>
         ) : null}
+        {c.idle ? (
+          <Text color={PALETTE.orange} wrap="truncate-end">
+            {`  ⚠ ${c.idle}`}
+          </Text>
+        ) : null}
+        <Text dimColor={isDone} color={isDone ? undefined : PALETTE.text2} wrap="truncate-end">{`  Σ ${c.usage}`}</Text>
+        {!c.isLead && (c.tone === 'live' || c.tone === 'fail') ? (
+          <Box paddingLeft={2}>
+            {c.tone === 'live' ? (
+              <Button key={`stop-${c.id}`} plain label="Arrêter" onPress={() => actions.stopAgent(c.id)} />
+            ) : (
+              <Button key={`retry-${c.id}`} plain label="Relancer" onPress={() => actions.retryAgent(c.id)} />
+            )}
+          </Box>
+        ) : null}
       </Box>
     )
   }
 
-  const gauge = (label: string, value: string, percent: number | undefined) => (
+  const gauge = (label: string, value: string, percent: number | undefined, warnAt: readonly [number, number] = [80, 95], extra = '') => (
     <Text key={label} wrap="truncate-end">
       <Text dimColor>{label.padEnd(9)}</Text>
-      <Text color={percent !== undefined && percent >= 95 ? PALETTE.red : percent !== undefined && percent >= 80 ? PALETTE.orange : PALETTE.silver}>
+      <Text color={percent !== undefined && percent >= warnAt[1] ? PALETTE.red : percent !== undefined && percent >= warnAt[0] ? PALETTE.orange : PALETTE.silver}>
         {bar(percent ?? 0, 10)}
       </Text>
       <Text>{`  ${value}`}</Text>
       <Text dimColor>{percent !== undefined ? ` · ${Math.round(percent)} %` : ''}</Text>
+      {extra ? <Text dimColor>{` · ${extra}`}</Text> : null}
     </Text>
   )
 
@@ -431,7 +628,12 @@ export function TerminalPane(t: Elements['terminal'], d: ViewData, onClear: () =
           <Text bold wrap="truncate-end">
             {flow?.title || 'revo-flow'}
           </Text>
-          <Text dimColor>{p?.text ?? ''}</Text>
+          <Box gap={2} flexShrink={0}>
+            {running > 0 && <Button key="stop-all" plain label="Tout arrêter" onPress={() => actions.stopAll()} />}
+            <Text color={isPending ? PALETTE.orange : undefined} dimColor={!isPending}>
+              {p?.text ?? ''}
+            </Text>
+          </Box>
         </Box>
         <Text dimColor wrap="truncate-end">
           {flow ? where || ' ' : '/revo-flow <demande> pour lancer un flow'}
@@ -439,25 +641,61 @@ export function TerminalPane(t: Elements['terminal'], d: ViewData, onClear: () =
       </Box>
 
       {isPlanning(d) && <Text color={PALETTE.text2}>{`⏳ ${WAITING}`}</Text>}
+
+      {isPending && flow && (
+        <Box flexDirection="column">
+          <Text bold color={PALETTE.orange}>{`${PLAN_PENDING} · ${flow.agents.length} agent${flow.agents.length > 1 ? 's' : ''}`}</Text>
+          {flow.agents.map(a => (
+            <Text key={a.key} wrap="truncate-end">
+              <Text>{`  ${a.name}`}</Text>
+              <Text dimColor>{`  ${planModel(a)} · ${planCount(a)}`}</Text>
+            </Text>
+          ))}
+          <Box gap={2} paddingLeft={2}>
+            <Button key="approve" label="Lancer" onPress={() => actions.approvePlan()} />
+            <Button key="cancel" plain label="Annuler" onPress={() => actions.cancelPlan()} />
+          </Box>
+        </Box>
+      )}
+
       {all.length > 0 && <Box flexDirection="column">{all.map(card)}</Box>}
 
       {d.entries.length > 0 && (
         <Box flexDirection="column">
           <Box justifyContent="space-between">
             <Text dimColor>{`Fichiers modifiés · ${d.entries.length}`}</Text>
-            <Button key="clear" plain label="vider" onPress={onClear} />
+            <Button key="clear" plain label="vider" onPress={() => actions.clear()} />
           </Box>
           {d.entries
             .slice(-3)
             .reverse()
-            .map(x => (
-              <Text key={x.path} wrap="truncate-start">{`  ${x.rel}${x.count > 1 ? ` ×${x.count}` : ''}`}</Text>
-            ))}
+            .map(x => {
+              const who = x.by ? whoName(d, x.by) : ''
+              const others = conflictNames(d, x)
+              return (
+                <Box key={x.path} flexDirection="column">
+                  <Box>
+                    <Box flexShrink={1}>
+                      <Text wrap="truncate-start">{`  ${x.rel}${x.count > 1 ? ` ×${x.count}` : ''}`}</Text>
+                    </Box>
+                    {who ? (
+                      <Box flexShrink={0}>
+                        <Text dimColor>{` · ${who}`}</Text>
+                      </Box>
+                    ) : null}
+                  </Box>
+                  {others ? (
+                    <Text color={PALETTE.orange} wrap="truncate-end">{`    ⚠ aussi modifié par ${others}`}</Text>
+                  ) : null}
+                </Box>
+              )
+            })}
         </Box>
       )}
 
       <Box flexDirection="column">
-        {gauge('Session', fmt(total(d.session)), pct.session)}
+        {gauge('Session', fmt(total(d.session)), pct.session, [80, 95], d.sessionCostUsd > 0 ? euros(d.sessionCostUsd) : '')}
+        {d.context && gauge('Contexte', `${fmt(d.context.tokens)} / ${fmt(d.context.window)}`, d.context.percent, [70, 85])}
         {gauge('Semaine', fmt(week), pct.week)}
         {d.limits.some(l => l.resetsAt) && (
           <Text dimColor wrap="truncate-end">

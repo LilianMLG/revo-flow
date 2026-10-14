@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
-import type { Elements, EngineInterface, Register } from 'claude-code'
+import type { Elements, EngineInterface, PluginOptions, Register, SessionContextUsage } from 'claude-code'
 
-import type { Activity, Flow, FlowAgent, Lead } from '../types'
+import type { Activity, Context, Flow, FlowAgent, Lead } from '../types'
 import {
   EMPTY,
   LEAD_BRIEF,
@@ -18,21 +18,37 @@ import {
   describeCall,
   dispatchText,
   draftTitle,
+  euros,
   finishTasks,
   firstSentence,
   flowPercent,
+  flowRecap,
+  fmtDuration,
   isTally,
   matchAgent,
   modelLabel,
   parsePlan,
+  planQuestion,
   progress,
-  projectOf,
+  remainingTasks,
   shortPath,
   slug,
   weekKey,
+  type PlanInput,
   type Usage,
 } from './lib'
-import { DesktopBand, DesktopPane, TerminalBand, TerminalPane, type ViewData } from './views'
+import {
+  DesktopBand,
+  DesktopPane,
+  MobileBand,
+  MobilePane,
+  TerminalBand,
+  TerminalPane,
+  TerminalTurnLine,
+  pixels,
+  type PaneActions,
+  type ViewData,
+} from './views'
 
 type $ = EngineInterface
 
@@ -48,9 +64,21 @@ const tokens = atom({ plugin: 'revo-flow', key: 'tokens' } as const, null)
 const limits = atom({ plugin: 'revo-flow', key: 'limits' } as const, [])
 const sessionUsage = atom({ plugin: 'revo-flow', key: 'session' } as const, EMPTY)
 const entries = atom({ plugin: 'revo-flow', key: 'entries' } as const, [])
+const lastTurnA = atom({ plugin: 'revo-flow', key: 'lastTurn' } as const, null)
+const contextA = atom({ plugin: 'revo-flow', key: 'context' } as const, null)
+const sessionCostA = atom({ plugin: 'revo-flow', key: 'sessionCostUsd' } as const, 0)
+
+/** Les options du plugin (userConfig), fixées pour ce chargement : un changement recharge le module. */
+const opts = { validerPlan: true, conflits: 'avertir' as 'avertir' | 'refuser', notifier: true }
 
 /** Les agents prévus déjà attribués à un appel Agent : deux lancements en parallèle ne prennent jamais le même. */
 const claimed = new Set<string>()
+/** Le tour en cours de l'orchestrateur, pour pouvoir l'interrompre ($.turn.abort ne prend que celui-là). */
+let leadTurnId: string | undefined
+/** La validation du plan en attente : les boutons du panneau peuvent y répondre à la place du dialogue. */
+let pendingDecision: ((d: Decision) => void) | undefined
+/** La réponse à la validation du plan ; note = ce que l'utilisateur a tapé à la place d'un choix. */
+type Decision = { isLaunched: boolean; note?: string }
 /** La vérification périodique de l'état des agents tourne-t-elle déjà (une par chargement du module) ? */
 let isWatching = false
 
@@ -82,6 +110,9 @@ async function setActivity($: $, who: string, patch: Activity) {
   else await setAgent($, who, a => ({ ...a, ...clean }))
 }
 
+/** Le dernier segment d'un chemin : le nom du dossier. */
+const baseName = (path: string) => path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? ''
+
 async function gitBranch($: $, root: string) {
   try {
     const r = await $.process.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], { cwd: root, timeoutMs: 5000 })
@@ -89,6 +120,20 @@ async function gitBranch($: $, root: string) {
   } catch {
     return ''
   }
+}
+
+/** L'en-tête projet · branche : le dépôt de la session, sinon le nom du dossier courant sans branche. */
+async function projectHeader($: $): Promise<{ project: string; branch: string }> {
+  let cwd = ''
+  try {
+    cwd = (await $.fs.stat('.', { resolve: true })).realPath ?? ''
+  } catch {
+    // dossier illisible : on s'en passe
+  }
+  const repo = await $.session.repo().catch(() => null)
+  if (!repo) return { project: baseName(cwd), branch: '' }
+  // La racine d'un worktree est celle du dépôt principal : la branche se lit là où l'on travaille.
+  return { project: baseName(repo.root), branch: await gitBranch($, cwd || repo.root) }
 }
 
 async function registerTools($: $) {
@@ -225,13 +270,16 @@ async function setReason($: $, path: string, reason: string) {
   await update($, entries, list => list.map(x => (x.path === path ? { ...x, reason } : x)))
 }
 
-/** Le fichier modifié entre dans la liste tout de suite ; sa raison (le texte écrit juste avant) suit, hors de l'outil. */
-async function markFile($: $, path: string, toolUseId: string | undefined, agentId: string | undefined) {
+/**
+ * Le fichier modifié entre dans la liste tout de suite, avec qui l'a modifié (pour repérer les conflits) ;
+ * sa raison (le texte écrit juste avant) suit, hors de l'outil.
+ */
+async function markFile($: $, path: string, by: string, toolUseId: string | undefined, agentId: string | undefined) {
   const at = await $.clock.now()
   const rel = shortPath(path)
   await update($, entries, list => {
     const old = list.find(x => x.path === path)
-    return [...list.filter(x => x.path !== path), { path, rel, reason: old?.reason ?? '…', count: (old?.count ?? 0) + 1, at }].slice(-100)
+    return [...list.filter(x => x.path !== path), { ...old, path, rel, reason: old?.reason ?? '…', count: (old?.count ?? 0) + 1, at, by }].slice(-100)
   })
   $.clock.after(0, async () => {
     try {
@@ -241,6 +289,51 @@ async function markFile($: $, path: string, toolUseId: string | undefined, agent
       await setReason($, path, '—')
     }
   })
+}
+
+/**
+ * Un autre agent, encore au travail, a déjà modifié ce fichier : selon l'option « conflits », on prévient
+ * (toast et marque sur l'entrée) ou on refuse (le texte du refus est renvoyé). Le fil principal n'est pas
+ * un agent : ses propres modifications ne bloquent personne.
+ */
+async function checkConflict($: $, path: string, who: string): Promise<string | undefined> {
+  const entry = (await read($, entries)).find(x => x.path === path)
+  if (!entry?.by || entry.by === who) return undefined
+  const other = (await read($, flowA))?.agents.find(a => a.key === entry.by && a.status === 'running')
+  if (!other) return undefined
+  if (opts.conflits === 'refuser') {
+    return `revo-flow : ce fichier est en cours de modification par l’agent « ${other.name} » ; coordonne-toi ou attends sa fin.`
+  }
+  $.ui.toast(`⚠ ${entry.rel} : fichier aussi modifié par « ${other.name} »`)
+  await update($, entries, list =>
+    list.map(x => (x.path === path ? { ...x, conflict: [...new Set([...(x.conflict ?? []), other.key])] } : x)),
+  )
+  return undefined
+}
+
+// ── Notifications ────────────────────────────────────────────────────────
+
+/** Une notification système si l'option « notifier » est active ; quand elle ne part pas, un toast. */
+async function notify($: $, text: string) {
+  if (!opts.notifier) return
+  try {
+    const sent = await $.ui.notify(text, { title: 'revo-flow' })
+    if (!sent.isSent) $.ui.toast(text)
+  } catch {
+    $.ui.toast(text)
+  }
+}
+
+/** Le flow est fini : phase done, heure de fin, et une notification avec la durée, le coût et les fichiers. */
+async function finishFlow($: $) {
+  const flow = await read($, flowA)
+  if (!flow || flow.phase === 'done') return
+  const now = await $.clock.now()
+  await setFlow($, f => ({ ...f, phase: 'done', endedAt: now }))
+  const lead = await read($, leadA)
+  const cost = lead.costUsd + flow.agents.reduce((sum, a) => sum + a.costUsd, 0)
+  const files = (await read($, entries)).length
+  await notify($, `« ${flow.title} » terminé · ${fmtDuration(now - flow.startedAt)} · ${euros(cost)} · ${files} fichier${files > 1 ? 's' : ''}`)
 }
 
 // ── Fenêtre latérale ─────────────────────────────────────────────────────
@@ -261,10 +354,40 @@ async function viewData($: $): Promise<ViewData> {
     session: await read($, sessionUsage),
     limits: await read($, limits),
     now: await $.clock.now(),
+    lastTurn: await read($, lastTurnA),
+    context: await read($, contextA),
+    sessionCostUsd: await read($, sessionCostA),
   }
 }
 
+/** Les boutons du panneau. */
+function paneActions($: $): PaneActions {
+  return {
+    clear: () => update($, entries, () => []),
+    stopAll: () => stopAll($),
+    stopAgent: key => stopAgent($, key),
+    retryAgent: key => retryAgent($, key),
+    approvePlan: () => approvePlan($),
+    cancelPlan: () => cancelPlan($),
+  }
+}
+
+/** La fenêtre de contexte telle que la barre d'état la lit ; rien tant qu'aucune réponse ne l'a mesurée. */
+function contextOf(c: SessionContextUsage): Context | null {
+  if (c.tokens === undefined) return null
+  return { percent: c.percent ?? Math.round((c.tokens / c.window) * 100), tokens: c.tokens, window: c.window }
+}
+
 const ENDED = new Set(['completed', 'failed', 'killed'])
+
+/** Un agent a fini : ses tâches sont closes, son heure de fin notée. */
+async function endAgent($: $, key: string, failed: boolean) {
+  const now = await $.clock.now()
+  await setAgent($, key, x => ({ ...x, status: failed ? 'failed' : 'done', isDoing: false, endedAt: now, tasks: finishTasks(x.tasks, failed) }))
+}
+
+/** Tous les agents ont fini pendant l'exécution : l'orchestrateur passe à la vérification. */
+const toReview = ($: $) => setFlow($, f => (f.phase === 'running' && allFinished(f) ? { ...f, phase: 'review' } : f))
 
 /**
  * L'état réel des sous-agents, lu auprès de Claude Code : la fin d'un tour ne veut pas dire que l'agent a fini
@@ -281,9 +404,113 @@ async function syncAgents($: $) {
     const isEnded = info ? ENDED.has(info.status) : a.hasEndedTurn === true
     if (!isEnded) continue
     const failed = (info !== undefined && info.status !== 'completed') || a.tasks.some(t => t.status === 'failed')
-    await setAgent($, a.key, x => ({ ...x, status: failed ? 'failed' : 'done', isDoing: false, tasks: finishTasks(x.tasks, failed) }))
+    await endAgent($, a.key, failed)
+    if (failed) await notify($, `agent « ${a.name} » en échec`)
   }
-  await setFlow($, f => (f.phase === 'running' && allFinished(f) ? { ...f, phase: 'review' } : f))
+  await toReview($)
+}
+
+// ── Arrêt, relance et validation du plan ─────────────────────────────────
+
+/** Arrête un sous-agent en cours avec TaskStop, comme le modèle le ferait, et le marque en échec. */
+async function stopAgent($: $, key: string) {
+  const a = (await read($, flowA))?.agents.find(x => x.key === key)
+  if (!a || a.status !== 'running') return
+  if (a.agentId) {
+    try {
+      await $.tool.call({ tool: 'TaskStop', task_id: a.agentId })
+    } catch {
+      // déjà fini, ou plus connu de Claude Code : on le marque quand même
+    }
+  }
+  await endAgent($, key, true)
+  await toReview($)
+}
+
+/** Arrête tous les agents en cours, puis interrompt le tour de l'orchestrateur s'il tourne. */
+async function stopAll($: $) {
+  for (const a of (await read($, flowA))?.agents ?? []) if (a.status === 'running') await stopAgent($, a.key)
+  const turnId = leadTurnId
+  leadTurnId = undefined
+  if (turnId) await $.turn.abort({ turnId }).catch(() => undefined)
+}
+
+/**
+ * Relance un agent : il redevient « en attente » (nouvelle tentative), ses tâches non faites repartent de zéro,
+ * et l'orchestrateur reçoit la consigne de le relancer avec l'outil Agent.
+ */
+async function retryAgent($: $, key: string) {
+  const a = (await read($, flowA))?.agents.find(x => x.key === key)
+  if (!a) return
+  if (a.status === 'running') await stopAgent($, key)
+  claimed.delete(key)
+  const tasks = a.tasks.map(t => (t.status === 'completed' ? t : { ...t, status: 'pending' as const }))
+  await setAgent($, key, ({ agentId: _id, startedAt: _start, endedAt: _end, ...x }) => ({
+    ...x,
+    status: 'waiting',
+    attempts: (x.attempts ?? 1) + 1,
+    tasks,
+    isDoing: false,
+    hasReported: false,
+    hasEndedTurn: false,
+  }))
+  // Le flow n'est plus fini : il repart en exécution.
+  await setFlow($, ({ endedAt: _end, ...f }) => ({ ...f, phase: f.phase === 'review' || f.phase === 'done' ? 'running' : f.phase }))
+  const left = remainingTasks({ ...a, tasks })
+    .map(t => t.title)
+    .join(' ; ')
+  void $.prompt
+    .submit({
+      text: `revo-flow : relance l’agent « ${a.name} » avec l’outil Agent (description = son nom exact) pour ses tâches restantes : ${left}`,
+      asUser: true,
+    })
+    .catch(() => undefined)
+}
+
+const CANCELLED =
+  'revo-flow : plan annulé par l’utilisateur. Demande-lui ce qu’il faut changer, puis propose un nouveau plan avec l’outil plan.'
+
+/** Le plan est refusé : retour à la planification, sans agents. */
+async function resetPlan($: $) {
+  claimed.clear()
+  await setFlow($, f => ({ ...f, phase: 'planning', agents: [], isApproved: false }))
+}
+
+/** Bouton « Lancer » : répond au dialogue en attente, sinon valide le plan posé. */
+async function approvePlan($: $) {
+  if (pendingDecision) return pendingDecision({ isLaunched: true })
+  await setFlow($, f => (f.phase === 'dispatch' ? { ...f, isApproved: true } : f))
+}
+
+/** Bouton « Annuler » : répond au dialogue en attente, sinon renvoie le plan (pas encore lancé) à la planification. */
+async function cancelPlan($: $) {
+  if (pendingDecision) return pendingDecision({ isLaunched: false })
+  const flow = await read($, flowA)
+  if (!flow || flow.phase !== 'dispatch' || flow.agents.some(a => a.agentId)) return
+  await resetPlan($)
+  void $.prompt.submit({ text: CANCELLED, asUser: true }).catch(() => undefined)
+}
+
+/**
+ * Demande à l'utilisateur de valider le plan. Le dialogue ou un bouton du panneau répond, le premier des deux.
+ * Sans personne à qui demander (-p) ou dialogue fermé, le plan part : la validation ne doit jamais bloquer le flow.
+ * Un texte libre (« Other ») vaut refus, transmis au modèle.
+ */
+function decide($: $, plan: PlanInput): Promise<Decision> {
+  return new Promise(resolve => {
+    let isSettled = false
+    const settle = (d: Decision) => {
+      if (isSettled) return
+      isSettled = true
+      if (pendingDecision === settle) pendingDecision = undefined
+      resolve(d)
+    }
+    pendingDecision = settle
+    $.ui.ask(planQuestion(plan), { options: ['Lancer', 'Annuler'], header: 'revo-flow' }).then(
+      answer => settle(answer === 'Lancer' ? { isLaunched: true } : answer === 'Annuler' ? { isLaunched: false } : { isLaunched: false, note: answer }),
+      () => settle({ isLaunched: true }),
+    )
+  })
 }
 
 function statusText(flow: Flow | null) {
@@ -296,15 +523,26 @@ function statusText(flow: Flow | null) {
   return [head, ...rows].join('\n')
 }
 
+function readOptions(o: PluginOptions) {
+  opts.validerPlan = o.validerPlan !== false
+  opts.conflits = o.conflits === 'refuser' ? 'refuser' : 'avertir'
+  opts.notifier = o.notifier !== false
+}
+
 // ── Les hooks ────────────────────────────────────────────────────────────
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  readOptions(options)
+
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'revo-flow',
       description:
         'revo-flow <demande> : l’orchestrateur lit les specs, fait le plan, répartit les tâches entre des sous-agents et suit chacun dans le panneau · statut · panneau · stop',
       argumentHint: '<demande> | statut | panneau | stop',
+      // statut, panneau et stop répondent tout de suite, même pendant un tour ; une nouvelle demande part
+      // par prompt.submit, qui attend de toute façon que la session soit libre.
+      immediate: true,
     })
     // Les outils ne sont déclarés qu'au premier /revo-flow ; après un rechargement en plein flow, on les redéclare.
     if (await read($, flowA)) await registerTools($)
@@ -313,6 +551,8 @@ export const register: Register = on => {
     await loadTokens($)
     const usage = await $.session.usage()
     await update($, limits, () => usage.rateLimits.map(l => ({ ...l })))
+    await update($, contextA, () => contextOf(usage.context))
+    await update($, sessionCostA, () => usage.cost?.usd ?? 0)
     watchAgents($)
     return next(e)
   })
@@ -324,9 +564,22 @@ export const register: Register = on => {
 
     if (!args || word === 'statut' || word === 'status') return { text: statusText(flow) }
     if (word === 'stop') {
+      let isStopped = false
+      if (flow?.agents.some(a => a.status === 'running')) {
+        // Sans personne à qui demander, on arrête tout : c'est ce que « stop » veut dire.
+        const answer = await $.ui
+          .ask('Des agents revo-flow tournent encore. Les arrêter ?', { options: ['Tout arrêter', 'Garder les agents'], header: 'revo-flow' })
+          .catch(() => 'Tout arrêter')
+        isStopped = answer !== 'Garder les agents'
+      } else isStopped = flow !== null && leadTurnId !== undefined
+      if (isStopped) await stopAll($)
       await update($, flowA, () => null)
       if (await isPaneShown($)) await $.ui.close({ id: PANE })
-      return { text: 'revo-flow : flow arrêté, barre et panneau retirés. Les agents déjà lancés continuent jusqu’au bout.' }
+      return {
+        text: isStopped
+          ? 'revo-flow : flow arrêté, agents et orchestrateur interrompus ; barre et panneau retirés.'
+          : 'revo-flow : flow arrêté, barre et panneau retirés. Les agents déjà lancés continuent jusqu’au bout.',
+      }
     }
     if (word === 'panneau') {
       if (await isPaneShown($)) {
@@ -343,17 +596,7 @@ export const register: Register = on => {
     // Une nouvelle demande : le panneau s'ouvre sur « En attente du plan d'exécution » ; les agents n'y entrent qu'avec le plan.
     await registerTools($)
     const now = await $.clock.now()
-    let project = ''
-    let branch = ''
-    try {
-      const here = projectOf((await $.fs.stat('.', { resolve: true })).realPath)
-      if (here) {
-        project = here.name
-        branch = await gitBranch($, here.root)
-      }
-    } catch {
-      // hors d'un projet : pas d'en-tête projet · branche
-    }
+    const { project, branch } = await projectHeader($)
     claimed.clear()
     await update($, flowA, () => ({
       id: String(now),
@@ -384,11 +627,31 @@ export const register: Register = on => {
   })
 
   on('turn.start', async ($, e, next) => {
+    // Le dernier tour de l'orchestrateur se compte même hors flow : la ligne de fin de tour en a besoin.
+    if (e.agentId === undefined) {
+      leadTurnId = e.turnId
+      const at = await $.clock.now()
+      await update($, lastTurnA, () => ({ at, durationMs: 0, tokens: EMPTY, modelId: '', costUsd: 0, isLive: true }))
+    }
     if (await read($, flowA)) await update($, isBusy, () => true)
     return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
+    if (e.agentId === undefined) {
+      if (leadTurnId === e.turnId) leadTurnId = undefined
+      const at = await $.clock.now()
+      // La fin du tour fait foi : son usage (toutes requêtes comprises) remplace le cumul, s'il est connu.
+      const u = e.usage
+      await update($, lastTurnA, t => ({
+        at: t?.at ?? at - e.durationMs,
+        durationMs: e.durationMs,
+        isLive: false,
+        tokens: u ? addUsage(EMPTY, u) : (t?.tokens ?? EMPTY),
+        costUsd: u ? costUsd(u.model, u) : (t?.costUsd ?? 0),
+        modelId: u?.model ?? t?.modelId ?? '',
+      }))
+    }
     const flow = await read($, flowA)
     if (!flow) {
       if (!e.agentId) await update($, isBusy, () => false)
@@ -403,10 +666,17 @@ export const register: Register = on => {
       return next(e)
     }
     await update($, isBusy, () => false)
+    // Interrompu avant même le plan : il n'y a rien à suivre, le flow est abandonné.
+    if (e.reason === 'aborted' && flow.phase === 'planning') {
+      await update($, flowA, () => null)
+      $.ui.toast('revo-flow : flow annulé')
+      return next(e)
+    }
     await update($, leadA, l => ({ ...l, isDoing: false }))
     await syncAgents($)
     // L'orchestrateur a fini son tour après que tous les agents ont fini : c'était sa conclusion.
-    await setFlow($, f => ((f.phase === 'review' || f.phase === 'running') && allFinished(f) ? { ...f, phase: 'done' } : f))
+    const now = await read($, flowA)
+    if (now && (now.phase === 'review' || now.phase === 'running') && allFinished(now)) await finishFlow($)
     return next(e)
   })
 
@@ -420,6 +690,11 @@ export const register: Register = on => {
     try {
       const u = r.usage ?? undefined
       await recordUsage($, u)
+      if (u && !e.agentId) {
+        await update($, lastTurnA, t =>
+          t?.isLive ? { ...t, modelId: step.model, tokens: addUsage(t.tokens, u), costUsd: t.costUsd + costUsd(step.model, u) } : t,
+        )
+      }
       if (flow && u) {
         if (!e.agentId) {
           await update($, leadA, l => ({
@@ -430,7 +705,15 @@ export const register: Register = on => {
             costUsd: l.costUsd + costUsd(step.model, u),
           }))
         } else if (a) {
-          await setAgent($, a.key, x => ({ ...x, hasEndedTurn: false, modelId: step.model, tokens: addUsage(x.tokens, u), costUsd: x.costUsd + costUsd(step.model, u) }))
+          const now = await $.clock.now()
+          await setAgent($, a.key, x => ({
+            ...x,
+            hasEndedTurn: false,
+            lastActiveAt: now,
+            modelId: step.model,
+            tokens: addUsage(x.tokens, u),
+            costUsd: x.costUsd + costUsd(step.model, u),
+          }))
         }
       }
     } catch {
@@ -449,6 +732,9 @@ export const register: Register = on => {
         deny: `revo-flow : aucun sous-agent avant le plan. Lis les specs toi-même, appelle ${PLAN_TOOL}, puis lance les agents prévus.`,
       }
     }
+    if (flow.phase === 'dispatch' && !flow.isApproved) {
+      return { deny: 'revo-flow : le plan attend la validation de l’utilisateur. Attends sa réponse avant de lancer les agents.' }
+    }
     const a = matchAgent(
       flow.agents.filter(x => !claimed.has(x.key)),
       e.description,
@@ -462,19 +748,29 @@ export const register: Register = on => {
       return r
     }
     const agentId = r.agentId
-    await setAgent($, a.key, x => ({ ...x, agentId, modelId: r.model, status: 'running' }))
+    const now = await $.clock.now()
+    await setAgent($, a.key, x => ({
+      ...x,
+      agentId,
+      modelId: r.model,
+      status: 'running',
+      startedAt: now,
+      lastActiveAt: now,
+      attempts: x.attempts ?? 1,
+    }))
     await setFlow($, f => (f.phase === 'dispatch' ? { ...f, phase: 'running' } : f))
     // L'exécution commence : c'est maintenant que le panneau s'ouvre.
     try {
-      const now = await read($, flowA)
-      if (now && !now.isPaneClosed && !(await isPaneShown($))) await openPane($)
+      const shown = await read($, flowA)
+      if (shown && !shown.isPaneClosed && !(await isPaneShown($))) await openPane($)
     } catch {
       // le panneau ne doit jamais gêner le lancement
     }
     return r
   })
 
-  // L'orchestrateur pose son plan : les agents, leur modèle, leur effort et leurs tâches.
+  // L'orchestrateur pose son plan : les agents, leur modèle, leur effort et leurs tâches. Selon l'option
+  // « validerPlan », l'utilisateur le valide avant que l'outil ne réponde : aucun agent ne part sans son accord.
   on('tool.call', { tool: PLAN_TOOL }, async ($, e) => {
     const flow = await read($, flowA)
     if (!flow) return { deny: 'revo-flow : aucun flow en cours. L’utilisateur doit lancer /revo-flow <demande>.' }
@@ -489,8 +785,17 @@ export const register: Register = on => {
       title: plan.title,
       summary: plan.summary,
       phase: 'dispatch',
+      isApproved: !opts.validerPlan,
       agents: plan.agents.map(a => ({ ...a, status: 'waiting' as const, tokens: EMPTY, costUsd: 0 })),
     }))
+    if (opts.validerPlan) {
+      const d = await decide($, plan)
+      if (!d.isLaunched) {
+        await resetPlan($)
+        return { result: (d.note ? `${CANCELLED} Sa réponse : « ${d.note} »` : CANCELLED) as never }
+      }
+      await setFlow($, f => ({ ...f, isApproved: true }))
+    }
     return { result: dispatchText(plan) as never }
   }).catch(() => ({ deny: 'revo-flow : le plan n’a pas pu être enregistré, réessaie.' }))
 
@@ -519,8 +824,16 @@ export const register: Register = on => {
     const label = describeCall(tool, input)
     const isEdit = tool === 'Edit' || tool === 'Write' || tool === 'NotebookEdit'
     const path = isEdit ? String(input.file_path ?? input.notebook_path ?? '') : ''
+    if (path) {
+      const deny = await checkConflict($, path, who).catch(() => undefined)
+      if (deny) return { deny }
+    }
     try {
       await setActivity($, who, { doing: label, isDoing: true, filePath: path, reason: path ? '…' : '' })
+      if (who !== 'lead') {
+        const now = await $.clock.now()
+        await setAgent($, who, a => ({ ...a, lastActiveAt: now }))
+      }
     } catch {
       // le suivi ne doit jamais gêner l'outil
     }
@@ -531,7 +844,7 @@ export const register: Register = on => {
       const done = failed ? `✗ ${label}` : label
       const prev = who === 'lead' ? await read($, leadA) : (await read($, flowA))?.agents.find(a => a.key === who)
       await setActivity($, who, { isDoing: false, history: [...(prev?.history ?? []), done].slice(-3) })
-      if (!failed && path) await markFile($, path, e.tool_use_id, e.agentId)
+      if (!failed && path) await markFile($, path, who, e.tool_use_id, e.agentId)
       // Un agent qui tient un TodoWrite calqué sur sa liste, sans passer par l'outil step : on suit quand même.
       if (!failed && tool === 'TodoWrite' && who !== 'lead') {
         await setAgent($, who, a => {
@@ -547,7 +860,23 @@ export const register: Register = on => {
 
   on('session.measure', async ($, e, next) => {
     if (e.changed.includes('rateLimits')) await update($, limits, () => e.rateLimits.map(l => ({ ...l })))
+    if (e.changed.includes('context')) await update($, contextA, () => contextOf(e.context))
+    if (e.changed.includes('cost') && e.cost) {
+      const usd = e.cost.usd
+      await update($, sessionCostA, () => usd)
+    }
     return next(e)
+  })
+
+  // Après une compaction de la conversation principale, en plein flow : le résumé peut perdre le rôle
+  // d'orchestrateur et l'état des agents ; on les rajoute en fin de conversation, comme un message de l'utilisateur.
+  // precompute n'installe rien : la compaction qui reprendra ce résultat repassera par ici.
+  on('session.compact', async ($, e, next) => {
+    const r = await next(e)
+    if (e.agentId !== undefined || e.trigger === 'precompute' || !r.messages) return r
+    const flow = await read($, flowA)
+    if (!flow || flow.phase === 'done') return r
+    return { ...r, messages: [...r.messages, { role: 'user' as const, text: flowRecap(flow), toolUses: [] }] }
   })
 
   // Fermé par la croix ou Échap : on ne le rouvre plus tout seul pendant ce flow.
@@ -561,8 +890,9 @@ export const register: Register = on => {
     if (e.props.hasSurvey || !(await read($, flowA))) return next(e)
     const d = await viewData($)
     if (e.surface === 'desktop' || e.surface === 'vscode') {
-      return DesktopBand($.ui.resolve(e) as unknown as Elements['desktop'], d, Math.round(e.props.bodyColumns * 7.6)) ?? next(e)
+      return DesktopBand($.ui.resolve(e) as unknown as Elements['desktop'], d, pixels(e.props.bodyColumns)) ?? next(e)
     }
+    if (e.surface === 'mobile') return MobileBand($.ui.resolve(e) as unknown as Elements['mobile'], d, pixels(e.props.bodyColumns)) ?? next(e)
     if (e.surface === 'terminal') return TerminalBand($.ui.resolve(e) as unknown as Elements['terminal'], d) ?? next(e)
     return next(e)
   })
@@ -570,11 +900,24 @@ export const register: Register = on => {
   // Le panneau : l'orchestrateur et chaque sous-agent avec sa propre barre, les fichiers, la consommation.
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
     const d = await viewData($)
-    const clear = () => update($, entries, () => [])
+    const actions = paneActions($)
     if (e.surface === 'desktop' || e.surface === 'vscode') {
-      return DesktopPane($.ui.resolve(e) as unknown as Elements['desktop'], d, clear, e.props.bodyColumns)
+      return DesktopPane($.ui.resolve(e) as unknown as Elements['desktop'], d, actions, e.props.bodyColumns)
     }
-    if (e.surface === 'terminal') return TerminalPane($.ui.resolve(e) as unknown as Elements['terminal'], d, clear)
+    if (e.surface === 'mobile') return MobilePane($.ui.resolve(e) as unknown as Elements['mobile'], d, actions, e.props.bodyColumns)
+    if (e.surface === 'terminal') return TerminalPane($.ui.resolve(e) as unknown as Elements['terminal'], d, actions)
     return next(e)
+  })
+
+  // La ligne de fin de tour (« Baked for 3s ») : durée, tokens et coût du dernier tour de l'orchestrateur.
+  // Elle n'a pas d'identifiant de tour : seule celle dont la durée est celle du dernier tour est remplacée,
+  // les lignes des tours précédents restent celles du moteur.
+  on('ui.render', { component: 'TurnDuration' }, async ($, e, next) => {
+    if (e.surface !== 'terminal') return next(e)
+    const lastTurn = await read($, lastTurnA)
+    if (!lastTurn || lastTurn.isLive || Math.abs(lastTurn.durationMs - e.props.durationMs) > 1500) return next(e)
+    const d = await viewData($)
+    const props = { word: e.props.word, durationMs: e.props.durationMs }
+    return TerminalTurnLine($.ui.resolve(e) as unknown as Elements['terminal'], d, props) ?? next(e)
   })
 }
