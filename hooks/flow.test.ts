@@ -1,4 +1,4 @@
-import { expect, mock, test } from 'claude-code/testing'
+import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
@@ -17,8 +17,10 @@ import {
   remainingTasks,
 } from './lib'
 import type { Flow, FlowAgent } from '../types'
+import { MACOS, WINDOWS, diskKey, native, type Os } from './test-os'
 
-const ROOT = 'C:\\Users\\x\\Documents\\Front\\ui-vel'
+const rootOf = (os: Os) => native(os, 'Documents', 'Front', 'ui-vel')
+const ROOT = rootOf(WINDOWS)
 const FILE = `${ROOT}\\components\\Basket.vue`
 const NOW = Date.UTC(2026, 9, 12, 9)
 const STEP_USAGE = { model: 'x', input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 1000, cache_creation_input_tokens: 20 }
@@ -43,9 +45,9 @@ const PLAN = {
   ],
 }
 
-function world(on: On) {
+function world(on: On, os: Os = WINDOWS) {
   mock.store(on, {})
-  mock.env(on, { USERPROFILE: 'C:\\Users\\x' })
+  mock.env(on, os.env)
   const clock = mock.clock(on, { now: NOW })
   const sent: { text: string; context: readonly string[] }[] = []
   const opened: string[] = []
@@ -63,7 +65,7 @@ function world(on: On) {
     if (e.argv.includes('--short')) return out('abc1234\n')
     return out('feat/promo\n')
   })
-  on('fs.stat', () => ({ value: { realPath: ROOT, kind: 'directory' } }) as never)
+  on('fs.stat', () => ({ value: { realPath: rootOf(os), kind: 'directory' } }) as never)
   on('fs.list', () => ({ value: [] }) as never)
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.usage', () => ({ value: { rateLimits: [], context: { window: 200000 } } }) as never)
@@ -77,11 +79,11 @@ function world(on: On) {
   })
   on('session.messages', () => ({ value: [] }) as never)
   // Le dépôt de la session : le projet du cache.
-  on('session.repo', () => ({ value: { root: ROOT, remote: null, internal: false, name: 'ui-vel' } }) as never)
+  on('session.repo', () => ({ value: { root: rootOf(os), remote: null, internal: false, name: 'ui-vel' } }) as never)
   // Un disque en mémoire pour les graphes du cache (~/.claude/revo-flow/graphs) et les sources du projet ;
-  // l'hôte passe les chemins à la façon Windows : les clés sont en « / ».
+  // les clés sont celles de diskKey, la même pour un chemin Windows ou macOS.
   const disk: Record<string, string> = {}
-  const at = (p: string) => p.replace(/\\/g, '/')
+  const at = diskKey
   on('fs.read', (_$, e) => (at(e.path) in disk ? { value: disk[at(e.path)]! } : { deny: `ENOENT ${e.path}` }) as never)
   on('fs.write', (_$, e) => {
     disk[at(e.path)] = e.text
@@ -540,122 +542,126 @@ test('l’agent de construction revo-flow-cache passe en planification, sans ent
   expect((w.states.flow as Flow).agents).toEqual([])
 })
 
-test('un Read d’un agent du flow alimente flowCache.lus (chemin relatif, tokens, qui)', async ($, on) => {
-  const w = world(on)
-  const { front } = await twoRunning($, w)
-  await $.tool.call({ tool: 'Read', file_path: FILE, limit: 40, agentId: front, tool_use_id: 'r1' } as never)
-  // Hors flow (un agent inconnu) : rien n'est compté.
-  await $.tool.call({ tool: 'Read', file_path: FILE, agentId: 'inconnu', tool_use_id: 'r2' } as never)
-  await w.clock.settle()
-  expect(flowCacheOf(w)?.lus).toEqual([{ p: 'components/Basket.vue', tok: 120, par: 'front-panier' }])
-})
+for (const os of [WINDOWS, MACOS]) {
+  describe(os.nom, () => {
+    test('un Read d’un agent du flow alimente flowCache.lus (chemin relatif, tokens, qui)', async ($, on) => {
+      const w = world(on, os)
+      const { front } = await twoRunning($, w)
+      await $.tool.call({ tool: 'Read', file_path: native(os, 'Documents', 'Front', 'ui-vel', 'components', 'Basket.vue'), limit: 40, agentId: front, tool_use_id: 'r1' } as never)
+      // Hors flow (un agent inconnu) : rien n'est compté.
+      await $.tool.call({ tool: 'Read', file_path: native(os, 'Documents', 'Front', 'ui-vel', 'components', 'Basket.vue'), agentId: 'inconnu', tool_use_id: 'r2' } as never)
+      await w.clock.settle()
+      expect(flowCacheOf(w)?.lus).toEqual([{ p: 'components/Basket.vue', tok: 120, par: 'front-panier' }])
+    })
 
-test('outil cache : une erreur revient en texte, jamais en exception', async ($, on) => {
-  const w = world(on)
-  await launch($, w)
-  const r = await $.tool.call({ tool: 'mcp__revo-flow__cache', action: 'nimporte' } as never)
-  expect(JSON.stringify(r)).toMatch(/revo-flow cache : /)
-  expect(r.deny).toBeUndefined()
-})
+    test('outil cache : une erreur revient en texte, jamais en exception', async ($, on) => {
+      const w = world(on, os)
+      await launch($, w)
+      const r = await $.tool.call({ tool: 'mcp__revo-flow__cache', action: 'nimporte' } as never)
+      expect(JSON.stringify(r)).toMatch(/revo-flow cache : /)
+      expect(r.deny).toBeUndefined()
+    })
 
-/** Un projet ui-vel suivi par git : le panier et sa promo, lisibles sur le disque en mémoire. */
-function seedProject(w: ReturnType<typeof world>) {
-  const root = ROOT.replace(/\\/g, '/')
-  w.tracked['components/Basket.vue'] = 'a1a1a1a1a1a1'
-  w.tracked['components/Promo.vue'] = 'b2b2b2b2b2b2'
-  w.disk[`${root}/components/Basket.vue`] = `<template><Promo /></template>\n<script setup>\nimport Promo from './Promo.vue'\n</script>\n${'// panier\n'.repeat(40)}`
-  w.disk[`${root}/components/Promo.vue`] = `<template><input /></template>\n${'// code promo\n'.repeat(20)}`
+    /** Un projet ui-vel suivi par git : le panier et sa promo, lisibles sur le disque en mémoire. */
+    function seedProject(w: ReturnType<typeof world>, os: Os) {
+      const root = diskKey(rootOf(os))
+      w.tracked['components/Basket.vue'] = 'a1a1a1a1a1a1'
+      w.tracked['components/Promo.vue'] = 'b2b2b2b2b2b2'
+      w.disk[`${root}/components/Basket.vue`] = `<template><Promo /></template>\n<script setup>\nimport Promo from './Promo.vue'\n</script>\n${'// panier\n'.repeat(40)}`
+      w.disk[`${root}/components/Promo.vue`] = `<template><input /></template>\n${'// code promo\n'.repeat(20)}`
+    }
+
+    test('/revo-flow cache : construit le graphe, ouvre la section du panneau, texte au terminal', async ($, on) => {
+      const w = world(on, os)
+      seedProject(w, os)
+      const text = await run($, 'cache')
+      expect(text).toMatch(/revo-flow cache · ui-vel : 2 fichiers, 0 fiche/)
+      expect(w.opened).toEqual(['revo-flow'])
+      expect(w.states.cacheOpen).toBe(true)
+      expect(w.states.cacheStats).toMatchObject({ projet: 'ui-vel', fichiers: 2 })
+      expect(w.sent).toEqual([])
+    })
+
+    test('flow avec cache : fiche apprise, proposée au lancement, servie, puis complétée en fin de flow', async ($, on) => {
+      const w = world(on, os)
+      seedProject(w, os)
+      // Une fiche apprise hors flow (manuel).
+      const learned = await $.tool.call({
+        tool: 'mcp__revo-flow__cache',
+        action: 'apprendre',
+        feature: 'panier',
+        titre: 'Panier et code promo',
+        alias: ['panier', 'code promo', 'basket'],
+        resume: 'Le panier et son code promo : saisie, validation côté API, application.',
+        fichiers: [{ p: 'components/Basket.vue', role: 'coeur' }, { p: 'components/Inconnu.vue', role: 'ui' }],
+      } as never)
+      expect(JSON.stringify(learned)).toMatch(/fiche « Panier et code promo » apprise \(1 fichier\)/)
+      expect(JSON.stringify(learned)).toMatch(/Chemins rejetés, inconnus du projet : components\/Inconnu\.vue/)
+
+      // Au lancement : confirmation, puis la fiche part dans le contexte avec le rôle d'orchestrateur.
+      w.ctl.answer = 'Utiliser'
+      const started = await launch($, w)
+      expect(w.asked[0]).toMatch(/Je pense qu’il s’agit de « Panier et code promo » .confiance 0,[0-9]+. : utiliser la fiche du cache ./)
+      expect(started.context?.length).toBe(2)
+      expect(started.context?.[1]).toMatch(/Panier/)
+      const fc = w.states.flowCache as { servis: { p: string; par: string }[]; feature?: string; injecte: number }
+      expect(fc.feature).toBe('panier')
+      expect(fc.servis.map(h => `${h.p}:${h.par}`)).toEqual(['components/Basket.vue:brief'])
+      expect(fc.injecte).toBeGreaterThan(0)
+
+      // Le flow tourne ; un agent lit un fichier hors fiche ; tout le monde finit sans « apprendre ».
+      w.ctl.answer = 'Lancer'
+      await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN } as never)
+      const front = (await spawn($, 'Front panier')).agentId!
+      const api = (await spawn($, 'API promo')).agentId!
+      await $.tool.call({ tool: 'Read', file_path: native(os, 'Documents', 'Front', 'ui-vel', 'components', 'Promo.vue'), limit: 10, agentId: front, tool_use_id: 'r1' } as never)
+      await w.clock.settle()
+      w.status[front] = 'completed'
+      w.status[api] = 'completed'
+      await w.clock.advance(3000)
+      await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' } as never)
+      expect(w.notified.join('\n')).toMatch(/« Code promo panier » terminé .* fiche auto « panier »/)
+      const saved = Object.values(w.disk).find(t => t.includes('"panier"') && t.includes('"features"'))!
+      const graph = JSON.parse(saved) as { features: Record<string, { fichiers: { p: string; role: string }[]; usages: { servie: number } }> }
+      expect(graph.features.panier!.fichiers.map(f => `${f.p}:${f.role}`)).toEqual(['components/Basket.vue:coeur', 'components/Promo.vue:peripherique'])
+      expect(graph.features.panier!.usages.servie).toBe(1)
+    })
+
+    test('brief : « Ignorer » ne sert pas la fiche, le brief court part quand même', async ($, on) => {
+      const w = world(on, os)
+      seedProject(w, os)
+      await $.tool.call({ tool: 'mcp__revo-flow__cache', action: 'apprendre', feature: 'panier', titre: 'Panier', alias: ['panier'], fichiers: [{ p: 'components/Basket.vue' }] } as never)
+      w.ctl.answer = 'Ignorer'
+      const started = await launch($, w)
+      expect(started.context?.length).toBe(2)
+      const fc = w.states.flowCache as { servis: unknown[]; feature?: string }
+      expect(fc.servis).toEqual([])
+      expect(fc.feature).toBeUndefined()
+    })
+
+    test('/revo-flow cache build <feature> : coût confirmé, agent revo-flow-cache lancé hors flow', async ($, on) => {
+      const w = world(on, os)
+      seedProject(w, os)
+      w.ctl.answer = 'Construire'
+      const text = await run($, 'cache build panier')
+      expect(w.asked[0]).toMatch(/Construire la fiche « panier » pour ui-vel : ≈ 0,\d\d €/)
+      expect(text).toMatch(/construction de « panier » lancée en arrière-plan/)
+      expect(w.prompts[0]).toMatch(/Construis la fiche de la feature « panier » du projet « ui-vel »/)
+      expect(w.prompts[0]).toContain(`projet = "${rootOf(os).replace(/\\/g, '/')}"`)
+      // Ni flow, ni demande envoyée : la construction vit à côté.
+      expect(w.states.flow ?? null).toBeNull()
+      expect(w.sent).toEqual([])
+    })
+
+    test('/revo-flow cache build <feature> annulé : aucun agent', async ($, on) => {
+      const w = world(on, os)
+      seedProject(w, os)
+      w.ctl.answer = 'Annuler'
+      expect(await run($, 'cache build panier')).toMatch(/construction annulée/)
+      expect(w.prompts).toEqual([])
+    })
+  })
 }
-
-test('/revo-flow cache : construit le graphe, ouvre la section du panneau, texte au terminal', async ($, on) => {
-  const w = world(on)
-  seedProject(w)
-  const text = await run($, 'cache')
-  expect(text).toMatch(/revo-flow cache · ui-vel : 2 fichiers, 0 fiche/)
-  expect(w.opened).toEqual(['revo-flow'])
-  expect(w.states.cacheOpen).toBe(true)
-  expect(w.states.cacheStats).toMatchObject({ projet: 'ui-vel', fichiers: 2 })
-  expect(w.sent).toEqual([])
-})
-
-test('flow avec cache : fiche apprise, proposée au lancement, servie, puis complétée en fin de flow', async ($, on) => {
-  const w = world(on)
-  seedProject(w)
-  // Une fiche apprise hors flow (manuel).
-  const learned = await $.tool.call({
-    tool: 'mcp__revo-flow__cache',
-    action: 'apprendre',
-    feature: 'panier',
-    titre: 'Panier et code promo',
-    alias: ['panier', 'code promo', 'basket'],
-    resume: 'Le panier et son code promo : saisie, validation côté API, application.',
-    fichiers: [{ p: 'components/Basket.vue', role: 'coeur' }, { p: 'components/Inconnu.vue', role: 'ui' }],
-  } as never)
-  expect(JSON.stringify(learned)).toMatch(/fiche « Panier et code promo » apprise \(1 fichier\)/)
-  expect(JSON.stringify(learned)).toMatch(/Chemins rejetés, inconnus du projet : components\/Inconnu\.vue/)
-
-  // Au lancement : confirmation, puis la fiche part dans le contexte avec le rôle d'orchestrateur.
-  w.ctl.answer = 'Utiliser'
-  const started = await launch($, w)
-  expect(w.asked[0]).toMatch(/Je pense qu’il s’agit de « Panier et code promo » .confiance 0,[0-9]+. : utiliser la fiche du cache ./)
-  expect(started.context?.length).toBe(2)
-  expect(started.context?.[1]).toMatch(/Panier/)
-  const fc = w.states.flowCache as { servis: { p: string; par: string }[]; feature?: string; injecte: number }
-  expect(fc.feature).toBe('panier')
-  expect(fc.servis.map(h => `${h.p}:${h.par}`)).toEqual(['components/Basket.vue:brief'])
-  expect(fc.injecte).toBeGreaterThan(0)
-
-  // Le flow tourne ; un agent lit un fichier hors fiche ; tout le monde finit sans « apprendre ».
-  w.ctl.answer = 'Lancer'
-  await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN } as never)
-  const front = (await spawn($, 'Front panier')).agentId!
-  const api = (await spawn($, 'API promo')).agentId!
-  await $.tool.call({ tool: 'Read', file_path: `${ROOT}\\components\\Promo.vue`, limit: 10, agentId: front, tool_use_id: 'r1' } as never)
-  await w.clock.settle()
-  w.status[front] = 'completed'
-  w.status[api] = 'completed'
-  await w.clock.advance(3000)
-  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' } as never)
-  expect(w.notified.join('\n')).toMatch(/« Code promo panier » terminé .* fiche auto « panier »/)
-  const saved = Object.values(w.disk).find(t => t.includes('"panier"') && t.includes('"features"'))!
-  const graph = JSON.parse(saved) as { features: Record<string, { fichiers: { p: string; role: string }[]; usages: { servie: number } }> }
-  expect(graph.features.panier!.fichiers.map(f => `${f.p}:${f.role}`)).toEqual(['components/Basket.vue:coeur', 'components/Promo.vue:peripherique'])
-  expect(graph.features.panier!.usages.servie).toBe(1)
-})
-
-test('brief : « Ignorer » ne sert pas la fiche, le brief court part quand même', async ($, on) => {
-  const w = world(on)
-  seedProject(w)
-  await $.tool.call({ tool: 'mcp__revo-flow__cache', action: 'apprendre', feature: 'panier', titre: 'Panier', alias: ['panier'], fichiers: [{ p: 'components/Basket.vue' }] } as never)
-  w.ctl.answer = 'Ignorer'
-  const started = await launch($, w)
-  expect(started.context?.length).toBe(2)
-  const fc = w.states.flowCache as { servis: unknown[]; feature?: string }
-  expect(fc.servis).toEqual([])
-  expect(fc.feature).toBeUndefined()
-})
-
-test('/revo-flow cache build <feature> : coût confirmé, agent revo-flow-cache lancé hors flow', async ($, on) => {
-  const w = world(on)
-  seedProject(w)
-  w.ctl.answer = 'Construire'
-  const text = await run($, 'cache build panier')
-  expect(w.asked[0]).toMatch(/Construire la fiche « panier » pour ui-vel : ≈ 0,\d\d €/)
-  expect(text).toMatch(/construction de « panier » lancée en arrière-plan/)
-  expect(w.prompts[0]).toMatch(/Construis la fiche de la feature « panier » du projet « ui-vel »/)
-  expect(w.prompts[0]).toMatch(/projet = "C:\/Users\/x\/Documents\/Front\/ui-vel"/)
-  // Ni flow, ni demande envoyée : la construction vit à côté.
-  expect(w.states.flow ?? null).toBeNull()
-  expect(w.sent).toEqual([])
-})
-
-test('/revo-flow cache build <feature> annulé : aucun agent', async ($, on) => {
-  const w = world(on)
-  seedProject(w)
-  w.ctl.answer = 'Annuler'
-  expect(await run($, 'cache build panier')).toMatch(/construction annulée/)
-  expect(w.prompts).toEqual([])
-})
 
 test('LEAD_BRIEF : cache d’abord (une carte, pas la vérité), extrait aux agents, « apprendre » avant de conclure', () => {
   expect(LEAD_BRIEF).toMatch(/commence par le cache revo-flow/)

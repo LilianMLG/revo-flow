@@ -1,11 +1,29 @@
 // Stockage et git du cache : tout ce qui touche le disque et git. Les modèles et la logique du graphe sont dans graph.ts (pur).
-// Pas de Node ici : seulement l'API `$` du plugin ($.fs, $.process, $.env, $.session, $.clock).
+// Pas de Node ici, et pas de `$` non plus : le moteur ne suit `$` que dans le fichier qui le reçoit, jamais à travers un import.
+// register.tsx construit donc un `Io` (ioOf) dont chaque méthode appelle $.fs, $.process, $.env, $.session ou $.clock.
 import type { EngineInterface } from 'claude-code'
 
 import type { Graph, SourceFile } from '../../types/cache'
 import { EXCLUS_DEFAUT, buildGraph, isExcluded, isIndexable, projectKey, updateFiles } from './graph'
 
 type $ = EngineInterface
+
+/** Ce que le cache demande au moteur ; construit par ioOf($) dans register.tsx. */
+export type Io = {
+  fs: {
+    read: (path: string) => Promise<string>
+    write: $['fs']['write']
+    list: $['fs']['list']
+    exists: $['fs']['exists']
+    stat: (path: string) => ReturnType<$['fs']['stat']>
+  }
+  run: $['process']['run']
+  now: $['clock']['now']
+  /** USERPROFILE (Windows), sinon HOME ; undefined si les deux sont vides. */
+  home: () => Promise<string | undefined>
+  repo: $['session']['repo']
+  root: $['session']['root']
+}
 
 export type ProjectRef = { cle: string; racine: string; nom: string }
 
@@ -209,36 +227,36 @@ export function mergeGraphs(mine: Graph, disk: Graph, baseStats?: Counters): Gra
 // ── Chemins et projet ────────────────────────────────────────────────────
 
 /** Le dossier personnel : USERPROFILE (Windows), HOME en repli. Les noms d'une variable doivent être des littéraux. */
-async function homeDir($: $): Promise<string> {
-  const home = (await $.env.get('USERPROFILE').catch(() => undefined)) || (await $.env.get('HOME').catch(() => undefined))
+async function homeDir(io: Io): Promise<string> {
+  const home = await io.home().catch(() => undefined)
   if (!home) throw new Error('dossier personnel introuvable (USERPROFILE et HOME sont vides)')
   return normalizePath(home)
 }
 
-async function graphsDir($: $): Promise<string> {
-  return `${await homeDir($)}/.claude/revo-flow/graphs`
+async function graphsDir(io: Io): Promise<string> {
+  return `${await homeDir(io)}/.claude/revo-flow/graphs`
 }
 
 /** Le fichier du graphe d'un projet : <home>/.claude/revo-flow/graphs/<cle avec / remplacé par ->.json */
-export async function graphPath($: $, cle: string): Promise<string> {
-  return `${await graphsDir($)}/${graphFileName(cle)}`
+export async function graphPath(io: Io, cle: string): Promise<string> {
+  return `${await graphsDir(io)}/${graphFileName(cle)}`
 }
 
 const baseName = (p: string) => normalizePath(p).split('/').pop() ?? ''
 const isAbsolute = (p: string) => /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('/')
 
-async function isDir($: $, p: string): Promise<boolean> {
+async function isDir(io: Io, p: string): Promise<boolean> {
   try {
-    return (await $.fs.stat(p)).kind === 'dir'
+    return (await io.fs.stat(p)).kind === 'dir'
   } catch {
     return false
   }
 }
 
 /** Le sous-dossier de `parent` qui s'appelle `name` à la casse près, avec sa vraie casse. */
-async function findDir($: $, parent: string, name: string): Promise<string | undefined> {
+async function findDir(io: Io, parent: string, name: string): Promise<string | undefined> {
   try {
-    const entries = await $.fs.list(parent)
+    const entries = await io.fs.list(parent)
     const hit = entries.find(e => e.kind === 'dir' && e.name.toLowerCase() === name.toLowerCase())
     return hit ? `${parent}/${hit.name}` : undefined
   } catch {
@@ -249,44 +267,44 @@ async function findDir($: $, parent: string, name: string): Promise<string | und
 const toRef = (racine: string): ProjectRef => ({ cle: projectKey(racine), racine, nom: baseName(racine) })
 
 /**
- * Le projet visé. Sans argument : celui de la session ($.session.repo().root, sinon $.session.root()).
+ * Le projet visé. Sans argument : celui de la session (io.repo().root, sinon io.root()).
  * Avec un chemin absolu : ce dossier. Avec un nom (reservation-tool, back/graphql, Front/ui-vel) : le dossier sous Documents/Front puis Documents/Back.
  * undefined si le dossier n'existe pas.
  */
-export async function resolveProject($: $, nameOrPath?: string): Promise<ProjectRef | undefined> {
+export async function resolveProject(io: Io, nameOrPath?: string): Promise<ProjectRef | undefined> {
   const wanted = nameOrPath?.trim()
   if (!wanted) {
-    const repo = await $.session.repo().catch(() => null)
+    const repo = await io.repo().catch(() => null)
     let root = repo?.root
-    if (!root) root = await $.session.root().catch(() => undefined)
+    if (!root) root = await io.root().catch(() => undefined)
     return root ? toRef(normalizePath(root)) : undefined
   }
   if (isAbsolute(wanted)) {
     const p = normalizePath(wanted)
-    return (await isDir($, p)) ? toRef(p) : undefined
+    return (await isDir(io, p)) ? toRef(p) : undefined
   }
-  const docs = `${await homeDir($)}/Documents`
+  const docs = `${await homeDir(io)}/Documents`
   const parts = normalizePath(wanted).split('/').filter(Boolean)
   const first = parts[0]?.toLowerCase()
   if (parts.length === 2 && (first === 'front' || first === 'back')) {
-    const group = await findDir($, docs, first)
-    const racine = group ? await findDir($, group, parts[1]!) : undefined
+    const group = await findDir(io, docs, first)
+    const racine = group ? await findDir(io, group, parts[1]!) : undefined
     return racine ? toRef(racine) : undefined
   }
   if (parts.length !== 1) return undefined
   for (const g of ['front', 'back']) {
-    const group = await findDir($, docs, g)
-    const racine = group ? await findDir($, group, parts[0]!) : undefined
+    const group = await findDir(io, docs, g)
+    const racine = group ? await findDir(io, group, parts[0]!) : undefined
     if (racine) return toRef(racine)
   }
   return undefined
 }
 
 /** Les projets qui ont déjà un graphe : les fichiers .json de ~/.claude/revo-flow/graphs/ (un graphe supprimé n'est qu'un marqueur de 2 octets : ignoré). */
-export async function listGraphs($: $): Promise<{ cle: string; path: string; mtimeMs: number }[]> {
+export async function listGraphs(io: Io): Promise<{ cle: string; path: string; mtimeMs: number }[]> {
   try {
-    const dir = await graphsDir($)
-    const entries = await $.fs.list(dir)
+    const dir = await graphsDir(io)
+    const entries = await io.fs.list(dir)
     return entries
       .filter(e => e.kind === 'file' && e.name.endsWith('.json') && e.size > 2)
       .map(e => ({ cle: keyFromFileName(e.name), path: `${dir}/${e.name}`, mtimeMs: e.mtimeMs }))
@@ -298,18 +316,18 @@ export async function listGraphs($: $): Promise<{ cle: string; path: string; mti
 // ── Fichiers ─────────────────────────────────────────────────────────────
 
 /** Le texte d'un fichier, ou undefined s'il est absent, illisible ou trop gros (> 4 Mio). */
-export async function readTextSafe($: $, path: string): Promise<string | undefined> {
+export async function readTextSafe(io: Io, path: string): Promise<string | undefined> {
   try {
-    return await $.fs.read(path)
+    return await io.fs.read(path)
   } catch {
     return undefined
   }
 }
 
 /** Estimation de tokens d'un fichier : taille / 4 arrondie au-dessus ; 0 s'il est absent. */
-export async function fileTokens($: $, racine: string, p: string): Promise<number> {
+export async function fileTokens(io: Io, racine: string, p: string): Promise<number> {
   try {
-    const st = await $.fs.stat(`${normalizePath(racine)}/${p}`)
+    const st = await io.fs.stat(`${normalizePath(racine)}/${p}`)
     return st.kind === 'file' ? Math.ceil(st.size / 4) : 0
   } catch {
     return 0
@@ -324,8 +342,8 @@ const isGraph = (g: unknown): g is Graph => {
 const EMPTY_MARK = '{' + '}'
 
 /** Lit et analyse un fichier graphe : le graphe, vide (absent ou marqueur de suppression) ou illisible. */
-async function readGraphFile($: $, path: string): Promise<{ graph: Graph } | 'vide' | 'illisible'> {
-  const text = await readTextSafe($, path)
+async function readGraphFile(io: Io, path: string): Promise<{ graph: Graph } | 'vide' | 'illisible'> {
+  const text = await readTextSafe(io, path)
   if (text === undefined || text.trim() === '' || text.trim() === EMPTY_MARK) return 'vide'
   try {
     const g = JSON.parse(text) as unknown
@@ -342,14 +360,14 @@ const bases = new Map<string, Counters>()
  * Le graphe d'un projet, ou null s'il est absent ou illisible.
  * Un fichier illisible est recopié en .bak ; la copie .tmp de la dernière écriture sert alors de secours.
  */
-export async function loadGraph($: $, ref: ProjectRef): Promise<Graph | null> {
+export async function loadGraph(io: Io, ref: ProjectRef): Promise<Graph | null> {
   try {
-    const path = await graphPath($, ref.cle)
-    let r = await readGraphFile($, path)
+    const path = await graphPath(io, ref.cle)
+    let r = await readGraphFile(io, path)
     if (r === 'illisible') {
-      const raw = await readTextSafe($, path)
-      if (raw) await $.fs.write(`${path}.bak`, raw).catch(() => undefined)
-      const alt = await readGraphFile($, `${path}.tmp`)
+      const raw = await readTextSafe(io, path)
+      if (raw) await io.fs.write(`${path}.bak`, raw).catch(() => undefined)
+      const alt = await readGraphFile(io, `${path}.tmp`)
       r = typeof alt === 'object' ? alt : 'illisible'
     }
     if (typeof r !== 'object') return null
@@ -366,19 +384,19 @@ export async function loadGraph($: $, ref: ProjectRef): Promise<Graph | null> {
  * Avant d'écrire on relit la cible : si son rev n'est plus celui de graph, mergeGraphs fusionne feature par feature. rev est incrémenté.
  * Il reste une fenêtre de quelques millisecondes entre la relecture et l'écriture (pas de verrou dans $.fs).
  */
-export async function saveGraph($: $, graph: Graph): Promise<Graph> {
+export async function saveGraph(io: Io, graph: Graph): Promise<Graph> {
   const cle = graph.projet.cle
-  const path = await graphPath($, cle)
+  const path = await graphPath(io, cle)
   let out: Graph
-  const disk = await readGraphFile($, path)
+  const disk = await readGraphFile(io, path)
   if (typeof disk === 'object' && (disk.graph.rev ?? 0) !== (graph.rev ?? 0)) out = mergeGraphs(graph, disk.graph, bases.get(cle))
   else out = { ...graph, rev: (graph.rev ?? 0) + 1 } as Graph
   const json = JSON.stringify(out)
   if (new TextEncoder().encode(json).length > MAX_WRITE) throw new Error(`graphe de ${cle} trop volumineux pour être écrit (plus de 4 Mio)`)
   try {
-    await $.fs.write(`${path}.tmp`, json)
-    if ((await readTextSafe($, `${path}.tmp`)) !== json) throw new Error('relecture différente')
-    await $.fs.write(path, json)
+    await io.fs.write(`${path}.tmp`, json)
+    if ((await readTextSafe(io, `${path}.tmp`)) !== json) throw new Error('relecture différente')
+    await io.fs.write(path, json)
   } catch (e) {
     throw new Error(`écriture du graphe de ${cle} impossible : ${e instanceof Error ? e.message : String(e)}`)
   }
@@ -390,12 +408,12 @@ export async function saveGraph($: $, graph: Graph): Promise<Graph> {
  * Supprime le graphe d'un projet. $.fs n'a ni remove ni unlink (vérifié dans les typings) :
  * le fichier et sa copie .tmp sont réécrits avec le marqueur d'objet vide (2 octets). loadGraph le lit comme absent et listGraphs l'ignore.
  */
-export async function deleteGraph($: $, cle: string): Promise<void> {
-  const path = await graphPath($, cle)
+export async function deleteGraph(io: Io, cle: string): Promise<void> {
+  const path = await graphPath(io, cle)
   bases.delete(cle)
-  await $.fs.write(`${path}.tmp`, EMPTY_MARK).catch(() => undefined)
+  await io.fs.write(`${path}.tmp`, EMPTY_MARK).catch(() => undefined)
   try {
-    if (await $.fs.exists(path)) await $.fs.write(path, EMPTY_MARK)
+    if (await io.fs.exists(path)) await io.fs.write(path, EMPTY_MARK)
   } catch (e) {
     throw new Error(`suppression du graphe de ${cle} impossible : ${e instanceof Error ? e.message : String(e)}`)
   }
@@ -406,9 +424,9 @@ export async function deleteGraph($: $, cle: string): Promise<void> {
 type GitResult = { ok: boolean; out: string; truncated: boolean; spawnFailed: boolean }
 
 /** Une commande git dans racine, sans jamais lever : ok = code 0 ; spawnFailed = git ne démarre pas. */
-async function git($: $, racine: string, args: string[], stdin?: string): Promise<GitResult> {
+async function git(io: Io, racine: string, args: string[], stdin?: string): Promise<GitResult> {
   try {
-    const r = await $.process.run(['git', '-c', 'core.quotepath=false', '--literal-pathspecs', ...args], {
+    const r = await io.run(['git', '-c', 'core.quotepath=false', '--literal-pathspecs', ...args], {
       cwd: racine,
       timeoutMs: GIT_MS,
       ...(stdin !== undefined ? { stdin } : {}),
@@ -420,14 +438,14 @@ async function git($: $, racine: string, args: string[], stdin?: string): Promis
 }
 
 /** git ls-files -s -z ; si sa sortie est coupée à 4 Mio, on repasse dossier par dossier (récursivement) en sautant les exclusions. */
-async function lsFiles($: $, racine: string, exclus: string[]): Promise<Record<string, string> | undefined> {
-  const all = await git($, racine, ['ls-files', '-s', '-z'])
+async function lsFiles(io: Io, racine: string, exclus: string[]): Promise<Record<string, string> | undefined> {
+  const all = await git(io, racine, ['ls-files', '-s', '-z'])
   if (!all.ok) return undefined
   if (!all.truncated) return parseLsFiles(all.out)
 
   const res: Record<string, string> = {}
   const visit = async (dir: string): Promise<void> => {
-    const entries = await $.fs.list(dir === '' ? racine : `${racine}/${dir}`)
+    const entries = await io.fs.list(dir === '' ? racine : `${racine}/${dir}`)
     const prefix = dir === '' ? '' : `${dir}/`
     const files: string[] = []
     for (const e of entries) {
@@ -435,13 +453,13 @@ async function lsFiles($: $, racine: string, exclus: string[]): Promise<Record<s
       const rel = prefix + e.name
       if (e.kind === 'dir') {
         if (isExcluded(`${rel}/`, exclus)) continue
-        const r = await git($, racine, ['ls-files', '-s', '-z', '--', `${rel}/`])
+        const r = await git(io, racine, ['ls-files', '-s', '-z', '--', `${rel}/`])
         if (r.ok && !r.truncated) Object.assign(res, parseLsFiles(r.out))
         else if (r.truncated) await visit(rel)
       } else files.push(rel)
     }
     for (let i = 0; i < files.length; i += 200) {
-      const r = await git($, racine, ['ls-files', '-s', '-z', '--', ...files.slice(i, i + 200)])
+      const r = await git(io, racine, ['ls-files', '-s', '-z', '--', ...files.slice(i, i + 200)])
       if (r.ok) Object.assign(res, parseLsFiles(r.out))
     }
   }
@@ -450,11 +468,11 @@ async function lsFiles($: $, racine: string, exclus: string[]): Promise<Record<s
 }
 
 /** git hash-object des fichiers du disque (non commités) : { chemin → 12 hex }. Un fichier qui a disparu entre-temps est ignoré. */
-async function hashObjects($: $, racine: string, paths: string[]): Promise<Record<string, string>> {
+async function hashObjects(io: Io, racine: string, paths: string[]): Promise<Record<string, string>> {
   const res: Record<string, string> = {}
   for (let i = 0; i < paths.length; i += 500) {
     const chunk = paths.slice(i, i + 500)
-    const r = await git($, racine, ['hash-object', '--stdin-paths'], chunk.join('\n') + '\n')
+    const r = await git(io, racine, ['hash-object', '--stdin-paths'], chunk.join('\n') + '\n')
     const lines = r.out.split(/\r?\n/).filter(Boolean)
     if (r.ok && lines.length === chunk.length) {
       chunk.forEach((p, k) => (res[p] = lines[k]!.slice(0, 12)))
@@ -462,7 +480,7 @@ async function hashObjects($: $, racine: string, paths: string[]): Promise<Recor
     }
     // Un chemin a échoué : un par un, pour ne perdre que celui-là.
     for (const p of chunk) {
-      const one = await git($, racine, ['hash-object', '--', p])
+      const one = await git(io, racine, ['hash-object', '--', p])
       const h = one.out.trim()
       if (one.ok && h) res[p] = h.slice(0, 12)
     }
@@ -471,13 +489,13 @@ async function hashObjects($: $, racine: string, paths: string[]): Promise<Recor
 }
 
 /** Le parcours du dossier sans git : { chemin → taille-mtimeMs }, avec les mêmes exclusions. */
-async function walkHashes($: $, racine: string, exclus: string[]): Promise<Record<string, string>> {
+async function walkHashes(io: Io, racine: string, exclus: string[]): Promise<Record<string, string>> {
   const res: Record<string, string> = {}
   const stack = ['']
   let count = 0
   while (stack.length > 0 && count < MAX_WALK) {
     const dir = stack.pop()!
-    const entries = await $.fs.list(dir === '' ? racine : `${racine}/${dir}`)
+    const entries = await io.fs.list(dir === '' ? racine : `${racine}/${dir}`)
     const prefix = dir === '' ? '' : `${dir}/`
     for (const e of entries) {
       if (e.isLink || e.name === '.git' || e.name === 'node_modules') continue
@@ -496,16 +514,16 @@ async function walkHashes($: $, racine: string, exclus: string[]): Promise<Recor
 type DiskState = { hashes: Record<string, string>; usesGit: boolean }
 
 /** L'état du disque : le hash de chaque fichier retenu. Avec git : ls-files -s, corrigé par status (supprimés, modifiés, non suivis par hash-object). Sans git : taille et mtime. */
-async function diskState($: $, racine: string, exclus: string[]): Promise<DiskState> {
+async function diskState(io: Io, racine: string, exclus: string[]): Promise<DiskState> {
   let tracked: Record<string, string> | undefined
   try {
-    tracked = await lsFiles($, racine, exclus)
+    tracked = await lsFiles(io, racine, exclus)
   } catch {
     tracked = undefined
   }
   if (!tracked) {
     try {
-      return { hashes: await walkHashes($, racine, exclus), usesGit: false }
+      return { hashes: await walkHashes(io, racine, exclus), usesGit: false }
     } catch {
       throw new Error(`dossier illisible : ${racine}`)
     }
@@ -513,30 +531,30 @@ async function diskState($: $, racine: string, exclus: string[]): Promise<DiskSt
   const hashes: Record<string, string> = {}
   for (const [p, h] of Object.entries(tracked)) if (isRetained(p, exclus)) hashes[p] = h
 
-  const st = await git($, racine, ['status', '--porcelain', '-z', '--untracked-files=all'])
+  const st = await git(io, racine, ['status', '--porcelain', '-z', '--untracked-files=all'])
   if (st.ok) {
     const toHash: string[] = []
     for (const e of parseStatus(st.truncated ? st.out.slice(0, st.out.lastIndexOf('\0')) : st.out)) {
       if (e.y === 'D') delete hashes[e.p]
       else if ((e.y === 'M' || e.y === 'T' || e.y === 'U' || e.y === 'A' || (e.x === '?' && e.y === '?')) && isRetained(e.p, exclus)) toHash.push(e.p)
     }
-    Object.assign(hashes, await hashObjects($, racine, toHash))
+    Object.assign(hashes, await hashObjects(io, racine, toHash))
   }
   return { hashes, usesGit: true }
 }
 
 /** Les hash actuels du disque { chemin → hash } pour les fichiers retenus, sans rien relire : la fraîcheur rapide. */
-export async function currentHashes($: $, racine: string, exclus: string[] = EXCLUS_DEFAUT): Promise<Record<string, string>> {
-  return (await diskState($, normalizePath(racine), exclus)).hashes
+export async function currentHashes(io: Io, racine: string, exclus: string[] = EXCLUS_DEFAUT): Promise<Record<string, string>> {
+  return (await diskState(io, normalizePath(racine), exclus)).hashes
 }
 
 /** Lit les fichiers par lots ; ceux qui sont illisibles ou trop gros (> 4 Mio) sont laissés de côté. */
-async function readSources($: $, racine: string, hashes: Record<string, string>, paths: string[], onProgress?: (done: number, total: number) => void): Promise<SourceFile[]> {
+async function readSources(io: Io, racine: string, hashes: Record<string, string>, paths: string[], onProgress?: (done: number, total: number) => void): Promise<SourceFile[]> {
   const out: SourceFile[] = []
   let done = 0
   for (let i = 0; i < paths.length; i += BATCH) {
     const batch = paths.slice(i, i + BATCH)
-    const texts = await Promise.all(batch.map(p => readTextSafe($, `${racine}/${p}`)))
+    const texts = await Promise.all(batch.map(p => readTextSafe(io, `${racine}/${p}`)))
     batch.forEach((p, k) => {
       const text = texts[k]
       if (text !== undefined && text.length <= MAX_READ) out.push({ p, h: hashes[p] ?? '', text })
@@ -548,35 +566,35 @@ async function readSources($: $, racine: string, hashes: Record<string, string>,
 }
 
 /** Le commit court et la branche ; vides sans git. */
-async function headInfo($: $, racine: string): Promise<{ commit: string; branche: string }> {
-  const c = await git($, racine, ['rev-parse', '--short', 'HEAD'])
-  const b = await git($, racine, ['rev-parse', '--abbrev-ref', 'HEAD'])
+async function headInfo(io: Io, racine: string): Promise<{ commit: string; branche: string }> {
+  const c = await git(io, racine, ['rev-parse', '--short', 'HEAD'])
+  const b = await git(io, racine, ['rev-parse', '--abbrev-ref', 'HEAD'])
   return { commit: c.ok ? c.out.trim() : '', branche: b.ok ? b.out.trim() : '' }
 }
 
-async function nowIso($: $): Promise<string> {
-  return new Date(await $.clock.now()).toISOString()
+async function nowIso(io: Io): Promise<string> {
+  return new Date(await io.now()).toISOString()
 }
 
 /**
  * Construit la couche mécanique d'un projet : fichiers retenus (isIndexable : exclusions, extensions ; moins de 4 Mio), package.json, commit, branche, historique git, puis buildGraph.
- * prev conserve les fiches. Sans git, on parcourt le dossier avec $.fs.list (hash = taille-mtime).
+ * prev conserve les fiches. Sans git, on parcourt le dossier avec io.fs.list (hash = taille-mtime).
  * Lève une Error en français : dossier illisible.
  */
-export async function buildMechanical($: $, ref: ProjectRef, prev?: Graph | null, onProgress?: (done: number, total: number) => void): Promise<Graph> {
+export async function buildMechanical(io: Io, ref: ProjectRef, prev?: Graph | null, onProgress?: (done: number, total: number) => void): Promise<Graph> {
   const racine = normalizePath(ref.racine)
   try {
-    await $.fs.list(racine)
+    await io.fs.list(racine)
   } catch {
     throw new Error(`dossier illisible : ${racine}`)
   }
   const exclus = prev?.projet.exclus ?? EXCLUS_DEFAUT
-  const { hashes, usesGit } = await diskState($, racine, exclus)
+  const { hashes, usesGit } = await diskState(io, racine, exclus)
   const paths = Object.keys(hashes).sort()
-  const files = await readSources($, racine, hashes, paths, onProgress)
-  const pkg = await readTextSafe($, `${racine}/package.json`)
-  const head = usesGit ? await headInfo($, racine) : { commit: '', branche: '' }
-  const log = usesGit ? (await git($, racine, ['log', '-n', '500', '--pretty=format:%s', '--name-only'])).out : ''
+  const files = await readSources(io, racine, hashes, paths, onProgress)
+  const pkg = await readTextSafe(io, `${racine}/package.json`)
+  const head = usesGit ? await headInfo(io, racine) : { commit: '', branche: '' }
+  const log = usesGit ? (await git(io, racine, ['log', '-n', '500', '--pretty=format:%s', '--name-only'])).out : ''
   return buildGraph({
     cle: ref.cle,
     racine,
@@ -585,7 +603,7 @@ export async function buildMechanical($: $, ref: ProjectRef, prev?: Graph | null
     ...(pkg !== undefined ? { pkgJson: pkg } : {}),
     commit: head.commit,
     branche: head.branche,
-    le: await nowIso($),
+    le: await nowIso(io),
     log,
     exclus,
     prev: prev ?? null,
@@ -598,10 +616,10 @@ export async function buildMechanical($: $, ref: ProjectRef, prev?: Graph | null
  * changed : chemins ajoutés, modifiés ou arrivés par renommage ; removed : chemins supprimés ou quittés par un renommage.
  * Rien n'est écrit : l'appelant enregistre avec saveGraph.
  */
-export async function refreshGraph($: $, graph: Graph): Promise<{ graph: Graph; changed: string[]; removed: string[] }> {
+export async function refreshGraph(io: Io, graph: Graph): Promise<{ graph: Graph; changed: string[]; removed: string[] }> {
   const racine = normalizePath(graph.projet.racine)
   const exclus = graph.projet.exclus ?? EXCLUS_DEFAUT
-  const { hashes, usesGit } = await diskState($, racine, exclus)
+  const { hashes, usesGit } = await diskState(io, racine, exclus)
   const known = graph.fichiers as Record<string, { h?: string }>
 
   const changed = Object.keys(hashes).filter(p => known[p] === undefined || known[p]!.h !== hashes[p])
@@ -614,7 +632,7 @@ export async function refreshGraph($: $, graph: Graph): Promise<{ graph: Graph; 
   const renamed: [string, string][] = []
   const commit = graph.projet.indexe?.commit
   if (usesGit && commit && added.size > 0 && goneSet.size > 0) {
-    const d = await git($, racine, ['diff', '--name-status', '-M', '-z', commit])
+    const d = await git(io, racine, ['diff', '--name-status', '-M', '-z', commit])
     if (d.ok) {
       for (const e of parseNameStatus(d.out)) {
         if (e.status === 'R' && e.from && goneSet.has(e.from) && added.has(e.p)) {
@@ -635,8 +653,8 @@ export async function refreshGraph($: $, graph: Graph): Promise<{ graph: Graph; 
     }
   }
 
-  const sources = await readSources($, racine, hashes, changed)
-  const head = usesGit ? await headInfo($, racine) : { commit: graph.projet.indexe?.commit ?? '', branche: graph.projet.indexe?.branche ?? '' }
-  const next = updateFiles(graph, sources, [...goneSet], renamed, { commit: head.commit, branche: head.branche, le: await nowIso($) })
+  const sources = await readSources(io, racine, hashes, changed)
+  const head = usesGit ? await headInfo(io, racine) : { commit: graph.projet.indexe?.commit ?? '', branche: graph.projet.indexe?.branche ?? '' }
+  const next = updateFiles(graph, sources, [...goneSet], renamed, { commit: head.commit, branche: head.branche, le: await nowIso(io) })
   return { graph: next, changed, removed: [...goneSet, ...renamed.map(([from]) => from)] }
 }

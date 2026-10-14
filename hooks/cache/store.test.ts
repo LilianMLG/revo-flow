@@ -1,11 +1,11 @@
-import { expect, mock, test } from 'claude-code/testing'
+import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import type { Feature, Graph } from '../../types/cache'
 import { graphFileName, mergeGraphs, normalizePath, parseLsFiles, parseNameStatus, parseStatus } from './store'
+import { OSES, diskKey, native, type Os } from '../test-os'
 
-const HOME = 'C:\\Users\\x'
 const DOCS = 'C:/Users/x/Documents'
 const NOW = Date.UTC(2026, 9, 14, 9)
 const EMPTY_OBJECT = '{' + '}'
@@ -33,44 +33,59 @@ type Repo = {
   calls: string[][]
 }
 
-type World = { files: Map<string, string>; repo: Repo | undefined; writes: string[]; clock: ReturnType<typeof mock.clock> }
+/** Le disque en mémoire : chaque chemin, quelle que soit sa forme, est rangé sous diskKey. */
+class Disk extends Map<string, string> {
+  override get(p: string) {
+    return super.get(diskKey(p))
+  }
+  override set(p: string, t: string) {
+    return super.set(diskKey(p), t)
+  }
+  override has(p: string) {
+    return super.has(diskKey(p))
+  }
+  override delete(p: string) {
+    return super.delete(diskKey(p))
+  }
+}
 
-const abs = (p: string) => normalizePath(p)
+type World = { files: Disk; repo: Repo | undefined; writes: string[]; clock: ReturnType<typeof mock.clock> }
 
 type Init = { files?: Record<string, string>; repo?: Partial<Repo>; sessionRoot?: string; repoRoot?: string | null }
 
-function world(on: On, init: Init = {}): World {
-  mock.env(on, { USERPROFILE: HOME })
+function makeWorld(on: On, os: Os, init: Init = {}): World {
+  mock.env(on, os.env)
   const clock = mock.clock(on, { now: NOW })
   const w: World = {
-    files: new Map(Object.entries(init.files ?? {}).map(([p, t]) => [abs(p), t])),
+    files: new Disk(),
     repo: init.repo
       ? { status: '', hashObject: {}, head: 'abc1234', branch: 'main', log: '', diff: '', truncateAll: false, calls: [], ...init.repo, tracked: { ...(init.repo.tracked ?? {}) } }
       : undefined,
     writes: [],
     clock,
   }
-  const isDirPath = (d: string) => [...w.files.keys()].some(k => k.startsWith(d + '/'))
+  for (const [p, t] of Object.entries(init.files ?? {})) w.files.set(p, t)
+  const isDirPath = (d: string) => [...w.files.keys()].some(k => k.startsWith(diskKey(d) + '/'))
   on('fs.read', (_$, e) => {
-    const t = w.files.get(abs(e.path))
+    const t = w.files.get(e.path)
     if (t === undefined) return { deny: 'ENOENT' }
     return { value: t } as never
   })
   on('fs.write', (_$, e) => {
-    w.files.set(abs(e.path), e.text)
-    w.writes.push(abs(e.path))
+    w.files.set(e.path, e.text)
+    w.writes.push(diskKey(e.path))
     return { value: undefined } as never
   })
-  on('fs.exists', (_$, e) => ({ value: w.files.has(abs(e.path)) || isDirPath(abs(e.path)) }) as never)
+  on('fs.exists', (_$, e) => ({ value: w.files.has(e.path) || isDirPath(e.path) }) as never)
   on('fs.stat', (_$, e) => {
-    const p = abs(e.path)
+    const p = e.path
     const t = w.files.get(p)
     if (t !== undefined) return { value: { kind: 'file', size: t.length, mtimeMs: 1000 + t.length, isLink: false } } as never
     if (isDirPath(p)) return { value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: false } } as never
     return { deny: 'ENOENT' }
   })
   on('fs.list', (_$, e) => {
-    const d = abs(e.path)
+    const d = diskKey(e.path)
     if (!isDirPath(d)) return { deny: 'ENOENT' }
     const seen = new Map<string, 'file' | 'dir'>()
     for (const k of w.files.keys()) {
@@ -84,7 +99,7 @@ function world(on: On, init: Init = {}): World {
     })
     return { value: entries } as never
   })
-  const defaultRoot = 'C:\\Users\\x\\Documents\\Front\\app'
+  const defaultRoot = native(os, 'Documents', 'Front', 'app')
   on('session.root', () => ({ value: init.sessionRoot ?? defaultRoot }) as never)
   on('session.repo', () => ({ value: init.repoRoot === null ? null : { root: init.repoRoot ?? defaultRoot, remote: null, internal: false, name: null } }) as never)
   on('process.run', (_$, e) => {
@@ -249,166 +264,173 @@ test('mergeGraphs : la couche mécanique la plus récemment indexée gagne ; usa
 
 const run = async ($: Engine, args: string) => (await $.command.run({ command: 'revo-flow', args } as never)).text ?? ''
 
-const RACINE = `${DOCS}/Front/app`
-const GRAPH_DIR = 'C:/Users/x/.claude/revo-flow/graphs'
-const GRAPH_FILE = `${GRAPH_DIR}/front-app.json`
-const sources = (racine: string): Record<string, string> => ({
-  [`${racine}/package.json`]: JSON.stringify({ name: 'app', dependencies: { nuxt: '^3.0.0' } }),
-  [`${racine}/pages/index.vue`]: '<template><Basket /></template>',
-  [`${racine}/components/Basket.vue`]: '<template><div /></template>',
-  [`${racine}/utils/a.ts`]: 'export const a = 1',
-  [`${racine}/node_modules/x/index.js`]: 'x',
-  [`${racine}/logo.png`]: 'png',
-})
-const TRACKED = { 'package.json': 'a1', 'pages/index.vue': 'a2', 'components/Basket.vue': 'a3', 'utils/a.ts': 'a4', 'node_modules/x/index.js': 'a5', 'logo.png': 'a6' }
-const RETENUS = ['components/Basket.vue', 'pages/index.vue', 'utils/a.ts']
-const readGraph = (w: World, file = GRAPH_FILE) => JSON.parse(w.files.get(file)!) as Graph
+for (const os of OSES) {
+  describe(os.nom, () => {
+    const world = (on: On, init?: Init) => makeWorld(on, os, init)
 
-test('cache build : fichiers retenus, hash de git, commit, branche ; écrit .tmp puis la cible, sous le dossier du plugin', async ($, on) => {
-  const w = world(on, { files: sources(RACINE), repo: { tracked: TRACKED, log: 'feat(basket): panier\nutils/a.ts\n' } })
-  expect(await run($, 'cache build')).toMatch(/couche mécanique construite \(3 fichiers\)/)
-  expect(w.writes).toEqual([`${GRAPH_FILE}.tmp`, GRAPH_FILE])
-  const g = readGraph(w)
-  expect(g.rev).toBe(1)
-  expect(Object.keys(g.fichiers).sort()).toEqual(RETENUS)
-  expect(g.fichiers['utils/a.ts']!.h).toBe(h12('a4'))
-  expect(g.projet.cle).toBe('front/app')
-  expect(g.projet.racine).toBe(RACINE)
-  expect(g.projet.indexe.commit).toBe('abc1234')
-  expect(g.projet.indexe.branche).toBe('main')
-  expect(g.projet.stack).toContain('Nuxt 3')
-  const calls = w.repo!.calls
-  expect(calls.some(c => c[0] === 'ls-files' && c.includes('-s') && c.includes('-z'))).toBe(true)
-  expect(calls.some(c => c[0] === 'status' && c.includes('--porcelain'))).toBe(true)
-  expect(calls.some(c => c[0] === 'log' && c.includes('-n') && c.includes('500') && c.includes('--name-only'))).toBe(true)
-})
+    const DOCS = `${normalizePath(os.home)}/Documents`
+    const RACINE = `${DOCS}/Front/app`
+    const GRAPH_DIR = `${normalizePath(os.home)}/.claude/revo-flow/graphs`
+    const GRAPH_FILE = `${GRAPH_DIR}/front-app.json`
+    const sources = (racine: string): Record<string, string> => ({
+      [`${racine}/package.json`]: JSON.stringify({ name: 'app', dependencies: { nuxt: '^3.0.0' } }),
+      [`${racine}/pages/index.vue`]: '<template><Basket /></template>',
+      [`${racine}/components/Basket.vue`]: '<template><div /></template>',
+      [`${racine}/utils/a.ts`]: 'export const a = 1',
+      [`${racine}/node_modules/x/index.js`]: 'x',
+      [`${racine}/logo.png`]: 'png',
+    })
+    const TRACKED = { 'package.json': 'a1', 'pages/index.vue': 'a2', 'components/Basket.vue': 'a3', 'utils/a.ts': 'a4', 'node_modules/x/index.js': 'a5', 'logo.png': 'a6' }
+    const RETENUS = ['components/Basket.vue', 'pages/index.vue', 'utils/a.ts']
+    const readGraph = (w: World, file = GRAPH_FILE) => JSON.parse(w.files.get(file)!) as Graph
 
-test('cache build : git status corrige les hash (modifié, non suivi) et retire les supprimés', async ($, on) => {
-  const w = world(on, {
-    files: { ...sources(RACINE), [`${RACINE}/utils/new.ts`]: 'export const n = 1' },
-    repo: {
-      tracked: { ...TRACKED, 'pages/gone.vue': 'a7' },
-      status: ' M utils/a.ts\0?? utils/new.ts\0 D pages/gone.vue\0',
-      hashObject: { 'utils/a.ts': 'f4', 'utils/new.ts': 'f5' },
-    },
+    test('cache build : fichiers retenus, hash de git, commit, branche ; écrit .tmp puis la cible, sous le dossier du plugin', async ($, on) => {
+      const w = world(on, { files: sources(RACINE), repo: { tracked: TRACKED, log: 'feat(basket): panier\nutils/a.ts\n' } })
+      expect(await run($, 'cache build')).toMatch(/couche mécanique construite \(3 fichiers\)/)
+      expect(w.writes).toEqual([`${GRAPH_FILE}.tmp`, GRAPH_FILE].map(diskKey))
+      const g = readGraph(w)
+      expect(g.rev).toBe(1)
+      expect(Object.keys(g.fichiers).sort()).toEqual(RETENUS)
+      expect(g.fichiers['utils/a.ts']!.h).toBe(h12('a4'))
+      expect(g.projet.cle).toBe('front/app')
+      expect(g.projet.racine).toBe(RACINE)
+      expect(g.projet.indexe.commit).toBe('abc1234')
+      expect(g.projet.indexe.branche).toBe('main')
+      expect(g.projet.stack).toContain('Nuxt 3')
+      const calls = w.repo!.calls
+      expect(calls.some(c => c[0] === 'ls-files' && c.includes('-s') && c.includes('-z'))).toBe(true)
+      expect(calls.some(c => c[0] === 'status' && c.includes('--porcelain'))).toBe(true)
+      expect(calls.some(c => c[0] === 'log' && c.includes('-n') && c.includes('500') && c.includes('--name-only'))).toBe(true)
+    })
+
+    test('cache build : git status corrige les hash (modifié, non suivi) et retire les supprimés', async ($, on) => {
+      const w = world(on, {
+        files: { ...sources(RACINE), [`${RACINE}/utils/new.ts`]: 'export const n = 1' },
+        repo: {
+          tracked: { ...TRACKED, 'pages/gone.vue': 'a7' },
+          status: ' M utils/a.ts\0?? utils/new.ts\0 D pages/gone.vue\0',
+          hashObject: { 'utils/a.ts': 'f4', 'utils/new.ts': 'f5' },
+        },
+      })
+      await run($, 'cache build')
+      const g = readGraph(w)
+      expect(g.fichiers['utils/a.ts']!.h).toBe(h12('f4'))
+      expect(g.fichiers['utils/new.ts']!.h).toBe(h12('f5'))
+      expect(g.fichiers['pages/gone.vue']).toBeUndefined()
+      expect(g.fichiers['pages/index.vue']!.h).toBe(h12('a2'))
+      expect(w.repo!.calls.some(c => c[0] === 'hash-object' && c.includes('--stdin-paths'))).toBe(true)
+    })
+
+    test('ls-files coupé à 4 Mio : repasse dossier par dossier, sans demander les dossiers exclus', async ($, on) => {
+      const w = world(on, { files: sources(RACINE), repo: { tracked: TRACKED, truncateAll: true } })
+      await run($, 'cache build')
+      expect(Object.keys(readGraph(w).fichiers).sort()).toEqual(RETENUS)
+      expect(w.repo!.calls.some(c => c[0] === 'ls-files' && c.includes('--') && c.includes('pages/'))).toBe(true)
+      expect(w.repo!.calls.some(c => c.includes('node_modules/'))).toBe(false)
+    })
+
+    test('cache : rafraîchissement incrémental (modifié, supprimé, renommé) enregistré avec rev + 1', async ($, on) => {
+      const w = world(on, { files: sources(RACINE), repo: { tracked: TRACKED } })
+      await run($, 'cache build')
+      // utils/a.ts modifié, pages/index.vue supprimé, components/Basket.vue renommé en Cart.vue (même blob).
+      w.files.set(`${RACINE}/utils/a.ts`, 'export const a = 2')
+      w.files.delete(`${RACINE}/pages/index.vue`)
+      w.files.delete(`${RACINE}/components/Basket.vue`)
+      w.files.set(`${RACINE}/components/Cart.vue`, '<template><div /></template>')
+      const t = w.repo!.tracked
+      t['utils/a.ts'] = 'b4'
+      delete t['pages/index.vue']
+      delete t['components/Basket.vue']
+      t['components/Cart.vue'] = 'a3'
+      await w.clock.advance(31_000)
+      await run($, 'cache')
+      const g = readGraph(w)
+      expect(Object.keys(g.fichiers).sort()).toEqual(['components/Cart.vue', 'utils/a.ts'])
+      expect(g.fichiers['utils/a.ts']!.h).toBe(h12('b4'))
+      expect(g.fichiers['components/Cart.vue']!.h).toBe(h12('a3'))
+      expect(g.rev).toBe(2)
+    })
+
+    test('cache : un renommage avec modification est annoncé par git diff -M depuis le commit indexé', async ($, on) => {
+      const w = world(on, { files: sources(RACINE), repo: { tracked: TRACKED } })
+      await run($, 'cache build')
+      w.files.delete(`${RACINE}/utils/a.ts`)
+      w.files.set(`${RACINE}/utils/b.ts`, 'export const a = 3')
+      delete w.repo!.tracked['utils/a.ts']
+      w.repo!.tracked['utils/b.ts'] = 'c9'
+      w.repo!.diff = 'R090\0utils/a.ts\0utils/b.ts\0'
+      await w.clock.advance(31_000)
+      await run($, 'cache')
+      const g = readGraph(w)
+      expect(g.fichiers['utils/a.ts']).toBeUndefined()
+      expect(g.fichiers['utils/b.ts']!.h).toBe(h12('c9'))
+      expect(w.repo!.calls.some(c => c[0] === 'diff' && c.includes('-M') && c.includes('abc1234'))).toBe(true)
+    })
+
+    test('cache : rien de changé, rien d écrit', async ($, on) => {
+      const w = world(on, { files: sources(RACINE), repo: { tracked: TRACKED } })
+      await run($, 'cache build')
+      const writes = w.writes.length
+      await w.clock.advance(31_000)
+      await run($, 'cache')
+      expect(w.writes.length).toBe(writes)
+      expect(readGraph(w).rev).toBe(1)
+    })
+
+    test('sans git : repli sur taille et mtime, construction et rafraîchissement', async ($, on) => {
+      const w = world(on, { files: sources(RACINE) })
+      await run($, 'cache build')
+      const a = `${RACINE}/utils/a.ts`
+      const len = w.files.get(a)!.length
+      const g = readGraph(w)
+      expect(Object.keys(g.fichiers).sort()).toEqual(RETENUS)
+      expect(g.fichiers['utils/a.ts']!.h).toBe(`${len}-${1000 + len}`)
+      expect(g.projet.indexe.commit).toBe('')
+      w.files.set(a, 'export const a = 12345')
+      const len2 = w.files.get(a)!.length
+      await w.clock.advance(31_000)
+      await run($, 'cache')
+      expect(readGraph(w).fichiers['utils/a.ts']!.h).toBe(`${len2}-${1000 + len2}`)
+    })
+
+    test('écriture concurrente : le graphe d une autre session est fusionné, rev dépasse les deux', async ($, on) => {
+      const w = world(on, { files: sources(RACINE), repo: { tracked: TRACKED } })
+      await run($, 'cache build')
+      // Une autre session écrit entre-temps : rev 5 et une fiche que nous ne connaissons pas.
+      const other = { ...readGraph(w), rev: 5 }
+      other.features = { b: feature('b', '2026-10-14T09:00:00Z') }
+      w.files.set(GRAPH_FILE, JSON.stringify(other))
+      await w.clock.advance(31_000)
+      await run($, 'cache build')
+      const g = readGraph(w)
+      expect(Object.keys(g.features)).toEqual(['b'])
+      expect(g.rev).toBe(6)
+    })
+
+    test('cache clear : confirmation, marqueur vide, puis aucun graphe', async ($, on) => {
+      const w = world(on, { files: sources(RACINE), repo: { tracked: TRACKED } })
+      await run($, 'cache build')
+      expect(await run($, 'cache clear')).toMatch(/cache de app supprimé/)
+      expect(w.files.get(GRAPH_FILE)).toBe(EMPTY_OBJECT)
+      expect(await run($, 'cache clear')).toMatch(/aucun graphe pour app, rien à supprimer/)
+    })
+
+    test('cache <projet> : le dossier sous Documents/Front, graphe nommé front-<projet>.json', async ($, on) => {
+      const other = `${DOCS}/Front/ui-vel`
+      const w = world(on, { files: { ...sources(RACINE), ...sources(other) }, repo: { tracked: TRACKED } })
+      expect(await run($, 'cache ui-vel')).toMatch(/revo-flow cache · ui-vel : 3 fichiers/)
+      const g = readGraph(w, `${GRAPH_DIR}/front-ui-vel.json`)
+      expect(g.projet.cle).toBe('front/ui-vel')
+      expect(g.projet.racine).toBe(other)
+      expect(w.files.has(GRAPH_FILE)).toBe(false)
+    })
+
+    test('un graphe illisible est recopié en .bak puis reconstruit', async ($, on) => {
+      const w = world(on, { files: sources(RACINE), repo: { tracked: TRACKED } })
+      w.files.set(GRAPH_FILE, 'pas du json')
+      await run($, 'cache build')
+      expect(w.files.get(`${GRAPH_FILE}.bak`)).toBe('pas du json')
+      expect(readGraph(w).rev).toBe(1)
+    })
   })
-  await run($, 'cache build')
-  const g = readGraph(w)
-  expect(g.fichiers['utils/a.ts']!.h).toBe(h12('f4'))
-  expect(g.fichiers['utils/new.ts']!.h).toBe(h12('f5'))
-  expect(g.fichiers['pages/gone.vue']).toBeUndefined()
-  expect(g.fichiers['pages/index.vue']!.h).toBe(h12('a2'))
-  expect(w.repo!.calls.some(c => c[0] === 'hash-object' && c.includes('--stdin-paths'))).toBe(true)
-})
-
-test('ls-files coupé à 4 Mio : repasse dossier par dossier, sans demander les dossiers exclus', async ($, on) => {
-  const w = world(on, { files: sources(RACINE), repo: { tracked: TRACKED, truncateAll: true } })
-  await run($, 'cache build')
-  expect(Object.keys(readGraph(w).fichiers).sort()).toEqual(RETENUS)
-  expect(w.repo!.calls.some(c => c[0] === 'ls-files' && c.includes('--') && c.includes('pages/'))).toBe(true)
-  expect(w.repo!.calls.some(c => c.includes('node_modules/'))).toBe(false)
-})
-
-test('cache : rafraîchissement incrémental (modifié, supprimé, renommé) enregistré avec rev + 1', async ($, on) => {
-  const w = world(on, { files: sources(RACINE), repo: { tracked: TRACKED } })
-  await run($, 'cache build')
-  // utils/a.ts modifié, pages/index.vue supprimé, components/Basket.vue renommé en Cart.vue (même blob).
-  w.files.set(`${RACINE}/utils/a.ts`, 'export const a = 2')
-  w.files.delete(`${RACINE}/pages/index.vue`)
-  w.files.delete(`${RACINE}/components/Basket.vue`)
-  w.files.set(`${RACINE}/components/Cart.vue`, '<template><div /></template>')
-  const t = w.repo!.tracked
-  t['utils/a.ts'] = 'b4'
-  delete t['pages/index.vue']
-  delete t['components/Basket.vue']
-  t['components/Cart.vue'] = 'a3'
-  await w.clock.advance(31_000)
-  await run($, 'cache')
-  const g = readGraph(w)
-  expect(Object.keys(g.fichiers).sort()).toEqual(['components/Cart.vue', 'utils/a.ts'])
-  expect(g.fichiers['utils/a.ts']!.h).toBe(h12('b4'))
-  expect(g.fichiers['components/Cart.vue']!.h).toBe(h12('a3'))
-  expect(g.rev).toBe(2)
-})
-
-test('cache : un renommage avec modification est annoncé par git diff -M depuis le commit indexé', async ($, on) => {
-  const w = world(on, { files: sources(RACINE), repo: { tracked: TRACKED } })
-  await run($, 'cache build')
-  w.files.delete(`${RACINE}/utils/a.ts`)
-  w.files.set(`${RACINE}/utils/b.ts`, 'export const a = 3')
-  delete w.repo!.tracked['utils/a.ts']
-  w.repo!.tracked['utils/b.ts'] = 'c9'
-  w.repo!.diff = 'R090\0utils/a.ts\0utils/b.ts\0'
-  await w.clock.advance(31_000)
-  await run($, 'cache')
-  const g = readGraph(w)
-  expect(g.fichiers['utils/a.ts']).toBeUndefined()
-  expect(g.fichiers['utils/b.ts']!.h).toBe(h12('c9'))
-  expect(w.repo!.calls.some(c => c[0] === 'diff' && c.includes('-M') && c.includes('abc1234'))).toBe(true)
-})
-
-test('cache : rien de changé, rien d écrit', async ($, on) => {
-  const w = world(on, { files: sources(RACINE), repo: { tracked: TRACKED } })
-  await run($, 'cache build')
-  const writes = w.writes.length
-  await w.clock.advance(31_000)
-  await run($, 'cache')
-  expect(w.writes.length).toBe(writes)
-  expect(readGraph(w).rev).toBe(1)
-})
-
-test('sans git : repli sur taille et mtime, construction et rafraîchissement', async ($, on) => {
-  const w = world(on, { files: sources(RACINE) })
-  await run($, 'cache build')
-  const a = `${RACINE}/utils/a.ts`
-  const len = w.files.get(a)!.length
-  const g = readGraph(w)
-  expect(Object.keys(g.fichiers).sort()).toEqual(RETENUS)
-  expect(g.fichiers['utils/a.ts']!.h).toBe(`${len}-${1000 + len}`)
-  expect(g.projet.indexe.commit).toBe('')
-  w.files.set(a, 'export const a = 12345')
-  const len2 = w.files.get(a)!.length
-  await w.clock.advance(31_000)
-  await run($, 'cache')
-  expect(readGraph(w).fichiers['utils/a.ts']!.h).toBe(`${len2}-${1000 + len2}`)
-})
-
-test('écriture concurrente : le graphe d une autre session est fusionné, rev dépasse les deux', async ($, on) => {
-  const w = world(on, { files: sources(RACINE), repo: { tracked: TRACKED } })
-  await run($, 'cache build')
-  // Une autre session écrit entre-temps : rev 5 et une fiche que nous ne connaissons pas.
-  const other = { ...readGraph(w), rev: 5 }
-  other.features = { b: feature('b', '2026-10-14T09:00:00Z') }
-  w.files.set(GRAPH_FILE, JSON.stringify(other))
-  await w.clock.advance(31_000)
-  await run($, 'cache build')
-  const g = readGraph(w)
-  expect(Object.keys(g.features)).toEqual(['b'])
-  expect(g.rev).toBe(6)
-})
-
-test('cache clear : confirmation, marqueur vide, puis aucun graphe', async ($, on) => {
-  const w = world(on, { files: sources(RACINE), repo: { tracked: TRACKED } })
-  await run($, 'cache build')
-  expect(await run($, 'cache clear')).toMatch(/cache de app supprimé/)
-  expect(w.files.get(GRAPH_FILE)).toBe(EMPTY_OBJECT)
-  expect(await run($, 'cache clear')).toMatch(/aucun graphe pour app, rien à supprimer/)
-})
-
-test('cache <projet> : le dossier sous Documents/Front, graphe nommé front-<projet>.json', async ($, on) => {
-  const other = `${DOCS}/Front/ui-vel`
-  const w = world(on, { files: { ...sources(RACINE), ...sources(other) }, repo: { tracked: TRACKED } })
-  expect(await run($, 'cache ui-vel')).toMatch(/revo-flow cache · ui-vel : 3 fichiers/)
-  const g = readGraph(w, `${GRAPH_DIR}/front-ui-vel.json`)
-  expect(g.projet.cle).toBe('front/ui-vel')
-  expect(g.projet.racine).toBe(other)
-  expect(w.files.has(GRAPH_FILE)).toBe(false)
-})
-
-test('un graphe illisible est recopié en .bak puis reconstruit', async ($, on) => {
-  const w = world(on, { files: sources(RACINE), repo: { tracked: TRACKED } })
-  w.files.set(GRAPH_FILE, 'pas du json')
-  await run($, 'cache build')
-  expect(w.files.get(`${GRAPH_FILE}.bak`)).toBe('pas du json')
-  expect(readGraph(w).rev).toBe(1)
-})
+}

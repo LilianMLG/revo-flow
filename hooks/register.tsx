@@ -20,7 +20,7 @@ import {
   servedFiles,
   tokensOf,
 } from './cache/graph'
-import { buildMechanical, deleteGraph, fileTokens, listGraphs, loadGraph, refreshGraph, resolveProject, saveGraph } from './cache/store'
+import { buildMechanical, deleteGraph, fileTokens, listGraphs, loadGraph, refreshGraph, resolveProject, saveGraph, type Io } from './cache/store'
 import {
   CACHE_TOOL,
   EMPTY,
@@ -368,6 +368,24 @@ async function finishFlow($: $) {
 
 type ProjectRef = NonNullable<Awaited<ReturnType<typeof resolveProject>>>
 
+/** Les accès du cache au moteur : store.ts ne reçoit jamais `$`, que le moteur ne suit pas à travers un import (sinon tout le module est refusé). */
+function ioOf($: $): Io {
+  return {
+    fs: {
+      read: path => $.fs.read(path),
+      write: (path, text) => $.fs.write(path, text),
+      list: path => $.fs.list(path),
+      exists: path => $.fs.exists(path),
+      stat: path => $.fs.stat(path),
+    },
+    run: (argv, init) => $.process.run(argv, init),
+    now: () => $.clock.now(),
+    home: async () => (await $.env.get('USERPROFILE').catch(() => undefined)) || (await $.env.get('HOME').catch(() => undefined)) || undefined,
+    repo: () => $.session.repo(),
+    root: () => $.session.root(),
+  }
+}
+
 /** Le préfixe de description des sous-agents qui construisent des fiches : exemptés du plan, hors flow. */
 const BUILDER = 'revo-flow-cache'
 /** Le type d'agent enregistré pour construire les fiches : `revo-flow:cache-indexer`. */
@@ -435,13 +453,13 @@ async function graphOf($: $, ref: ProjectRef, opt: { build?: boolean; force?: bo
   const now = await $.clock.now()
   const held = graphCache.get(ref.cle)
   if (held && !opt.force && now - held.refreshedAt < REFRESH_MS) return held.graph
-  let graph = (await loadGraph($, ref).catch(() => null)) ?? held?.graph ?? null
+  let graph = (await loadGraph(ioOf($), ref).catch(() => null)) ?? held?.graph ?? null
   if (graph) {
-    const r = await refreshGraph($, graph)
+    const r = await refreshGraph(ioOf($), graph)
     graph = r.graph
-    if (r.changed.length || r.removed.length) graph = await saveGraph($, r.graph).catch(() => r.graph)
+    if (r.changed.length || r.removed.length) graph = await saveGraph(ioOf($), r.graph).catch(() => r.graph)
   } else if (opt.build) {
-    graph = await saveGraph($, await buildMechanical($, ref))
+    graph = await saveGraph(ioOf($), await buildMechanical(ioOf($), ref))
   }
   return graph ? keepGraph(graph, now) : null
 }
@@ -458,7 +476,7 @@ function findFeature(graph: Graph, id: string): Feature | undefined {
 async function flowRefOf($: $, fc: FlowCache | null): Promise<ProjectRef | undefined> {
   if (!fc) return undefined
   if (flowRef?.cle === fc.cle) return flowRef
-  const ref = await resolveProject($).catch(() => undefined)
+  const ref = await resolveProject(ioOf($)).catch(() => undefined)
   if (ref?.cle === fc.cle) flowRef = ref
   return flowRef?.cle === fc.cle ? flowRef : undefined
 }
@@ -495,7 +513,7 @@ function noteRead($: $, path: string, limit: unknown, who: string) {
       const ref = await flowRefOf($, fc)
       const p = ref ? relTo(ref.racine, path) : undefined
       if (!fc || !ref || !p) return
-      const tok = typeof limit === 'number' && limit > 0 ? Math.round((limit * 12) / 4) : await fileTokens($, ref.racine, p)
+      const tok = typeof limit === 'number' && limit > 0 ? Math.round((limit * 12) / 4) : await fileTokens(ioOf($), ref.racine, p)
       await update($, flowCacheA, f => (f && f.cle === fc.cle ? { ...f, lus: [...f.lus, { p, tok, par: who }].slice(-500) } : f))
       await refreshStats($)
     } catch {
@@ -565,7 +583,7 @@ type CacheCall = Record<string, unknown> & { agentId?: string }
 async function cacheTool($: $, e: CacheCall): Promise<string> {
   const action = text(e.action).toLowerCase()
   const projet = text(e.projet)
-  const ref = await resolveProject($, projet || undefined)
+  const ref = await resolveProject(ioOf($), projet || undefined)
   if (!ref) return `revo-flow cache : projet ${projet ? `« ${projet} » ` : 'courant '}introuvable (il faut un dossier suivi par git).`
   const graph = await graphOf($, ref, { build: true })
   if (!graph) return `revo-flow cache : le graphe de ${ref.nom} n’a pas pu être construit (git requis).`
@@ -608,7 +626,7 @@ async function cacheTool($: $, e: CacheCall): Promise<string> {
       const f = findFeature(graph, text(e.feature))
       if (!f) return `revo-flow cache : pas de fiche « ${text(e.feature)} » dans ${ref.nom}, rien à oublier.`
       const { [f.id]: _gone, ...rest } = graph.features
-      keepGraph(await saveGraph($, { ...graph, features: rest }), await $.clock.now())
+      keepGraph(await saveGraph(ioOf($), { ...graph, features: rest }), await $.clock.now())
       await refreshStats($)
       return `revo-flow cache : fiche « ${f.titre} » oubliée.`
     }
@@ -657,7 +675,7 @@ async function learnTool($: $, e: CacheCall, ref: ProjectRef, graph: Graph, live
     corrections: texts(e.corrections),
   }
   const { graph: next, rejected } = learn(graph, input, ctx)
-  const saved = keepGraph(await saveGraph($, next), now)
+  const saved = keepGraph(await saveGraph(ioOf($), next), now)
   if (live) {
     if (learned.flowId !== live.id) Object.assign(learned, { flowId: live.id, features: [] })
     if (!learned.features.includes(id)) learned.features.push(id)
@@ -676,7 +694,7 @@ async function startFlowCache($: $, flowId: string, request: string): Promise<st
   await update($, flowCacheA, () => null)
   Object.assign(learned, { flowId, features: [] })
   endNote = ''
-  flowRef = await resolveProject($).catch(() => undefined)
+  flowRef = await resolveProject(ioOf($)).catch(() => undefined)
   const ref = flowRef
   if (!ref) {
     await refreshStats($)
@@ -734,7 +752,7 @@ async function learnAtEnd($: $, flow: Flow) {
     le: new Date(now).toISOString(),
     confiance: 0.5,
   }
-  keepGraph(await saveGraph($, autoFiche(graph, id, files, ctx)), now)
+  keepGraph(await saveGraph(ioOf($), autoFiche(graph, id, files, ctx)), now)
   endNote = `fiche auto « ${id} »`
 }
 
@@ -755,7 +773,7 @@ async function closeFlowCache($: $) {
   if (!graph) return
   let next = recordCacheUsage(graph, fc)
   if (fc.feature && next.features[fc.feature]) next = completeFiche(next, fc.feature, [...new Set(fc.lus.map(l => l.p))])
-  keepGraph(await saveGraph($, next), await $.clock.now())
+  keepGraph(await saveGraph(ioOf($), next), await $.clock.now())
   await refreshStats($)
 }
 
@@ -799,14 +817,14 @@ async function cacheCommand($: $, word: string, rest: string): Promise<{ text: s
 /** Un projet connu : un graphe déjà construit, ou un dossier de projet dont le nom est exactement celui-là. */
 async function knownProject($: $, name: string): Promise<ProjectRef | undefined> {
   const s = slug(name.split(/[\\/]/).pop() ?? name)
-  const known = (await listGraphs($).catch(() => [])).some(g => g.cle === name || slug(g.cle) === slug(name))
-  const ref = await resolveProject($, name).catch(() => undefined)
+  const known = (await listGraphs(ioOf($)).catch(() => [])).some(g => g.cle === name || slug(g.cle) === slug(name))
+  const ref = await resolveProject(ioOf($), name).catch(() => undefined)
   if (!ref) return undefined
   return known || ref.cle === name || slug(ref.nom) === s || ref.racine === name ? ref : undefined
 }
 
 async function showGraph($: $, target: ProjectRef | undefined) {
-  const ref = target ?? (await resolveProject($).catch(() => undefined))
+  const ref = target ?? (await resolveProject(ioOf($)).catch(() => undefined))
   if (!ref) return { text: NO_PROJECT }
   const graph = await graphOf($, ref, { build: true })
   if (!graph) return { text: `revo-flow cache : le graphe de ${ref.nom} n’a pas pu être construit (git requis).` }
@@ -826,7 +844,7 @@ async function showGraph($: $, target: ProjectRef | undefined) {
 }
 
 async function searchCommand($: $, q: string) {
-  const ref = await resolveProject($).catch(() => undefined)
+  const ref = await resolveProject(ioOf($)).catch(() => undefined)
   if (!ref) return { text: NO_PROJECT }
   const graph = await graphOf($, ref, { build: true })
   if (!graph) return { text: `revo-flow cache : le graphe de ${ref.nom} n’a pas pu être construit (git requis).` }
@@ -836,9 +854,9 @@ async function searchCommand($: $, q: string) {
 }
 
 async function clearCommand($: $, feature: string) {
-  const ref = await resolveProject($).catch(() => undefined)
+  const ref = await resolveProject(ioOf($)).catch(() => undefined)
   if (!ref) return { text: NO_PROJECT }
-  const graph = graphCache.get(ref.cle)?.graph ?? (await loadGraph($, ref).catch(() => null))
+  const graph = graphCache.get(ref.cle)?.graph ?? (await loadGraph(ioOf($), ref).catch(() => null))
   if (!graph) return { text: `revo-flow cache : aucun graphe pour ${ref.nom}, rien à supprimer.` }
   if (feature) {
     const f = findFeature(graph, feature)
@@ -848,7 +866,7 @@ async function clearCommand($: $, feature: string) {
       return { text: 'revo-flow cache : rien n’a été supprimé.' }
     }
     const { [f.id]: _gone, ...rest } = graph.features
-    keepGraph(await saveGraph($, { ...graph, features: rest }), await $.clock.now())
+    keepGraph(await saveGraph(ioOf($), { ...graph, features: rest }), await $.clock.now())
     await refreshStats($)
     return { text: `revo-flow cache : fiche « ${f.titre} » supprimée de ${ref.nom}.` }
   }
@@ -856,7 +874,7 @@ async function clearCommand($: $, feature: string) {
   if (!(await confirm($, `Supprimer tout le cache de ${ref.nom} (graphe et ${plural(n, 'fiche')}) ?`, 'Supprimer', 'Garder', false))) {
     return { text: 'revo-flow cache : rien n’a été supprimé.' }
   }
-  await deleteGraph($, ref.cle)
+  await deleteGraph(ioOf($), ref.cle)
   graphCache.delete(ref.cle)
   await refreshStats($)
   return { text: `revo-flow cache : cache de ${ref.nom} supprimé (graphe et ${plural(n, 'fiche')}).` }
@@ -875,12 +893,12 @@ function featureTok(graph: Graph, f: Feature | undefined): number | undefined {
  * un sous-agent en arrière-plan écrit les fiches, après confirmation du coût estimé.
  */
 async function buildCommand($: $, args: string[]) {
-  const ref = await resolveProject($).catch(() => undefined)
+  const ref = await resolveProject(ioOf($)).catch(() => undefined)
   if (!ref) return { text: NO_PROJECT }
   const now = await $.clock.now()
   if (args.length === 0) {
-    const prev = graphCache.get(ref.cle)?.graph ?? (await loadGraph($, ref).catch(() => null)) ?? undefined
-    const graph = keepGraph(await saveGraph($, await buildMechanical($, ref, prev)), now)
+    const prev = graphCache.get(ref.cle)?.graph ?? (await loadGraph(ioOf($), ref).catch(() => null)) ?? undefined
+    const graph = keepGraph(await saveGraph(ioOf($), await buildMechanical(ioOf($), ref, prev)), now)
     shownRef = ref
     await refreshStats($)
     return {
