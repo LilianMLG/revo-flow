@@ -507,3 +507,72 @@ export function planBarSvg(
   const label = clip(o.label, Math.max(6, Math.floor((W - countW - 8) / 5.9)))
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} 24" width="${W}" height="24">${bars}<text x="0" y="20" font-family="${FONT}" font-size="10.5" font-weight="600" fill="${failed ? PALETTE.redText : PALETTE.text}">${esc(label)}</text><text x="${W}" y="20" text-anchor="end" font-family="${MONO}" font-size="10.5" fill="${PALETTE.muted}">${esc(o.count)}</text></svg>`
 }
+
+// ── Le cache du projet (graphe de nœuds) ─────────────────────────────────
+
+/** Trois tuiles (nœuds, utilisés, ≈ évités) et, si besoin, un badge orange « n périmé(s) ». Hauteur 44. */
+export function cacheSummarySvg(o: { nodes: number; used: number; saved: string; stale: number; width: number }): string {
+  const W = Math.max(200, Math.round(o.width))
+  const badgeText = o.stale > 0 ? `⚠ ${o.stale} périmé${o.stale > 1 ? 's' : ''}` : ''
+  const badgeW = badgeText ? Math.round(badgeText.length * 6.6 + 16) : 0
+  const avail = W - (badgeW ? badgeW + 8 : 0)
+  const gap = 6
+  const tileW = (avail - gap * 2) / 3
+  const tiles = [
+    { big: String(o.nodes), small: 'nœuds', color: PALETTE.silver },
+    { big: String(o.used), small: 'utilisés', color: o.used > 0 ? PALETTE.live : PALETTE.muted },
+    { big: `≈ ${o.saved}`, small: 'évités', color: o.saved === '0' ? PALETTE.muted : PALETTE.live },
+  ]
+    .map((t, i) => {
+      const x = i * (tileW + gap)
+      return `<rect x="${num(x + 0.5)}" y=".5" width="${num(tileW - 1)}" height="43" rx="8" fill="${PALETTE.card}" stroke="${PALETTE.cardBorder}"/><text x="${num(x + 10)}" y="20" font-family="${MONO}" font-size="14" font-weight="700" fill="${t.color}">${esc(clip(t.big, Math.max(3, Math.floor((tileW - 14) / 8.4))))}</text><text x="${num(x + 10)}" y="35" font-family="${FONT}" font-size="11" fill="${PALETTE.muted}">${esc(t.small)}</text>`
+    })
+    .join('')
+  const badge = badgeText
+    ? `<g><rect x="${num(W - badgeW + 0.5)}" y="11" width="${badgeW - 1}" height="22" rx="11" fill="none" stroke="${PALETTE.orange}"/><text x="${num(W - badgeW / 2)}" y="26" text-anchor="middle" font-family="${FONT}" font-size="11" font-weight="600" fill="${PALETTE.orange}">${esc(badgeText)}</text></g>`
+    : ''
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} 44" width="${W}" height="44">${tiles}${badge}</svg>`
+}
+
+/**
+ * Un nœud du cache : pastille d'état, nom en mono, type à droite, et dessous le résumé tronqué.
+ * `color` = couleur de l'agent qui l'a reçu (pastille pleine) ; sinon creuse (frais) ou orange (partiel, périmé).
+ */
+export function cacheNodeRowSvg(o: {
+  name: string
+  type: string
+  summary: string
+  color?: string
+  level: 'fraiche' | 'partielle' | 'perimee'
+  width: number
+  detail: string
+}): string {
+  const W = Math.max(200, Math.round(o.width))
+  const warn = o.level !== 'fraiche'
+  const dotColor = warn ? PALETTE.orange : (o.color ?? PALETTE.muted)
+  const dot =
+    o.color && !warn
+      ? `<circle cx="6" cy="9" r="4" fill="${dotColor}"/>`
+      : warn
+        ? `<circle cx="6" cy="9" r="4" fill="${o.color ?? 'none'}" stroke="${PALETTE.orange}" stroke-width="1.5"/>`
+        : `<circle cx="6" cy="9" r="3.5" fill="none" stroke="${PALETTE.muted}" stroke-width="1.3"/>`
+  const type = clip(o.type, 14)
+  const typeW = type.length * 6.4 + 4
+  const name = clip(o.name, Math.max(8, Math.floor((W - 22 - typeW - 8) / 7.2)))
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} 38" width="${W}" height="38">${dot}<text x="20" y="13" font-family="${MONO}" font-size="12" fill="${PALETTE.text}">${esc(name)}</text><text x="${W}" y="13" text-anchor="end" font-family="${MONO}" font-size="11" fill="${warn ? PALETTE.orange : PALETTE.muted}">${esc(warn ? `${type} ⚠` : type)}</text><text x="20" y="31" font-family="${FONT}" font-size="12" fill="${PALETTE.muted}">${esc(clip(o.summary, Math.floor((W - 24) / 6.1)))}</text><title>${esc(o.detail)}</title></svg>`
+}
+
+/** Une ligne dim sous la barre de progression : « cache : 12 nœuds · … », les tokens évités en vert, les périmés en orange à droite. Hauteur 18. */
+export function cacheBandSvg(o: { text: string; saved?: string; stale: number; width: number }): string {
+  const W = Math.max(300, Math.round(o.width))
+  const stale = o.stale > 0 ? `⚠ ${o.stale} périmé${o.stale > 1 ? 's' : ''}` : ''
+  const room = Math.floor((W - 40 - stale.length * 6.4) / 6.4)
+  const main = o.saved && o.text.includes(o.saved) ? o.text.split(o.saved) : [o.text]
+  const body =
+    main.length === 2
+      ? `<tspan fill="${PALETTE.muted}">${esc(main[0]!)}</tspan><tspan fill="${PALETTE.live}">${esc(o.saved!)}</tspan><tspan fill="${PALETTE.muted}">${esc(main[1]!)}</tspan>`
+      : `<tspan fill="${PALETTE.muted}">${esc(clip(o.text, room))}</tspan>`
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} 18" width="${W}" height="18"><text x="20" y="13" font-family="${MONO}" font-size="11">${body}</text>${
+    stale ? `<text x="${W - 20}" y="13" text-anchor="end" font-family="${MONO}" font-size="11" fill="${PALETTE.orange}">${esc(stale)}</text>` : ''
+  }<title>${esc(o.text)}</title></svg>`
+}

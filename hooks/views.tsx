@@ -1,11 +1,15 @@
 import type { Elements } from 'claude-code'
 
+import type { CacheStats } from '../types/cache'
 import type { Context, Entry, Flow, FlowAgent, FlowTask, Lead, LastTurn, Limit, Tally, Tokens } from '../types'
 import {
   AGENT_COLORS,
   PALETTE,
   agentHeadSvg,
   barSvg,
+  cacheBandSvg,
+  cacheNodeRowSvg,
+  cacheSummarySvg,
   emptySvg,
   fileRowSvg,
   headerSvg,
@@ -50,6 +54,10 @@ export type ViewData = {
   lastTurn: LastTurn | null
   context: Context | null
   sessionCostUsd: number
+  /** Le cache du projet (graphe de nœuds) ; null tant qu'il n'y en a pas. */
+  cache: CacheStats | null
+  /** La section Cache du panneau est dépliée. */
+  cacheOpen: boolean
 }
 
 /** Ce que les boutons du panneau déclenchent : branchés par register.tsx. */
@@ -60,6 +68,7 @@ export type PaneActions = {
   retryAgent(key: string): unknown
   approvePlan(): unknown
   cancelPlan(): unknown
+  toggleCache(): unknown
 }
 
 const MODEL_COLOR = { haiku: PALETTE.haiku, sonnet: PALETTE.sonnet, opus: PALETTE.opus } as const
@@ -109,9 +118,70 @@ const ctxColor = (percent: number) => (percent >= 85 ? PALETTE.red : percent >= 
 const cacheOf = (t: Tally) => t.cacheRead + t.cacheWrite
 const turnCost = (t: LastTurn) => (t.costUsd === 0 && !modelKey(t.modelId) ? '—' : euros(t.costUsd))
 /** « 3,2k ↑ · 850 ↓ · 41k cache · 0,04 € » */
-const promptText = (t: LastTurn) => `${fmt(t.tokens.input)} ↑ · ${fmt(t.tokens.output)} ↓ · ${fmt(cacheOf(t.tokens))} cache · ${turnCost(t)}`
+const promptText = (t: LastTurn) => `${fmt(t.tokens.input)} ↑ · ${fmt(t.tokens.output)} ↓ · ${fmt(cacheOf(t.tokens))} cache API · ${turnCost(t)}`
 const planCount = (a: FlowAgent) => `${a.tasks.length} tâche${a.tasks.length > 1 ? 's' : ''}`
 const planModel = (a: FlowAgent) => `${modelLabel(a.modelId || MODELS[a.model].id)} · ${a.effort}`
+
+// ── Le cache du projet : le texte et les chiffres partagés ───────────────
+
+const TYPE_LABEL: Record<string, string> = { page: 'Pages', composant: 'Composants', composable: 'Composables', store: 'Stores', service: 'Services', feature: 'Features' }
+const plural = (n: number, word: string) => `${n} ${word}${n > 1 ? 's' : ''}`
+const cacheNodes = (c: CacheStats) => Math.max(c.noeuds.length, c.fichiers + c.features)
+const cacheHits = (c: CacheStats) => c.noeuds.filter(n => n.hit).length
+const cacheKnown = (c: CacheStats) => c.noeuds.length > 0 || c.fichiers > 0 || c.features > 0 || c.build !== undefined
+/** La part des tokens lus qui ont été évités : évités / (évités + injectés). */
+const cacheShare = (c: CacheStats) => (c.flow.evites + c.flow.injecte > 0 ? (c.flow.evites / (c.flow.evites + c.flow.injecte)) * 100 : 0)
+/** La couleur de l'agent qui a reçu un nœud : « lead » en blanc, sinon la couleur de sa carte (ou de son modèle en terminal). */
+function hitColor(d: ViewData, key: string | undefined, byModel = false): string | undefined {
+  if (!key) return undefined
+  if (key === 'lead') return PALETTE.text
+  const i = d.flow?.agents.findIndex(a => a.key === key) ?? -1
+  if (i < 0) return PALETTE.silver
+  const a = d.flow!.agents[i]!
+  return byModel ? colorOf(a.modelId || MODELS[a.model].id) : AGENT_COLORS[i % AGENT_COLORS.length]!
+}
+const nodeState = (n: CacheStats['noeuds'][number]) => (n.niveau === 'perimee' ? 'périmé' : n.niveau === 'partielle' ? 'partiel' : 'frais')
+/** Les nœuds à montrer : ceux qui ont servi d'abord, puis les périmés, puis le reste. */
+const shownNodes = (c: CacheStats, max: number) => {
+  const rank = (n: CacheStats['noeuds'][number]) => (n.hit ? 0 : n.niveau !== 'fraiche' ? 1 : 2)
+  return [...c.noeuds].sort((a, b) => rank(a) - rank(b)).slice(0, max)
+}
+const typeCounts = (c: CacheStats) =>
+  Object.entries(c.parType)
+    .filter(([, n]) => n > 0)
+    .map(([k, n]) => `${TYPE_LABEL[k] ?? k} ${n}`)
+    .join(' · ')
+
+/** Les morceaux de la ligne de cache : le texte, les tokens évités (pour les colorer) et le nombre de périmés. */
+function cacheParts(d: ViewData, columns = 100): { text: string; saved?: string; stale: number } | undefined {
+  const c = d.cache
+  if (!c || !cacheKnown(c)) return undefined
+  const stale = c.perimees
+  if (c.build && c.flow.evites <= 0) return { text: `cache : construction « ${c.build.feature} » · ${fmt(c.build.tokens)} tokens`, stale }
+  const n = cacheNodes(c)
+  const used = cacheHits(c)
+  if (columns < 70) {
+    const saved = `≈${fmt(c.flow.evites)}`
+    return { text: `cache : ${n} · ${used} ✓ · ${saved}`, saved, stale }
+  }
+  const saved = `≈ ${fmt(c.flow.evites)} tokens évités`
+  return { text: `cache : ${plural(n, 'nœud')} · ${plural(used, 'utilisé')} · ${saved}`, saved, stale }
+}
+
+/** `cache : 12 nœuds · 3 utilisés · ≈ 18k tokens évités` (+ ` · ⚠ 1 périmé`) ; undefined sans cache. */
+export function cacheLine(d: ViewData, columns = 100): string | undefined {
+  const p = cacheParts(d, columns)
+  return p ? `${p.text}${p.stale > 0 ? ` · ⚠ ${p.stale} périmé${p.stale > 1 ? 's' : ''}` : ''}` : undefined
+}
+
+/** Les lignes « ↳ cache : … » d'une carte : ce que le cache a donné à cet agent (« lead » pour l'orchestrateur). */
+function cacheDetail(d: ViewData, key: string): Line[] {
+  const mine = d.cache?.noeuds.filter(n => n.hit === key) ?? []
+  if (!mine.length) return []
+  const title = mine.find(n => n.k === 'feature')?.titre ?? d.cache?.flow.feature ?? mine[0]!.titre
+  const saved = mine.reduce((s, n) => s + n.tok, 0)
+  return [{ icon: ' ', text: `↳ cache : ${title} (≈ ${fmt(saved)} évités)`, tone: 'detail' }]
+}
 
 const STATUS: Record<Tone, string> = { live: 'Actif', wait: 'En attente', done: 'Terminé', fail: 'Échec' }
 
@@ -149,13 +219,14 @@ function leadCard(d: ViewData, flow: Flow): Card {
     ...(d.lead.isDoing && d.lead.doing ? { doing: d.lead.doing } : {}),
     prog: p,
     usage: usageText(d.lead.tokens, d.lead.costUsd),
-    lines: lines(tasks, p, d.lead, tone === 'wait' ? 'live' : tone),
+    lines: [...lines(tasks, p, d.lead, tone === 'wait' ? 'live' : tone), ...cacheDetail(d, 'lead')],
     duration: fmtDuration(Math.max(0, (flow.endedAt ?? d.now) - flow.startedAt)),
     isLead: true,
   }
 }
 
-function agentCard(a: FlowAgent, index: number, now: number): Card {
+function agentCard(a: FlowAgent, index: number, d: ViewData): Card {
+  const now = d.now
   const tone: Tone = a.status === 'failed' ? 'fail' : a.status === 'done' ? 'done' : a.status === 'running' ? 'live' : 'wait'
   const p = progress(a.tasks, a.status, a.status === 'running')
   const modelId = a.modelId || MODELS[a.model].id
@@ -170,7 +241,7 @@ function agentCard(a: FlowAgent, index: number, now: number): Card {
     ...(a.isDoing && a.doing ? { doing: a.doing } : {}),
     prog: p,
     usage: usageText(a.tokens, a.costUsd),
-    lines: lines(a.tasks, p, a, tone),
+    lines: [...lines(a.tasks, p, a, tone), ...cacheDetail(d, a.key)],
     ...(a.startedAt !== undefined
       ? { duration: fmtDuration(Math.max(0, (a.endedAt ?? (a.status === 'running' ? now : (a.lastActiveAt ?? now))) - a.startedAt)) }
       : {}),
@@ -188,7 +259,7 @@ const RANK: Record<Tone, number> = { live: 0, wait: 1, fail: 2, done: 3 }
 export function cards(d: ViewData): Card[] {
   if (!d.flow || d.flow.phase === 'planning') return []
   // La couleur suit l'ordre du plan (elle ne change pas quand l'agent change de place) ; le tri garde cet ordre à rang égal.
-  const agents = d.flow.agents.map((a, i) => agentCard(a, i, d.now)).sort((a, b) => RANK[a.tone] - RANK[b.tone])
+  const agents = d.flow.agents.map((a, i) => agentCard(a, i, d)).sort((a, b) => RANK[a.tone] - RANK[b.tone])
   return [leadCard(d, d.flow), ...agents]
 }
 
@@ -225,8 +296,9 @@ export function DesktopBand(t: Elements['desktop'], d: ViewData, widthPx: number
   if (!m) return null
   const { Box, Svg } = t
   const width = Math.max(340, Math.min(1100, widthPx - 24))
+  const cp = cacheParts(d, width / 7.6)
   return (
-    <Box key="bar">
+    <Box key="bar" flexDirection="column">
       <Svg
         source={barSvg(m.stages, {
           title: m.flow.title,
@@ -241,9 +313,20 @@ export function DesktopBand(t: Elements['desktop'], d: ViewData, widthPx: number
         width={width}
         isInteractive
       />
+      {cp && (
+        <Svg
+          source={cacheBandSvg({ text: cp.text, ...(cp.saved ? { saved: cp.saved } : {}), stale: cp.stale, width })}
+          alt={cacheLine(d, width / 7.6) ?? ''}
+          width={width}
+          isInteractive
+        />
+      )}
     </Box>
   )
 }
+
+/** La largeur du terminal en colonnes (100 si on ne la connaît pas). */
+const termColumns = () => (globalThis as { process?: { stdout?: { columns?: number } } }).process?.stdout?.columns ?? 100
 
 /** Terminal : une ligne sobre — titre, étape de l'orchestrateur, avancement, agents actifs — et dessous le dernier prompt et le contexte. */
 export function TerminalBand(t: Elements['terminal'], d: ViewData) {
@@ -251,6 +334,8 @@ export function TerminalBand(t: Elements['terminal'], d: ViewData) {
   if (!m) return null
   const { Box, Text } = t
   const lt = d.lastTurn
+  const cp = cacheParts(d, termColumns())
+  const cut = cp?.saved ? cp.text.indexOf(cp.saved) : -1
   return (
     <Box borderStyle="round" borderColor={PALETTE.border} paddingX={1} flexDirection="column">
       <Text wrap="truncate-end">
@@ -276,6 +361,20 @@ export function TerminalBand(t: Elements['terminal'], d: ViewData) {
           )}
         </Box>
       )}
+      {cp && (
+        <Box justifyContent="space-between">
+          <Text wrap="truncate-end">
+            <Text dimColor>{cut >= 0 ? cp.text.slice(0, cut) : cp.text}</Text>
+            {cut >= 0 ? <Text color={PALETTE.live}>{cp.saved}</Text> : null}
+            {cut >= 0 ? <Text dimColor>{cp.text.slice(cut + (cp.saved?.length ?? 0))}</Text> : null}
+          </Text>
+          {cp.stale > 0 && (
+            <Box flexShrink={0} marginLeft={2}>
+              <Text color={PALETTE.orange}>{`⚠ ${cp.stale} périmé${cp.stale > 1 ? 's' : ''}`}</Text>
+            </Box>
+          )}
+        </Box>
+      )}
     </Box>
   )
 }
@@ -289,8 +388,9 @@ export function TerminalTurnLine(t: Elements['terminal'], d: ViewData, props: { 
     `⏱ ${fmtDuration(props.durationMs)}`,
     `${fmt(lt.tokens.input)} in`,
     `${fmt(lt.tokens.output)} out`,
-    `${fmt(cacheOf(lt.tokens))} cache`,
+    `${fmt(cacheOf(lt.tokens))} cache API`,
     turnCost(lt),
+    ...(d.cache && d.cache.flow.evites > 0 ? [`cache ${plural(cacheHits(d.cache), 'hit')} ≈ -${fmt(d.cache.flow.evites)}`] : []),
     modelLabel(lt.modelId),
   ]
   return (
@@ -499,6 +599,59 @@ export function DesktopPane(t: Elements['desktop'], d: ViewData, actions: PaneAc
             <Button key="clear" plain label="vider la liste" onPress={() => actions.clear()} />
           </Box>
         )}
+
+        {d.cache && cacheKnown(d.cache) && (() => {
+          const c = d.cache!
+          const nodes = cacheNodes(c)
+          const right = `${plural(nodes, 'nœud')}${c.perimees > 0 ? ` · ${c.perimees} périmé${c.perimees > 1 ? 's' : ''}` : ''}`
+          const limit = inner < 360 ? 5 : 8
+          const shown = shownNodes(c, limit)
+          const types = typeCounts(c)
+          return (
+            <Box key="cache" flexDirection="column" gap={1} width="100%">
+              <Box flexDirection="row" alignItems="center" gap={1}>
+                <Button key="toggle-cache" plain label={d.cacheOpen ? '▾' : '▸'} onPress={() => actions.toggleCache()} />
+                <Svg source={sectionSvg(`CACHE · ${c.projet}`, right, inner - 28)} alt={`Cache ${c.projet} : ${right}`} width={inner - 28} />
+              </Box>
+              {d.cacheOpen && (
+                <Box flexDirection="column" gap={1} width="100%">
+                  <Svg
+                    source={cacheSummarySvg({ nodes, used: cacheHits(c), saved: fmt(c.flow.evites), stale: c.perimees, width: inner })}
+                    alt={`Cache : ${plural(nodes, 'nœud')}, ${plural(cacheHits(c), 'utilisé')}, ≈ ${fmt(c.flow.evites)} tokens évités`}
+                    width={inner}
+                  />
+                  {types ? <Text color={PALETTE.muted} wrap="truncate-end">{types}</Text> : null}
+                  {shown.map(n => {
+                    const color = hitColor(d, n.hit)
+                    return (
+                      <Svg
+                        key={n.id}
+                        source={cacheNodeRowSvg({
+                          name: n.titre,
+                          type: n.k,
+                          summary: `${nodeState(n)}${n.hit ? ` · reçu par ${whoName(d, n.hit)}` : ''} · ≈ ${fmt(n.tok)} tokens`,
+                          level: n.niveau,
+                          width: inner,
+                          detail: `${n.titre} (${n.k}) : ${nodeState(n)}${n.hit ? `, reçu par ${whoName(d, n.hit)}` : ''}, ≈ ${fmt(n.tok)} tokens${c.indexe ? `, indexé au commit ${c.indexe.commit}` : ''}`,
+                          ...(color ? { color } : {}),
+                        })}
+                        alt={`${n.titre}, ${n.k}, ${nodeState(n)}${n.hit ? `, reçu par ${whoName(d, n.hit)}` : ''}`}
+                        width={inner}
+                        isInteractive
+                      />
+                    )
+                  })}
+                  {c.noeuds.length > shown.length && (
+                    <Text color={PALETTE.muted} wrap="truncate-end">{`… et ${c.noeuds.length - shown.length} autres : /revo-flow cache`}</Text>
+                  )}
+                  {c.build && (
+                    <Text color={PALETTE.muted} wrap="truncate-end">{`Coût construction ${fmt(c.build.tokens)} tokens · ${euros(c.build.costUsd)}`}</Text>
+                  )}
+                </Box>
+              )}
+            </Box>
+          )
+        })()}
       </Box>
 
       <Box flexDirection="column" gap={1} padding={2} width="100%" backgroundColor={PALETTE.panelFoot}>
@@ -525,6 +678,20 @@ export function DesktopPane(t: Elements['desktop'], d: ViewData, actions: PaneAc
               warnAt: [70, 85],
             })}
             alt={`Contexte : ${Math.round(d.context.percent)} %`}
+            width={inner}
+          />
+        )}
+        {d.cache && (d.cache.flow.evites > 0 || d.cache.flow.lus > 0) && (
+          <Svg
+            source={usageRowSvg({
+              label: 'Cache',
+              value: `≈ ${fmt(d.cache.flow.evites)} évités`,
+              note: d.cache.build ? `coût ${fmt(d.cache.build.tokens)}` : '',
+              percent: cacheShare(d.cache),
+              width: inner,
+              warnAt: [101, 101],
+            })}
+            alt={`Cache : ≈ ${fmt(d.cache.flow.evites)} tokens évités`}
             width={inner}
           />
         )}
@@ -595,6 +762,11 @@ export function TerminalPane(t: Elements['terminal'], d: ViewData, actions: Pane
             {`  ⚠ ${c.idle}`}
           </Text>
         ) : null}
+        {c.lines
+          .filter(l => l.text.startsWith('↳ cache'))
+          .map((l, i) => (
+            <Text key={`cache${i}`} dimColor wrap="truncate-end">{`    ${l.text}`}</Text>
+          ))}
         <Text dimColor={isDone} color={isDone ? undefined : PALETTE.text2} wrap="truncate-end">{`  Σ ${c.usage}`}</Text>
         {!c.isLead && (c.tone === 'live' || c.tone === 'fail') ? (
           <Box paddingLeft={2}>
@@ -620,6 +792,58 @@ export function TerminalPane(t: Elements['terminal'], d: ViewData, actions: Pane
       {extra ? <Text dimColor>{` · ${extra}`}</Text> : null}
     </Text>
   )
+
+  const cacheSection = (c: CacheStats) => {
+    const nodes = cacheNodes(c)
+    const shown = shownNodes(c, 8)
+    const types = typeCounts(c)
+    const share = cacheShare(c)
+    const gain = c.flow.evites > 0 || c.flow.lus > 0
+    return (
+      <Box key="cache" flexDirection="column">
+        <Box justifyContent="space-between">
+          <Button key="toggle-cache" plain label={`${d.cacheOpen ? '▾' : '▸'} Cache · ${c.projet}`} onPress={() => actions.toggleCache()} />
+          <Text dimColor wrap="truncate-end">{`${plural(nodes, 'nœud')}${c.perimees > 0 ? ` · ${c.perimees} périmé${c.perimees > 1 ? 's' : ''}` : ''}`}</Text>
+        </Box>
+        {d.cacheOpen && types ? <Text dimColor wrap="truncate-end">{`  ${types}`}</Text> : null}
+        {d.cacheOpen &&
+          shown.map(n => {
+            const warn = n.niveau !== 'fraiche'
+            const color = hitColor(d, n.hit, true)
+            const mark = warn ? '⚠' : n.hit ? '●' : '○'
+            return (
+              <Box key={n.id} justifyContent="space-between">
+                <Box flexShrink={1}>
+                  <Text wrap="truncate-end">
+                    <Text color={warn ? PALETTE.orange : (color ?? PALETTE.muted)}>{`  ${mark} `}</Text>
+                    <Text>{`${n.titre} (${n.k})`}</Text>
+                  </Text>
+                </Box>
+                <Box flexShrink={0} marginLeft={1}>
+                  <Text color={warn ? PALETTE.orange : undefined} dimColor={!warn}>
+                    {n.hit ? `← ${whoName(d, n.hit)}` : nodeState(n)}
+                  </Text>
+                </Box>
+              </Box>
+            )
+          })}
+        {d.cacheOpen && c.noeuds.length > shown.length ? (
+          <Text dimColor wrap="truncate-end">{`  … et ${c.noeuds.length - shown.length} autres : /revo-flow cache`}</Text>
+        ) : null}
+        {gain && (d.cacheOpen || c.flow.evites > 0) ? (
+          <Text wrap="truncate-end">
+            <Text dimColor>{'  Gain '.padEnd(9)}</Text>
+            <Text color={PALETTE.live}>{bar(share, 10)}</Text>
+            <Text>{`  ≈ ${fmt(c.flow.evites)} tokens évités`}</Text>
+            <Text dimColor>{` (sur ≈ ${fmt(c.flow.lus)} lus)`}</Text>
+          </Text>
+        ) : null}
+        {d.cacheOpen && c.build ? (
+          <Text dimColor wrap="truncate-end">{`  Coût construction ${fmt(c.build.tokens)} tokens · ${euros(c.build.costUsd)}`}</Text>
+        ) : null}
+      </Box>
+    )
+  }
 
   return (
     <Box flexDirection="column" gap={1} paddingX={1}>
@@ -692,6 +916,8 @@ export function TerminalPane(t: Elements['terminal'], d: ViewData, actions: Pane
             })}
         </Box>
       )}
+
+      {d.cache && cacheKnown(d.cache) && cacheSection(d.cache)}
 
       <Box flexDirection="column">
         {gauge('Session', fmt(total(d.session)), pct.session, [80, 95], d.sessionCostUsd > 0 ? euros(d.sessionCostUsd) : '')}

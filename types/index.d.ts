@@ -99,6 +99,38 @@ export type LastTurn = { at: number; durationMs: number; tokens: Tally; modelId:
 /** Fenêtre de contexte de l'orchestrateur. */
 export type Context = { percent: number; tokens: number; window: number }
 
+// Le cache projet, tel que l'état partagé le porte. Le contrat doit se suffire à lui-même (pas d'import) :
+// ces types reprennent à l'identique ceux de types/cache.d.ts (graph.ts), qui restent la référence.
+
+/** Un fichier servi par le cache pendant le flow courant. par = 'brief' | 'feature' | 'voisins' | 'chercher'. */
+export type CacheHit = { p: string; tok: number; feature?: string; frais: boolean; par: string }
+
+/** Ce que le flow courant a lu et reçu du cache. */
+export type FlowCache = {
+  cle: string
+  servis: CacheHit[]
+  lus: { p: string; tok: number; par: string }[]
+  /** Tokens injectés par le cache (brief et réponses de l'outil). */
+  injecte: number
+  feature?: string
+}
+
+/** Les données du cache pour le panneau et la bande (graph.ts computeStats). */
+export type CacheStats = {
+  projet: string
+  cle: string
+  fichiers: number
+  features: number
+  fraiches: number
+  perimees: number
+  parType: Record<string, number>
+  indexe?: { commit: string; le: string }
+  noeuds: { id: string; k: string; titre: string; niveau: 'fraiche' | 'partielle' | 'perimee'; hit?: string; tok: number }[]
+  flow: { injecte: number; evites: number; net: number; lus: number; completude: number; feature?: string }
+  cumul: { flows: number; evites: number; net: number }
+  build?: { feature: string; tokens: number; costUsd: number }
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'revo-flow': {
@@ -112,6 +144,12 @@ declare module 'claude-code' {
       lastTurn: LastTurn | null
       context: Context | null
       sessionCostUsd: number
+      /** Le cache projet tel que les vues l'affichent : graphe, fiches, gains du flow et cumulés. */
+      cacheStats: CacheStats | null
+      /** Ce que le cache a servi et ce qui a été lu pendant le flow courant. */
+      flowCache: FlowCache | null
+      /** La section « Cache » du panneau est dépliée. */
+      cacheOpen: boolean
     }
   }
 }

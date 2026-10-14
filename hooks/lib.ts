@@ -3,6 +3,7 @@ import type { Effort, Flow, FlowAgent, FlowTask, ModelKey, Phase, TaskKind, Task
 export const PLUGIN = 'revo-flow'
 export const PLAN_TOOL = `mcp__${PLUGIN}__plan`
 export const STEP_TOOL = `mcp__${PLUGIN}__step`
+export const CACHE_TOOL = `mcp__${PLUGIN}__cache`
 
 // ── Modèles ──────────────────────────────────────────────────────────────
 
@@ -225,13 +226,22 @@ export const allFinished = (flow: Flow) => flow.agents.length > 0 && flow.agents
 
 // ── Les consignes ────────────────────────────────────────────────────────
 
-/** Ajoutées, invisibles, à la demande envoyée par /revo-flow : le rôle de l'orchestrateur. */
-export const LEAD_BRIEF = `# revo-flow — tu es l'orchestrateur de cette demande
-1. Plan : lis toi-même la demande et les specs utiles (fichiers, code existant, tickets cités), seulement le nécessaire, sans rien modifier et sans lancer de sous-agent (revo-flow refuse tout agent avant le plan). Établis le plan.
+/**
+ * Ajoutées, invisibles, à la demande envoyée par /revo-flow : le rôle de l'orchestrateur. Sans cache (option
+ * désactivée), rien n'y parle du cache ni de son outil.
+ */
+export function leadBrief(withCache: boolean): string {
+  const cache = (s: string) => (withCache ? s : '')
+  return `# revo-flow — tu es l'orchestrateur de cette demande
+1. Plan : ${cache(`commence par le cache revo-flow ci-dessous s'il y en a un (ou l'outil ${CACHE_TOOL} : chercher, feature, voisins). S'il connaît la feature, fie-toi à sa fiche pour comprendre le flux et ne lis que les fichiers à modifier et ceux signalés « modifiés depuis l'apprentissage ». Le cache est une carte, pas la vérité : vérifie dans le code tout ce que tu vas affirmer ou changer. Lis ensuite `)}${withCache ? 'toi-même' : 'lis toi-même'} la demande et les specs utiles (fichiers, code existant, tickets cités), seulement le nécessaire, sans rien modifier et sans lancer de sous-agent (revo-flow refuse tout agent avant le plan). Établis le plan.
 2. Équipe : appelle UNE fois l'outil ${PLAN_TOOL} avec le titre de la feature, le résumé du plan et les sous-agents nécessaires (1 à 6, pas plus que le travail ne le demande). Pour chacun : un nom court et unique, son rôle, le type d'agent (general-purpose par défaut, Explore pour de la lecture seule), le modèle le plus fiable pour SES tâches (haiku : mécanique et localisé ; sonnet : la plupart des features et correctifs ; opus : transverse, ambigu, délicat, sécurité) avec l'effort adapté (low, medium, high, xhigh), et la liste ordonnée de SES tâches (2 à 10, titres courts à l'infinitif) avec leur type (analyse, codage, test, review, doc, deploy). Découpe pour que les agents avancent en parallèle sans modifier les mêmes fichiers.
-3. Exécution : lance ensuite chaque sous-agent avec l'outil Agent : description = son nom exact, prompt = sa mission avec tout le contexte utile (fichiers, conventions, contraintes, ce que les autres font). Lance-les dans un même message quand ils sont indépendants. revo-flow applique son modèle et son effort et lui transmet sa liste de tâches : ne la recopie pas.
-4. Fin : quand tous ont fini, vérifie l'ensemble (tests et lint ciblés), corrige si besoin et conclus par une synthèse courte.
+3. Exécution : lance ensuite chaque sous-agent avec l'outil Agent : description = son nom exact, prompt = sa mission avec tout le contexte utile (fichiers, conventions, contraintes, ce que les autres font)${cache(", dont l'extrait de fiche du cache qui le concerne (fichiers, rôles, pièges) : il ne doit pas réexplorer ce que le cache sait déjà")}. Lance-les dans un même message quand ils sont indépendants. revo-flow applique son modèle et son effort et lui transmet sa liste de tâches : ne la recopie pas.
+4. Fin : quand tous ont fini, vérifie l'ensemble (tests et lint ciblés), corrige si besoin${cache(`, puis appelle ${CACHE_TOOL} action « apprendre » pour chaque feature touchée : feature (identifiant court), titre, alias, resume, flux, entrees, fichiers et leur rôle, pièges découverts, et corrections de ce que le cache disait de faux (revo-flow écrit sinon une fiche minimale à partir des fichiers lus et modifiés pendant le flow)`)}. Conclus par une synthèse courte.
 Ne fais pas toi-même les tâches confiées aux sous-agents. Pas de commit, de push ni de MR sans que l'utilisateur le demande.`
+}
+
+/** Le rôle de l'orchestrateur, cache compris (l'option par défaut). */
+export const LEAD_BRIEF = leadBrief(true)
 
 /** La réponse de l'outil plan : ce que l'orchestrateur doit lancer maintenant. */
 export function dispatchText(plan: PlanInput): string {
@@ -259,21 +269,23 @@ export const remainingTasks = (a: FlowAgent) => a.tasks.filter(t => t.status ===
 
 /**
  * Réinjecté après une compaction : la compaction résume la conversation et peut perdre le rôle d'orchestrateur
- * et l'état du flow ; on les redonne tels quels au modèle.
+ * et l'état du flow ; on les redonne tels quels au modèle. `cache` : la ligne du cache (fiche servie, features
+ * connues), ou false quand le cache est désactivé.
  */
-export function flowRecap(flow: Flow): string {
+export function flowRecap(flow: Flow, cache?: string | false): string {
   const rows = flow.agents.map(a => {
     const left = remainingTasks(a)
     const todo = left.length ? `reste : ${left.map(t => t.title).join(' ; ')}` : 'plus rien à faire'
     return `- « ${a.name} » (${MODELS[a.model].label}, effort ${a.effort}) [${a.status}] — ${todo}`
   })
   return [
-    LEAD_BRIEF,
+    cache === false ? leadBrief(false) : LEAD_BRIEF,
     '',
     `# État du flow revo-flow (rappel après compaction)`,
     `Feature : « ${flow.title} » — phase : ${PHASE_LABEL[flow.phase]}.`,
     ...(flow.summary ? [`Plan : ${flow.summary}`] : []),
     ...(rows.length ? ['Agents :', ...rows] : ['Aucun agent prévu pour l’instant : le plan reste à poser.']),
+    ...(cache ? [cache] : []),
   ].join('\n')
 }
 
@@ -285,11 +297,11 @@ export function planQuestion(plan: PlanInput): string {
   return [`Plan « ${plan.title} » : ${plan.agents.length} agent${plan.agents.length > 1 ? 's' : ''}.`, ...rows, 'Lancer ce plan ?'].join('\n')
 }
 
-/** Ajouté au prompt du sous-agent : ses tâches et comment les signaler. */
-export function agentBrief(a: FlowAgent): string {
+/** Ajouté au prompt du sous-agent : ses tâches, comment les signaler et, avec le cache, l'outil voisins. */
+export function agentBrief(a: FlowAgent, withCache = true): string {
   return `# Tes tâches (revo-flow) — « ${a.name} »${a.role ? ` : ${a.role}` : ''}
 ${a.tasks.map((t, i) => `${i + 1}. ${t.title}`).join('\n')}
-
+${withCache ? `\nAvant un grep « qui utilise X », essaie ${CACHE_TOOL} action voisins.\n` : ''}
 Suivi : fais ces tâches dans l'ordre. Au début de chacune, appelle l'outil ${STEP_TOOL} avec {"tache": <numéro>, "statut": "en_cours"} ; quand elle est finie, {"tache": <numéro>, "statut": "fait"} (ou "echec" si tu ne peux pas la faire, en expliquant pourquoi dans ta réponse). C'est ce qui fait avancer ta barre de progression ; n'utilise cet outil pour rien d'autre.`
 }
 
