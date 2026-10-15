@@ -1,10 +1,11 @@
 # R&D : graphe de cache par projet
 
-> **Statut : lots 0 à 3 implémentés en v1.2.0 (2026-10-14) ; lot 4 à venir.**
+> **Statut : lots 0 à 3 implémentés en v1.2.0 (2026-10-14) ; lot 4 en partie en v1.3.0 (2026-10-15) : extrait de fiche injecté à chaque agent, actions `rafraichir` et `diff` ; le reste du lot 4 à venir.**
 >
 > Étude de faisabilité du 2026-10-14. Trois fiches détaillées :
 > [conception.md](conception.md) (modèle, construction, usage, gains), [api-plugin.md](api-plugin.md)
 > (ce que l'API plugin permet, avec les lignes des typings), [ui.md](ui.md) (panneau, bande, terminal).
+> Suite du 2026-10-15 : [ameliorations.md](ameliorations.md) (limites mesurées, état de l'art, pistes chiffrées pour la v1.4).
 
 ## Verdict : faisable
 
@@ -76,5 +77,6 @@ Les imports explicites ne suffisent pas : auto-imports Nuxt (140 dans reservatio
 ## Décisions (2026-10-14)
 
 1. **L'orchestrateur gère tout.** revo-flow ne passe pas lui-même les extraits de fiche aux sous-agents : c'est l'orchestrateur, modèle le plus intelligent de la session, qui choisit ce qu'il transmet à chacun. Le `LEAD_BRIEF` le lui demande (étape 3), revo-flow fournit l'outil et le brief, rien de plus.
+   *Amendée en v1.3.0 (2026-10-15)* : revo-flow injecte lui-même dans `agent.spawn` l'extrait de la fiche servie qui concerne chaque agent (fichiers cités par sa mission, sinon entrée, cœur et données ; pièges ; ≤ 600 tokens) et lui donne la consigne d'utiliser l'outil (`chercher`, `feature`, `voisins`, `diff`, `rafraichir`). L'orchestrateur complète avec ce qui manque (pièges transverses, décisions). Une fiche périmée se vérifie (`diff`) puis se rafraîchit (`rafraichir`) ou se corrige (`apprendre` avec `corrections`).
 2. **Confirmation au lancement.** Quand une feature du cache correspond à la demande, revo-flow demande via `$.ui.ask` (« Je pense qu'il s'agit de complementary-products : utiliser la fiche ? », options Utiliser / Ignorer) avant d'injecter la fiche. Sans personne à qui demander (`claude -p`), la fiche est utilisée.
 3. **Nom : `cache`.** Sous-commande `/revo-flow cache …`, outil `mcp__revo-flow__cache`. Dans la bande, l'existant « 40k cache » (cache de prompt API) devient « 40k cache API » pour lever l'ambiguïté.

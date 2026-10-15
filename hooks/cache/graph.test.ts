@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import {
+  agentExtract,
   autoFiche,
   briefText,
   buildGraph,
@@ -9,6 +10,8 @@ import {
   completeFiche,
   computeStats,
   detectStack,
+  diffText,
+  extractFiles,
   featureText,
   freshness,
   graphText,
@@ -20,11 +23,14 @@ import {
   matchRequest,
   neighbors,
   neighborsText,
+  perimeOf,
   projectKey,
   recordUsage,
+  refreshFiles,
   search,
   searchText,
   servedFiles,
+  servedSubset,
   tokensOf,
   updateFiles,
   MECA_FORMAT,
@@ -301,6 +307,9 @@ test('freshness : fraîche, partielle (< 50 %), périmée (≥ 50 %), confiance 
   expect(fr1.confiance).toBe(0.67)
   expect(featureText(g1, g1.features.f!)).toContain('Flux :')
   expect(featureText(g1, g1.features.f!)).toContain('⚠ Modifiés depuis l')
+  expect(featureText(g1, g1.features.f!)).toContain('action rafraichir (feature, fichiers = ceux relus)')
+  expect(featureText(g1, g1.features.f!)).toContain('action apprendre avec corrections')
+  expect(featureText(g1, g1.features.f!)).toContain('Action diff (feature ou chemin)')
 
   const g2 = updateFiles(g1, [{ p: 'utils/c.ts', h: 'c2', text: 'c'.repeat(1600) }], [], [], CTX)
   const fr2 = freshness(g2, g2.features.f!)
@@ -310,6 +319,8 @@ test('freshness : fraîche, partielle (< 50 %), périmée (≥ 50 %), confiance 
   expect(txt).not.toContain('Flux :')
   expect(txt).not.toContain('étape un')
   expect(txt).toContain('très périmée')
+  expect(txt).toContain('Relis les fichiers (ou action diff) puis action apprendre pour la réécrire.')
+  expect(txt).not.toContain('action rafraichir')
 
   // Un nouvel apprentissage remet les hash à jour et vide perime
   const g3 = learn(g2, { feature: 'f' }, LEARN).graph
@@ -473,6 +484,8 @@ test('briefText : ≤ 1 200 tokens avec une grosse fiche, ≈ 200 sans fiche', (
   expect(tokensOf(short)).toBeLessThan(250)
   expect(short).toContain('complementary-products ✓')
   expect(short).toContain('Outil mcp__revo-flow__cache')
+  expect(short).toContain('diff (feature ou chemin')
+  expect(short).toContain('rafraichir')
 })
 
 test('graphText ≤ 60 lignes, candidatesFromLog par scope', () => {
@@ -652,4 +665,242 @@ test('featureText : fiche fraîche complète (résumé, entrées, rôles, taille
   expect(t).toContain('Entrées : /booking/offer')
   expect(t).toContain('- pages/booking/offer.vue · entree · ')
   expect(tokensOf(t)).toBeLessThanOrEqual(1500)
+})
+// ── Fiche périmée actionnable, rafraîchissement, extrait d'agent, diff ───
+
+const LATER = { commit: 'def5678', branche: 'master', le: '2026-10-15T08:00:00.000Z' }
+const fiche = (): Graph => learn(small(), { feature: 'f', resume: 'Résumé', flux: ['étape un'], fichiers: [{ p: 'utils/a.ts' }, { p: 'utils/b.ts' }, { p: 'utils/c.ts' }] }, { ...LEARN, confiance: 0.8 }).graph
+const touch = (g: Graph, ...ps: string[]) => updateFiles(g, ps.map(p => ({ p, h: `${p}-2`, text: 'z'.repeat(400) })), [], [], LATER)
+
+test('perimeOf : dérivé des hash de la fiche (modifié, supprimé), pas de f.perime', () => {
+  const g0 = fiche()
+  expect(perimeOf(g0, g0.features.f!)).toEqual([])
+  const g1 = updateFiles(touch(g0, 'utils/a.ts'), [], ['utils/b.ts'], [], LATER)
+  const f = { ...g1.features.f!, perime: [] }
+  expect(perimeOf(g1, f)).toEqual([
+    { p: 'utils/a.ts', depuis: 'a1', nouveau: 'utils/a.ts-2' },
+    { p: 'utils/b.ts', depuis: 'b1', nouveau: '' },
+  ])
+  expect(g1.features.f!.perime).toEqual(perimeOf(g1, g1.features.f!))
+  expect(perimeOf(g1, undefined as never)).toEqual([])
+})
+
+test('refreshFiles : hash remis sur les fichiers relus, perime nettoyé, résumé et confiance intacts', () => {
+  const g1 = touch(fiche(), 'utils/a.ts', 'utils/b.ts')
+  expect(g1.features.f!.perime.map(x => x.p)).toEqual(['utils/a.ts', 'utils/b.ts'])
+  const r = refreshFiles(g1, 'f', ['utils/a.ts'], LATER)
+  expect(r.refreshed).toEqual(['utils/a.ts'])
+  expect(r.unknown).toEqual([])
+  const f = r.graph.features.f!
+  expect(f.fichiers.find(x => x.p === 'utils/a.ts')!.h).toBe('utils/a.ts-2')
+  expect(f.fichiers.find(x => x.p === 'utils/b.ts')!.h).toBe('b1')
+  expect(f.perime).toEqual([{ p: 'utils/b.ts', depuis: 'b1', nouveau: 'utils/b.ts-2' }])
+  expect([f.resume, f.flux, f.confiance, f.source]).toEqual(['Résumé', ['étape un'], 0.8, 'flow:1'])
+  // un fichier encore périmé : la date d'apprentissage ne bouge pas
+  expect(f.appris).toEqual({ le: CTX.le, commit: CTX.commit, branche: CTX.branche })
+  // le graphe d'origine n'est pas modifié
+  expect(g1.features.f!.fichiers.find(x => x.p === 'utils/a.ts')!.h).toBe('a1')
+
+  // tout est relu (suffixe unique accepté) : la fiche est fraîche et reprend la date de la relecture
+  const r2 = refreshFiles(r.graph, 'f', ['b.ts'], LATER)
+  expect(r2.refreshed).toEqual(['utils/b.ts'])
+  expect(r2.graph.features.f!.perime).toEqual([])
+  expect(r2.graph.features.f!.appris).toEqual({ le: LATER.le, commit: 'def5678', branche: 'master' })
+  expect(freshness(r2.graph, r2.graph.features.f!).niveau).toBe('fraiche')
+  expect(r2.graph.features.f!.confiance).toBe(0.8)
+})
+
+test('refreshFiles : fichier hors fiche rejeté, supprimé retiré, fiche inconnue ou entrée bizarre : rien ne casse', () => {
+  const g0 = learn(small(), { feature: 'ab', fichiers: [{ p: 'utils/a.ts' }, { p: 'utils/b.ts' }] }, LEARN).graph
+  const g1 = updateFiles(touch(g0, 'utils/a.ts'), [], ['utils/b.ts'], [], LATER)
+  const r = refreshFiles(g1, 'ab', ['utils/c.ts', 'nope.ts', 'utils/b.ts', 'utils/a.ts', 'utils/a.ts'], LATER)
+  expect(r.unknown).toEqual(['utils/c.ts', 'nope.ts'])
+  expect(r.refreshed).toEqual(['utils/b.ts', 'utils/a.ts'])
+  const f = r.graph.features.ab!
+  expect(f.fichiers.map(x => x.p)).toEqual(['utils/a.ts'])
+  expect(f.perime).toEqual([])
+  expect(f.appris.le).toBe(LATER.le)
+
+  const none = refreshFiles(g1, 'inconnue', ['utils/a.ts'], LATER)
+  expect(none.graph).toBe(g1)
+  expect(none.refreshed).toEqual([])
+  const hors = refreshFiles(g1, 'ab', ['utils/c.ts'], LATER)
+  expect(hors.graph).toBe(g1)
+  expect(hors.graph.features.ab!.fichiers.some(x => x.p === 'utils/c.ts')).toBe(false)
+  expect(() => refreshFiles(g1, 'ab', undefined as never, LATER)).not.toThrow()
+  expect(() => refreshFiles(g1, 'ab', [42, null] as never, LATER)).not.toThrow()
+})
+
+test('featureText : fiche partielle avec consignes (rafraichir, apprendre, diff) et taille du fichier modifié, budget tenu', () => {
+  const g = touch(fiche(), 'utils/a.ts')
+  const t = featureText(g, g.features.f!)
+  expect(t).toContain("⚠ Modifiés depuis l'apprentissage : utils/a.ts")
+  expect(t).toContain('Après relecture : si la fiche reste juste pour ces fichiers, action rafraichir (feature, fichiers = ceux relus) ; si elle est fausse, action apprendre avec corrections (et flux/pieges corrigés).')
+  expect(t).toContain('Action diff (feature ou chemin) pour voir ce qui a changé sans tout relire.')
+  expect(t).toMatch(/- utils\/a\.ts · .+ · 100 ⚠ modifié/)
+  expect(tokensOf(t)).toBeLessThanOrEqual(1500)
+  const long = 'x'.repeat(290)
+  const gros = learn(g, { feature: 'f', resume: long.repeat(2), flux: Array.from({ length: 12 }, (_, i) => `${i} ${long}`) }, LEARN).graph
+  const g2 = touch(gros, 'utils/a.ts')
+  expect(tokensOf(featureText(g2, g2.features.f!))).toBeLessThanOrEqual(1500)
+})
+
+test('servedFiles et servedSubset : limités aux chemins demandés', () => {
+  const g = touch(fiche(), 'utils/a.ts')
+  const f = g.features.f!
+  expect(servedFiles(g, f, 'feature').map(h => h.p)).toEqual(['utils/a.ts', 'utils/b.ts', 'utils/c.ts'])
+  const sub = servedSubset(g, f, ['utils/a.ts', 'utils/c.ts', 'hors.ts'], 'agent')
+  expect(sub).toEqual([
+    { p: 'utils/a.ts', tok: 100, feature: 'f', frais: false, par: 'agent' },
+    { p: 'utils/c.ts', tok: 400, feature: 'f', frais: true, par: 'agent' },
+  ])
+  expect(servedFiles(g, f, 'x', [])).toEqual([])
+})
+
+const CP = 'complementary-products'
+const extractGraph = () =>
+  learn(
+    withFeatures(),
+    {
+      feature: CP,
+      resume: 'Onglets Complémentaires et Transports de /booking/offer.',
+      pieges: [
+        { txt: 'Le stock vient du service', p: 'services/offer.ts' },
+        { txt: 'Le store garde un cache', p: 'stores/booking/Booking.ts' },
+        { txt: 'Sans fichier : prix en centimes' },
+      ],
+    },
+    LEARN,
+  ).graph
+const ag = (prompt: string, tasks: string[] = []) => ({ name: 'agent', tasks, prompt })
+
+test('extractFiles : par chemin, par nom de base, par export, repli sur les rôles centraux', () => {
+  const g = extractGraph()
+  const f = g.features[CP]!
+  expect(extractFiles(g, f, ag('Corrige services/offer.ts pour le stock'))).toEqual(['services/offer.ts'])
+  expect(extractFiles(g, f, ag('', ['Ajouter un getter dans useBookingStore']))).toEqual(['stores/booking/Booking.ts'])
+  expect(extractFiles(g, f, ag('Brancher OfferService sur la page'))).toEqual(['services/offer.ts'])
+  expect(extractFiles(g, f, ag('adapte le BOOKING store'))).toEqual(['stores/booking/Booking.ts'])
+  expect(extractFiles(g, f, ag('Relis le slug use-booking-store'))).toEqual(['stores/booking/Booking.ts'])
+  // un nom plus long qui contient celui d'un fichier n'est pas une citation
+  expect(extractFiles(g, f, ag('OfferServices et Bookings'))).toEqual(extractFiles(g, f, ag('rien')))
+  // rien de cité : fichiers entree, coeur et donnees dans l'ordre de la fiche
+  expect(extractFiles(g, f, ag('Écris la documentation'))).toEqual(f.fichiers.filter(x => ['entree', 'coeur', 'donnees'].includes(x.role)).map(x => x.p))
+  expect(extractFiles(g, f, ag('Corrige index et utils'))).toEqual(extractFiles(g, f, ag('rien')))
+  expect(() => extractFiles(g, f, { name: 'a', tasks: undefined as never, prompt: undefined as never })).not.toThrow()
+})
+
+test('agentExtract : en-tête, fichiers cités, pièges rattachés, résumé, ligne d’outil', () => {
+  const g = extractGraph()
+  const f = g.features[CP]!
+  const t = agentExtract(g, f, ag('Corrige services/offer.ts'))
+  expect(t.split('\n')[0]).toBe('# Cache revo-flow — fiche « complementary-products : Produits complémentaires et transports » (✓ fraîche, confiance 0,90)')
+  expect(t).toMatch(/\n- services\/offer\.ts · donnees · \d+\n/)
+  expect(t).not.toContain('stores/booking/Booking.ts')
+  expect(t).toContain('Pièges :')
+  expect(t).toContain('- Le stock vient du service (services/offer.ts)')
+  expect(t).not.toContain('Le store garde un cache')
+  expect(t).toContain('- Sans fichier : prix en centimes')
+  expect(t).toContain('Résumé : Onglets Complémentaires')
+  expect(t.split('\n').pop()).toBe('Outil mcp__revo-flow__cache : feature « complementary-products » pour la fiche entière, voisins (chemin), diff (fichier modifié), rafraichir ou apprendre après relecture d’un fichier ⚠.')
+  expect(tokensOf(t)).toBeLessThanOrEqual(600)
+})
+
+test('agentExtract : ⚠ modifié et ✕ supprimé, pas de résumé quand la fiche est très périmée', () => {
+  const g0 = extractGraph()
+  const prompt = ag('services/offer.ts, stores/booking/Booking.ts et pages/booking/offer.vue')
+  const g1 = updateFiles(g0, [{ p: 'services/offer.ts', h: 'n1', text: 'export const x = 1' }], [], [], LATER)
+  const t1 = agentExtract(g1, g1.features[CP]!, prompt)
+  expect(freshness(g1, g1.features[CP]!).niveau).toBe('partielle')
+  expect(t1).toMatch(/- services\/offer\.ts · donnees · \d+ ⚠ modifié depuis l'apprentissage/)
+  expect(t1).not.toMatch(/Booking\.ts · donnees · \d+ ⚠/)
+  expect(t1).toContain('Résumé :')
+  // tout change ou disparaît : très périmée, résumé masqué, supprimé marqué
+  const g2 = updateFiles(
+    g1,
+    [
+      { p: 'stores/booking/Booking.ts', h: 'n2', text: 'export const y = 1'.repeat(400) },
+      { p: 'pages/booking/offer.vue', h: 'n3', text: '<template><div /></template>'.repeat(400) },
+    ],
+    ['services/offer.ts'],
+    [],
+    LATER,
+  )
+  expect(freshness(g2, g2.features[CP]!).niveau).toBe('perimee')
+  const t2 = agentExtract(g2, g2.features[CP]!, prompt)
+  expect(t2).toContain('✕ très périmée')
+  expect(t2).toContain('- services/offer.ts · donnees ✕ supprimé')
+  expect(t2).not.toContain('Résumé :')
+  expect(t2).toContain('Outil mcp__revo-flow__cache')
+})
+
+test('agentExtract : budget tenu, le résumé saute avant le reste, la ligne d’outil reste', () => {
+  let g = extractGraph()
+  g = learn(g, { feature: CP, resume: 'r'.repeat(600) }, LEARN).graph
+  const f = g.features[CP]!
+  const all = ag('services/offer.ts stores/booking/Booking.ts pages/booking/offer.vue')
+  const big = agentExtract(g, f, all)
+  expect(big).toContain('Résumé :')
+  const court = agentExtract(g, f, all, 160)
+  expect(tokensOf(court)).toBeLessThanOrEqual(160)
+  expect(court).not.toContain('Résumé :')
+  expect(court).toContain('Outil mcp__revo-flow__cache')
+  expect(court.split('\n')[0]).toContain('# Cache revo-flow')
+  expect(tokensOf(agentExtract(g, f, all, 40))).toBeLessThanOrEqual(40)
+})
+
+const hunk = (n: number, len = 100) => [`@@ -${n},20 +${n},20 @@`, ...Array.from({ length: 20 }, (_, i) => `${i % 2 ? '+' : '-'}${'x'.repeat(len)}`)]
+
+test('diffText : en-tête, compte des lignes, diff indisponible, aucune différence', () => {
+  const g = extractGraph()
+  const f = g.features[CP]!
+  const t = diffText(g, f, undefined, [
+    { p: 'services/offer.ts', depuis: 'a', diff: '@@ -1,3 +1,3 @@\n a\n-b\n+c\n+d\n e\n' },
+    { p: 'stores/booking/Booking.ts', depuis: 'b', diff: undefined },
+    { p: 'pages/booking/offer.vue', depuis: 'c', diff: '' },
+  ])
+  expect(t.split('\n')[0]).toMatch(/^Diff depuis l'apprentissage de « complementary-products » \(le \d\d\/\d\d, commit abc1234\)$/)
+  expect(t).toContain('### services/offer.ts (+2/-1 lignes)\n@@ -1,3 +1,3 @@\n a\n-b\n+c\n+d\n e')
+  expect(t).toContain('### stores/booking/Booking.ts\ndiff indisponible (blob absent) : relis le fichier.')
+  expect(t).toContain('### pages/booking/offer.vue\naucune différence.')
+  expect(diffText(g, undefined, 'services/offer.ts', [{ p: 'services/offer.ts', depuis: 'a', diff: '@@ -1 +1 @@\n-a\n+b' }]).split('\n')[0]).toBe("Diff depuis l'apprentissage de services/offer.ts")
+  expect(diffText(g, f, undefined, [])).toContain('aucun fichier modifié')
+  expect(() => diffText(g, f, undefined, undefined as never)).not.toThrow()
+  expect(() => diffText(g, f, undefined, [null, { p: 3, diff: 5 }] as never)).not.toThrow()
+})
+
+test('diffText : ≤ 2 500 tokens, hunks entiers puis ligne de troncature', () => {
+  const g = extractGraph()
+  const f = g.features[CP]!
+  const lines = Array.from({ length: 200 }, (_, i) => hunk(i * 30 + 1)).flat()
+  const t = diffText(g, f, undefined, [{ p: 'services/offer.ts', depuis: 'a', diff: lines.join('\n') }])
+  expect(tokensOf(t)).toBeLessThanOrEqual(2500)
+  const rows = t.split('\n').slice(2)
+  const last = rows.pop()!
+  expect(last).toMatch(/^… \(tronqué, \d+ lignes de plus\)$/)
+  expect(rows.length % 21).toBe(0)
+  expect(rows[rows.length - 1]).toMatch(/^[+-]x+$/)
+  const left = Number(/(\d+) lignes de plus/.exec(last)![1])
+  expect(rows.length + left).toBe(lines.length)
+  expect(t).toContain('(+2000/-2000 lignes)')
+})
+
+test('diffText : un seul gros hunk coupé par lignes, budget partagé entre les fichiers', () => {
+  const g = extractGraph()
+  const f = g.features[CP]!
+  const one = ['@@ -1,3000 +1,3000 @@', ...Array.from({ length: 3000 }, () => `+${'y'.repeat(80)}`)].join('\n')
+  const t1 = diffText(g, f, undefined, [{ p: 'services/offer.ts', depuis: 'a', diff: one }])
+  expect(tokensOf(t1)).toBeLessThanOrEqual(2500)
+  expect(t1).toMatch(/… \(tronqué, \d+ lignes de plus\)$/)
+  expect(t1).toContain('@@ -1,3000 +1,3000 @@')
+  const huge = Array.from({ length: 100 }, (_, i) => hunk(i * 30 + 1)).flat().join('\n')
+  const paths = ['services/offer.ts', 'stores/booking/Booking.ts', 'pages/booking/offer.vue']
+  const t2 = diffText(g, f, undefined, paths.map(p => ({ p, depuis: 'a', diff: huge })))
+  expect(tokensOf(t2)).toBeLessThanOrEqual(2500)
+  for (const p of paths) expect(t2).toContain(`### ${p} (+1000/-1000 lignes)`)
+  expect(t2.match(/… \(tronqué/g)).toHaveLength(3)
+  // trop de fichiers pour le budget : les derniers sont annoncés
+  const many = Array.from({ length: 30 }, (_, i) => ({ p: `f${i}.ts`, depuis: 'a', diff: huge }))
+  const t3 = diffText(g, f, undefined, many)
+  expect(tokensOf(t3)).toBeLessThanOrEqual(2500)
 })

@@ -107,6 +107,8 @@ export type Card = {
   /** « inactif depuis 1 m 30 » : un agent actif qui ne fait plus rien depuis plus de 90 s. */
   idle?: string
   isLead: boolean
+  /** Le bouton « Relancer » : un agent en échec, ou qui attend un autre agent. */
+  canRetry?: boolean
 }
 
 const IDLE_AFTER_MS = 90_000
@@ -185,12 +187,23 @@ function cacheDetail(d: ViewData, key: string): Line[] {
 
 const STATUS: Record<Tone, string> = { live: 'Actif', wait: 'En attente', done: 'Terminé', fail: 'Échec' }
 
-function lines(tasks: readonly FlowTask[], p: Progress, a: { doing?: string; isDoing?: boolean; reason?: string; filePath?: string; history?: string[] }, tone: Tone): Line[] {
+/** `waiting` : le nom de l'agent attendu, pour un agent en attente (sa tâche suspendue, puis « attend « Y » »). */
+function lines(
+  tasks: readonly FlowTask[],
+  p: Progress,
+  a: { doing?: string; isDoing?: boolean; reason?: string; filePath?: string; history?: string[] },
+  tone: Tone,
+  waiting?: string,
+): Line[] {
   const out: Line[] = []
   const at = tasks.findIndex(t => t.title === p.label && t.status !== 'completed')
   const failed = tasks.find(t => t.status === 'failed')
   if (failed) out.push({ icon: '✕', text: failed.title, tone: 'fail' })
   else if (tone === 'live' && p.label) out.push({ icon: '⏳', text: p.label, tone: 'now' })
+  else if (waiting !== undefined && p.label) {
+    out.push({ icon: '⏳', text: p.label, tone: 'now' })
+    out.push({ icon: ' ', text: `attend « ${waiting} »`, tone: 'detail' })
+  }
   if (tone === 'live' && a.doing && a.isDoing) out.push({ icon: ' ', text: a.doing, tone: 'detail' })
   if (tone === 'live' && a.filePath && a.reason && a.reason !== '…') out.push({ icon: ' ', text: `↳ ${a.reason}`, tone: 'detail' })
   const next = tasks.find((t, i) => t.status === 'pending' && i > at)
@@ -225,10 +238,19 @@ function leadCard(d: ViewData, flow: Flow): Card {
   }
 }
 
+/** Le nom de l'agent attendu, raccourci pour tenir dans l'en-tête de la carte. */
+const waitName = (name: string) => (name.length > 24 ? `${name.slice(0, 23)}…` : name)
+
 function agentCard(a: FlowAgent, index: number, d: ViewData): Card {
   const now = d.now
+  // En attente d'un autre agent : ton « attente », pas « échec ».
   const tone: Tone = a.status === 'failed' ? 'fail' : a.status === 'done' ? 'done' : a.status === 'running' ? 'live' : 'wait'
-  const p = progress(a.tasks, a.status, a.status === 'running')
+  const isBlocked = a.status === 'blocked'
+  const waiting = isBlocked ? waitName(a.waitingFor?.name ?? '?') : undefined
+  const base = progress(a.tasks, a.status, a.status === 'running')
+  // Sa barre montre la tâche suspendue (la première restante) : c'est elle qui reprendra.
+  const paused = isBlocked ? a.tasks.findIndex(t => t.status === 'pending' || t.status === 'in_progress') : -1
+  const p = paused >= 0 ? { ...base, label: a.tasks[paused]!.title, count: `${paused + 1}/${a.tasks.length}` } : base
   const modelId = a.modelId || MODELS[a.model].id
   return {
     id: a.key,
@@ -236,12 +258,12 @@ function agentCard(a: FlowAgent, index: number, d: ViewData): Card {
     modelId,
     pill: `${shortModel(modelId)} · ${a.effort}`,
     tone,
-    status: STATUS[tone],
+    status: waiting !== undefined ? `Attend « ${waiting} »` : STATUS[tone],
     color: AGENT_COLORS[index % AGENT_COLORS.length]!,
     ...(a.isDoing && a.doing ? { doing: a.doing } : {}),
     prog: p,
     usage: usageText(a.tokens, a.costUsd),
-    lines: [...lines(a.tasks, p, a, tone), ...cacheDetail(d, a.key)],
+    lines: [...lines(a.tasks, p, a, tone, waiting), ...cacheDetail(d, a.key)],
     ...(a.startedAt !== undefined
       ? { duration: fmtDuration(Math.max(0, (a.endedAt ?? (a.status === 'running' ? now : (a.lastActiveAt ?? now))) - a.startedAt)) }
       : {}),
@@ -249,11 +271,15 @@ function agentCard(a: FlowAgent, index: number, d: ViewData): Card {
       ? { idle: `inactif depuis ${fmtDuration(now - a.lastActiveAt)}` }
       : {}),
     isLead: false,
+    canRetry: a.status === 'failed' || isBlocked,
   }
 }
 
 /** Les cartes n'existent qu'une fois le plan posé : avant, le panneau attend le plan d'exécution. */
-/** L'ordre des cartes sous l'orchestrateur : les actifs d'abord, puis en attente, en échec, et les terminés en bas. */
+/**
+ * L'ordre des cartes sous l'orchestrateur : les actifs d'abord, puis en attente (de lancement ou d'un autre agent),
+ * en échec, et les terminés en bas.
+ */
 const RANK: Record<Tone, number> = { live: 0, wait: 1, fail: 2, done: 3 }
 
 export function cards(d: ViewData): Card[] {
@@ -413,9 +439,14 @@ function pill(d: ViewData) {
   if (flow.phase === 'planning') return { text: 'Analyse des specs', tone: 'outline' as const }
   if (isPendingPlan(d)) return { text: PLAN_PENDING, tone: 'orange' as const }
   const failed = flow.agents.filter(a => a.status === 'failed').length
-  if (flow.phase === 'done') return { text: failed ? `Terminé · ${failed} échec${failed > 1 ? 's' : ''}` : 'Terminé · 100 %', tone: failed ? ('red' as const) : ('silver' as const) }
+  const blocked = flow.agents.filter(a => a.status === 'blocked').length
+  const waits = blocked ? ` · ${blocked} en attente` : ''
+  if (flow.phase === 'done') {
+    const text = failed ? `Terminé · ${failed} échec${failed > 1 ? 's' : ''}${waits}` : blocked ? `Terminé${waits}` : 'Terminé · 100 %'
+    return { text, tone: failed ? ('red' as const) : ('silver' as const) }
+  }
   const done = flow.agents.filter(a => a.status === 'done').length
-  const text = allFinished(flow) ? `Vérification · ${flowPercent(flow)} %` : `${done}/${flow.agents.length} agents · ${flowPercent(flow)} %`
+  const text = allFinished(flow) ? `Vérification · ${flowPercent(flow)} %${waits}` : `${done}/${flow.agents.length} agents · ${flowPercent(flow)} %${waits}`
   return { text, tone: failed ? ('red' as const) : ('outline' as const) }
 }
 
@@ -560,7 +591,7 @@ export function DesktopPane(t: Elements['desktop'], d: ViewData, actions: PaneAc
                   <Button key={`stop-${c.id}`} plain label="Arrêter" onPress={() => actions.stopAgent(c.id)} />
                 </Box>
               )}
-              {!c.isLead && c.tone === 'fail' && (
+              {!c.isLead && c.canRetry && (
                 <Box justifyContent="flex-end" width="100%">
                   <Button key={`retry-${c.id}`} plain label="Relancer" onPress={() => actions.retryAgent(c.id)} />
                 </Box>
@@ -768,7 +799,7 @@ export function TerminalPane(t: Elements['terminal'], d: ViewData, actions: Pane
             <Text key={`cache${i}`} dimColor wrap="truncate-end">{`    ${l.text}`}</Text>
           ))}
         <Text dimColor={isDone} color={isDone ? undefined : PALETTE.text2} wrap="truncate-end">{`  Σ ${c.usage}`}</Text>
-        {!c.isLead && (c.tone === 'live' || c.tone === 'fail') ? (
+        {!c.isLead && (c.tone === 'live' || c.canRetry) ? (
           <Box paddingLeft={2}>
             {c.tone === 'live' ? (
               <Button key={`stop-${c.id}`} plain label="Arrêter" onPress={() => actions.stopAgent(c.id)} />

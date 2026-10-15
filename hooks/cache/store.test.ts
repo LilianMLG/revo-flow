@@ -3,7 +3,9 @@ import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import type { Feature, Graph } from '../../types/cache'
-import { graphFileName, mergeGraphs, normalizePath, parseLsFiles, parseNameStatus, parseStatus } from './store'
+import { diffSince, graphFileName, mergeGraphs, normalizePath, parseLsFiles, parseNameStatus, parseStatus, stripDiffHeader } from './store'
+import type { Io } from './store'
+import { hashPath } from './graph'
 import { OSES, diskKey, native, type Os } from '../test-os'
 
 const DOCS = 'C:/Users/x/Documents'
@@ -434,3 +436,110 @@ for (const os of OSES) {
     })
   })
 }
+
+
+// ── Diff depuis l'apprentissage (Io de test, sans moteur) ────────────────
+
+type Scripted = { exitCode: number; stdout?: string; truncated?: boolean } | 'throw'
+
+/** Un Io dont seuls run, fs.write et home servent : chaque commande git reçue est notée (arguments après les options communes, cwd, délai). */
+function fakeIo(script: (args: string[]) => Scripted) {
+  const calls: { args: string[]; cwd: string | undefined; timeoutMs: number | undefined }[] = []
+  const writes: Record<string, string> = {}
+  const io = {
+    home: async () => 'C:\\Users\\x',
+    fs: {
+      write: async (p: string, t: string) => {
+        writes[p] = t
+      },
+    },
+    run: async (argv: string[], init?: { cwd?: string; timeoutMs?: number }) => {
+      const args = argv.slice(4)
+      calls.push({ args, cwd: init?.cwd, timeoutMs: init?.timeoutMs })
+      const r = script(args)
+      if (r === 'throw') throw new Error('spawn')
+      return { exitCode: r.exitCode, stdout: r.stdout ?? '', stderr: '', isStdoutTruncated: r.truncated ?? false, isStderrTruncated: false }
+    },
+  } as unknown as Io
+  return { io, calls, writes }
+}
+
+const OLD = 'aaaaaaaaaaaa'
+const NEW = 'bbbbbbbbbbbb'
+const RACINE_DIFF = 'C:\\Users\\x\\Documents\\Front\\app'
+const HEADER = `diff --git a/${OLD} b/${NEW}\nindex ${OLD}..${NEW} 100644\n--- a/${OLD}\n+++ b/${NEW}\n`
+
+test('stripDiffHeader : retire l’en-tête avant le premier @@, garde le reste', () => {
+  expect(stripDiffHeader(`${HEADER}@@ -1 +1 @@\n-a\n+b\n`)).toBe('@@ -1 +1 @@\n-a\n+b')
+  expect(stripDiffHeader('@@ -1 +1 @@\n-a\n+b')).toBe('@@ -1 +1 @@\n-a\n+b')
+  expect(stripDiffHeader(`diff --git a/x b/x\nindex 1..2 100644\nBinary files a/x and b/x differ\n`)).toBe('Binary files a/x and b/x differ')
+  expect(stripDiffHeader('')).toBe('')
+})
+
+test('diffSince : git diff entre les deux blobs, cwd = racine, délai 10 s, en-tête retiré', async () => {
+  const { io, calls, writes } = fakeIo(() => ({ exitCode: 0, stdout: `${HEADER}@@ -1,2 +1,2 @@\n a\n-b\n+c\n` }))
+  const d = await diffSince(io, RACINE_DIFF, 'utils/a.ts', OLD, NEW)
+  expect(d).toBe('@@ -1,2 +1,2 @@\n a\n-b\n+c')
+  expect(calls).toEqual([{ args: ['diff', '--no-color', '--unified=3', OLD, NEW], cwd: 'C:/Users/x/Documents/Front/app', timeoutMs: 10_000 }])
+  expect(writes).toEqual({})
+})
+
+test('diffSince : blob courant absent, repli sur git show puis git diff --no-index (code 1 = différences)', async () => {
+  const { io, calls, writes } = fakeIo(args => {
+    if (args[0] === 'diff' && args.includes('--no-index')) return { exitCode: 1, stdout: '--- a/tmp.txt\n+++ b/utils/a.ts\n@@ -1 +1 @@\n-vieux\n+neuf\n' }
+    if (args[0] === 'diff') return { exitCode: 128 }
+    if (args[0] === 'show') return { exitCode: 0, stdout: 'vieux\n' }
+    return { exitCode: 1 }
+  })
+  const d = await diffSince(io, RACINE_DIFF, 'utils/a.ts', OLD, NEW)
+  expect(d).toBe('@@ -1 +1 @@\n-vieux\n+neuf')
+  const tmp = `C:/Users/x/.claude/revo-flow/tmp/${hashPath('utils/a.ts')}-${OLD}.txt`
+  expect(calls.map(c => c.args)).toEqual([
+    ['diff', '--no-color', '--unified=3', OLD, NEW],
+    ['show', OLD],
+    ['diff', '--no-index', '--no-color', '--unified=3', '--', tmp, 'C:/Users/x/Documents/Front/app/utils/a.ts'],
+  ])
+  expect(calls.every(c => c.cwd === 'C:/Users/x/Documents/Front/app' && c.timeoutMs === 10_000)).toBe(true)
+  expect(writes).toEqual({ [tmp]: 'vieux\n' })
+})
+
+test('diffSince : hash courant qui n’est pas un blob (sans git) : directement le repli ; --no-index sans différence : chaîne vide', async () => {
+  const { io, calls } = fakeIo(args => (args[0] === 'show' ? { exitCode: 0, stdout: 'x\n' } : { exitCode: 0, stdout: '' }))
+  expect(await diffSince(io, RACINE_DIFF, 'a.ts', OLD, '120-1700')).toBe('')
+  expect(calls.map(c => c.args[0])).toEqual(['show', 'diff'])
+  expect(calls[1]!.args).toContain('--no-index')
+  // un code d'erreur (128) au lieu de 0 ou 1 : diff impossible
+  const bad = fakeIo(args => (args[0] === 'show' ? { exitCode: 0, stdout: 'x\n' } : { exitCode: 128 }))
+  expect(await diffSince(bad.io, RACINE_DIFF, 'a.ts', OLD, '120-1700')).toBeUndefined()
+})
+
+test('diffSince : fichier supprimé, ancien contenu en lignes retirées, tronqué à 80 lignes', async () => {
+  const body = Array.from({ length: 100 }, (_, i) => `ligne ${i + 1}`).join('\n') + '\n'
+  const { io, calls } = fakeIo(() => ({ exitCode: 0, stdout: body }))
+  const d = await diffSince(io, RACINE_DIFF, 'gone.ts', OLD, '')
+  expect(calls.map(c => c.args)).toEqual([['show', OLD]])
+  const rows = d!.split('\n')
+  expect(rows.slice(0, 3)).toEqual(['fichier supprimé', '@@ -1,100 +0,0 @@', '-ligne 1'])
+  expect(rows[rows.length - 2]).toBe('-ligne 80')
+  expect(rows[rows.length - 1]).toBe('… (tronqué, 20 lignes de plus)')
+  const court = fakeIo(() => ({ exitCode: 0, stdout: 'a\nb\n' }))
+  expect(await diffSince(court.io, RACINE_DIFF, 'gone.ts', OLD, '')).toBe('fichier supprimé\n@@ -1,2 +0,0 @@\n-a\n-b')
+})
+
+test('diffSince : indisponible (hash non git, git absent, blob appris introuvable), jamais d’exception', async () => {
+  const none = fakeIo(() => ({ exitCode: 0 }))
+  expect(await diffSince(none.io, RACINE_DIFF, 'a.ts', '120-1700', NEW)).toBeUndefined()
+  expect(await diffSince(none.io, RACINE_DIFF, 'a.ts', '', NEW)).toBeUndefined()
+  expect(none.calls).toEqual([])
+  const boom = fakeIo(() => 'throw')
+  expect(await diffSince(boom.io, RACINE_DIFF, 'a.ts', OLD, NEW)).toBeUndefined()
+  expect(await diffSince(boom.io, RACINE_DIFF, 'a.ts', OLD, '')).toBeUndefined()
+  const gone = fakeIo(() => ({ exitCode: 128 }))
+  expect(await diffSince(gone.io, RACINE_DIFF, 'a.ts', OLD, NEW)).toBeUndefined()
+  expect(await diffSince(gone.io, RACINE_DIFF, 'a.ts', OLD, '')).toBeUndefined()
+})
+
+test('diffSince : sortie coupée par le moteur, on garde les lignes entières', async () => {
+  const { io } = fakeIo(() => ({ exitCode: 0, stdout: '@@ -1,3 +1,3 @@\n-a\n+b\n+c', truncated: true }))
+  expect(await diffSince(io, RACINE_DIFF, 'a.ts', OLD, NEW)).toBe('@@ -1,3 +1,3 @@\n-a\n+b')
+})

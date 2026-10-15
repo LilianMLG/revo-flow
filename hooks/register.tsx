@@ -2,25 +2,45 @@ import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, PluginOptions, Register, SessionContextUsage } from 'claude-code'
 
 import type { Activity, Context, Flow, FlowAgent, Lead } from '../types'
-import type { CacheHit, CacheStats, Feature, FlowCache, Graph, LearnContext, LearnInput } from '../types/cache'
+import type { AgentInfo, CacheHit, CacheStats, DiffEntry, Feature, FlowCache, Graph, LearnContext, LearnInput, PerimeEntry } from '../types/cache'
 import {
+  agentExtract,
   autoFiche,
   briefText,
   candidatesText,
   completeFiche,
   computeStats,
+  diffText,
+  extractFiles,
   featureText,
   freshness,
   graphText,
   learn,
   matchRequest,
   neighborsText,
+  perimeOf,
   recordUsage as recordCacheUsage,
+  refreshFiles,
+  resolveKey,
+  sameHash,
   searchText,
   servedFiles,
+  servedSubset,
   tokensOf,
 } from './cache/graph'
-import { buildMechanical, deleteGraph, fileTokens, isOutdated, listGraphs, loadGraph, refreshGraph, resolveProject, saveGraph, type Io } from './cache/store'
+import {
+  buildMechanical,
+  deleteGraph,
+  diffSince,
+  fileTokens,
+  isOutdated,
+  listGraphs,
+  loadGraph,
+  refreshGraph,
+  resolveProject,
+  saveGraph,
+  type Io,
+} from './cache/store'
 import {
   CACHE_TOOL,
   EMPTY,
@@ -40,8 +60,10 @@ import {
   dispatchText,
   draftTitle,
   euros,
+  findAgent,
   finishTasks,
   firstSentence,
+  pauseTasks,
   leadBrief,
   flowPercent,
   flowRecap,
@@ -210,12 +232,14 @@ async function registerTools($: $) {
   await $.tool.register({
     name: 'step',
     description:
-      'revo-flow : un sous-agent signale où il en est dans SA liste de tâches (numérotée à partir de 1). Fait avancer sa barre de progression.',
+      'revo-flow : un sous-agent signale où il en est dans SA liste de tâches (numérotée à partir de 1). Fait avancer sa barre de progression. ' +
+      'attente : la tâche dépend du travail d’un autre agent du plan qui n’a pas fini (nomme-le dans « attend ») ; termine ensuite ta réponse en disant ce qui manque, revo-flow te relancera quand il aura fini.',
     inputSchema: {
       type: 'object',
       properties: {
         tache: { type: 'number', description: 'Numéro de la tâche, à partir de 1' },
-        statut: { type: 'string', enum: ['en_cours', 'fait', 'echec'] },
+        statut: { type: 'string', enum: ['en_cours', 'fait', 'echec', 'attente'] },
+        attend: { type: 'string', description: 'Avec statut attente : le nom de l’agent du plan dont tu attends le travail, ou ce qui manque' },
       },
       required: ['tache', 'statut'],
     },
@@ -328,7 +352,7 @@ async function checkConflict($: $, path: string, who: string): Promise<string | 
   const other = (await read($, flowA))?.agents.find(a => a.key === entry.by && a.status === 'running')
   if (!other) return undefined
   if (opts.conflits === 'refuser') {
-    return `revo-flow : ce fichier est en cours de modification par l’agent « ${other.name} » ; coordonne-toi ou attends sa fin.`
+    return `revo-flow : ce fichier est en cours de modification par l’agent « ${other.name} » ; coordonne-toi ou attends sa fin (outil ${STEP_TOOL}, statut attente, attend = « ${other.name} »).`
   }
   $.ui.toast(`⚠ ${entry.rel} : fichier aussi modifié par « ${other.name} »`)
   await update($, entries, list =>
@@ -360,7 +384,8 @@ async function finishFlow($: $) {
   const cost = lead.costUsd + flow.agents.reduce((sum, a) => sum + a.costUsd, 0)
   const files = (await read($, entries)).length
   await closeFlowCache($).catch(() => undefined)
-  const note = endNote ? ` · ${endNote}` : ''
+  const blocked = flow.agents.filter(a => a.status === 'blocked').length
+  const note = `${blocked ? ` · ${blocked} agent${blocked > 1 ? 's' : ''} en attente` : ''}${endNote ? ` · ${endNote}` : ''}`
   await notify($, `« ${flow.title} » terminé · ${fmtDuration(now - flow.startedAt)} · ${euros(cost)} · ${files} fichier${files > 1 ? 's' : ''}${note}`)
 }
 
@@ -528,15 +553,15 @@ async function registerCacheTool($: $) {
   await $.tool.register({
     name: 'cache',
     description:
-      "revo-flow : le cache du projet (graphe des fichiers et fiches de features). Une carte, pas la vérité : vérifie dans le code ce que tu affirmes ou modifies. Actions : chercher (requete : mots-clés → les features et fichiers pertinents, une ligne chacun) ; feature (feature : identifiant → la fiche : résumé, flux, points d'entrée, fichiers et rôles, pièges, fraîcheur) ; voisins (chemin relatif à la racine, profondeur 1 ou 2 → ce que le fichier utilise et qui l'utilise, à essayer avant un grep « qui utilise X ») ; apprendre (feature, titre, alias, resume, flux, entrees, fichiers [{p, role}], pieges [{txt, p}], deps, corrections → enregistre ou complète la fiche, avec les chemins rejetés) ; oublier (feature → supprime la fiche) ; candidates (features repérées sans fiche, avec leur taille). projet : facultatif, nom ou chemin d'un autre projet (défaut : le projet courant).",
+      "revo-flow : le cache du projet (graphe des fichiers et fiches de features). Une carte, pas la vérité : vérifie dans le code ce que tu affirmes ou modifies. Actions : chercher (requete : mots-clés → les features et fichiers pertinents, une ligne chacun) ; feature (feature : identifiant → la fiche : résumé, flux, points d'entrée, fichiers et rôles, pièges, fraîcheur) ; voisins (chemin relatif à la racine, profondeur 1 ou 2 → ce que le fichier utilise et qui l'utilise, à essayer avant un grep « qui utilise X ») ; diff (feature → le diff de ses fichiers modifiés depuis l'apprentissage, ou chemin → ce fichier seul) ; rafraichir (feature, fichiers = les chemins relus et toujours conformes à la fiche → leurs hash sont remis à jour, le reste de la fiche ne bouge pas) ; apprendre (feature, titre, alias, resume, flux, entrees, fichiers [{p, role}], pieges [{txt, p}], deps, corrections → enregistre ou complète la fiche, avec les chemins rejetés ; un champ absent garde sa valeur) ; oublier (feature → supprime la fiche) ; candidates (features repérées sans fiche, avec leur taille). projet : facultatif, nom ou chemin d'un autre projet (défaut : le projet courant).",
     inputSchema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['chercher', 'feature', 'voisins', 'apprendre', 'oublier', 'candidates'] },
+        action: { type: 'string', enum: ['chercher', 'feature', 'voisins', 'diff', 'rafraichir', 'apprendre', 'oublier', 'candidates'] },
         projet: { type: 'string', description: 'Nom ou chemin du projet ; le projet courant par défaut' },
         requete: { type: 'string', description: 'chercher : mots-clés' },
-        feature: { type: 'string', description: 'feature, apprendre, oublier : identifiant court de la feature (ex. double-session)' },
-        chemin: { type: 'string', description: 'voisins : chemin du fichier, relatif à la racine du projet' },
+        feature: { type: 'string', description: 'feature, diff, rafraichir, apprendre, oublier : identifiant court de la feature (ex. double-session)' },
+        chemin: { type: 'string', description: 'voisins, diff : chemin du fichier, relatif à la racine du projet' },
         profondeur: { type: 'number', description: 'voisins : 1 (défaut) ou 2' },
         titre: { type: 'string' },
         alias: { type: 'array', items: { type: 'string' } },
@@ -546,6 +571,7 @@ async function registerCacheTool($: $) {
         fichiers: {
           type: 'array',
           items: { type: 'object', properties: { p: { type: 'string' }, role: { type: 'string' } }, required: ['p'] },
+          description: 'apprendre : les fichiers et leur rôle ; rafraichir : les fichiers relus ({p}), toujours conformes à la fiche',
         },
         pieges: {
           type: 'array',
@@ -622,6 +648,12 @@ async function cacheTool($: $, e: CacheCall): Promise<string> {
       answer = neighborsText(graph, relTo(ref.racine, raw) ?? raw, depth)
       break
     }
+    case 'diff':
+      answer = await diffTool($, e, ref, graph)
+      break
+    case 'rafraichir':
+      answer = await refreshTool($, e, ref, graph)
+      break
     case 'apprendre':
       return learnTool($, e, ref, graph, live, builder)
     case 'oublier': {
@@ -636,10 +668,82 @@ async function cacheTool($: $, e: CacheCall): Promise<string> {
       answer = candidatesText(graph)
       break
     default:
-      return `revo-flow cache : action « ${action} » inconnue (chercher, feature, voisins, apprendre, oublier, candidates).`
+      return `revo-flow cache : action « ${action} » inconnue (chercher, feature, voisins, diff, rafraichir, apprendre, oublier, candidates).`
   }
   await served($, ref.cle, hits, tokensOf(answer), feature)
   return answer
+}
+
+/** Le nombre de fichiers comparés par un `diff` sur une fiche entière. */
+const DIFF_FILES = 5
+
+/** Les chemins passés à `rafraichir` : `fichiers` ([{p}] ou chaînes) et `chemin`, rendus relatifs à la racine. */
+function pathsOf(e: CacheCall, root: string): string[] {
+  const raw = [
+    ...(Array.isArray(e.fichiers) ? e.fichiers : []).map(x => (typeof x === 'string' ? x : typeof x === 'object' && x !== null ? text((x as { p?: unknown }).p) : '')),
+    text(e.chemin),
+  ]
+  return [...new Set(raw.map(p => text(p)).filter(Boolean).map(p => relTo(root, p) ?? p))]
+}
+
+/**
+ * `diff` : ce qui a changé depuis l'apprentissage. Avec feature, ses fichiers périmés (5 au plus, dans l'ordre de la fiche) ;
+ * avec chemin, ce fichier seul, comparé au hash appris par la fiche la plus récente qui le contient. Les diffs se calculent l'un après l'autre.
+ */
+async function diffTool($: $, e: CacheCall, ref: ProjectRef, graph: Graph): Promise<string> {
+  const id = text(e.feature)
+  const raw = text(e.chemin)
+  let f: Feature | undefined
+  let p: string | undefined
+  let list: PerimeEntry[]
+  if (id) {
+    f = findFeature(graph, id)
+    if (!f) return `revo-flow cache : pas de fiche « ${id} » dans ${ref.nom}, rien à comparer.`
+    list = perimeOf(graph, f)
+  } else if (raw) {
+    const rel = relTo(ref.racine, raw) ?? raw
+    p = resolveKey(graph, rel) ?? rel
+    const key = p
+    const owners = Object.values(graph.features)
+      .filter(x => x.fichiers.some(ff => ff.p === key))
+      .sort((a, b) => b.appris.le.localeCompare(a.appris.le))
+    if (!owners.length) return `revo-flow cache : pas de fiche ne connaît ${key}, rien à comparer (relis le fichier).`
+    const learnedHash = owners[0]!.fichiers.find(ff => ff.p === key)!.h
+    const now = graph.fichiers[key]?.h ?? ''
+    list = sameHash(learnedHash, now) ? [] : [{ p: key, depuis: learnedHash, nouveau: now }]
+  } else {
+    return 'revo-flow cache : « feature » ou « chemin » manquant pour diff.'
+  }
+  const shown = list.slice(0, DIFF_FILES)
+  const diffs: DiffEntry[] = []
+  for (const x of shown) diffs.push({ p: x.p, depuis: x.depuis, diff: await diffSince(ioOf($), graph.projet.racine, x.p, x.depuis, x.nouveau) })
+  const rest = list.slice(DIFF_FILES).map(x => x.p)
+  const answer = diffText(graph, f, p, diffs)
+  return rest.length ? `${answer}\nAussi modifiés (action diff avec chemin) : ${rest.join(', ')}` : answer
+}
+
+/**
+ * `rafraichir` : les fichiers relus et toujours conformes à la fiche reprennent leur hash courant (refreshFiles) ;
+ * résumé, flux, pièges et confiance ne bougent pas. Le graphe est enregistré.
+ */
+async function refreshTool($: $, e: CacheCall, ref: ProjectRef, graph: Graph): Promise<string> {
+  const id = text(e.feature)
+  if (!id) return 'revo-flow cache : « feature » manquante pour rafraichir.'
+  const f = findFeature(graph, id)
+  if (!f) return `revo-flow cache : pas de fiche « ${id} » dans ${ref.nom}, rien à rafraîchir.`
+  const paths = pathsOf(e, ref.racine)
+  if (!paths.length) return `revo-flow cache : « fichiers » manquants (les chemins relus et toujours conformes à la fiche « ${f.id} »).`
+  const now = await $.clock.now()
+  const r = refreshFiles(graph, f.id, paths, { le: new Date(now).toISOString(), commit: graph.projet.indexe.commit, branche: graph.projet.indexe.branche })
+  const unknown = r.unknown.length ? [`Chemins inconnus de la fiche (ignorés) : ${r.unknown.join(', ')}.`] : []
+  if (!r.refreshed.length) return [`revo-flow cache : aucun des fichiers donnés n'appartient à la fiche « ${f.id} », rien de rafraîchi.`, ...unknown].join('\n')
+  const saved = keepGraph(await saveGraph(ioOf($), r.graph), now)
+  await refreshStats($)
+  const left = (saved.features[f.id] ?? r.graph.features[f.id])?.perime.map(x => x.p) ?? []
+  return [
+    `revo-flow cache : fiche « ${f.id} » rafraîchie : ${plural(r.refreshed.length, 'fichier')} ; ${left.length ? `encore périmés : ${left.join(', ')}.` : 'fiche redevenue fraîche.'}`,
+    ...unknown,
+  ].join('\n')
 }
 
 /** `apprendre` : la fiche est écrite (chemins inconnus rejetés), avec qui l'a apprise, sur quel modèle, à quelle confiance. */
@@ -664,16 +768,25 @@ async function learnTool($: $, e: CacheCall, ref: ProjectRef, graph: Graph, live
     feature: id,
     ...(text(e.titre) ? { titre: text(e.titre) } : {}),
     ...(text(e.resume) ? { resume: text(e.resume) } : {}),
-    alias: texts(e.alias),
-    flux: texts(e.flux),
-    entrees: texts(e.entrees),
-    fichiers: obj(e.fichiers)
-      .map(f => ({ p: relTo(ref.racine, text(f.p)) ?? text(f.p), ...(text(f.role) ? { role: text(f.role) } : {}) }))
-      .filter(f => f.p),
-    pieges: obj(e.pieges)
-      .map(x => ({ txt: text(x.txt), ...(text(x.p) ? { p: relTo(ref.racine, text(x.p)) ?? text(x.p) } : {}) }))
-      .filter(x => x.txt),
-    deps: texts(e.deps),
+    // Un champ absent de l'appel reste undefined : learn garde alors la valeur de la fiche (un tableau vide l'effacerait).
+    ...(Array.isArray(e.alias) ? { alias: texts(e.alias) } : {}),
+    ...(Array.isArray(e.flux) ? { flux: texts(e.flux) } : {}),
+    ...(Array.isArray(e.entrees) ? { entrees: texts(e.entrees) } : {}),
+    ...(Array.isArray(e.fichiers)
+      ? {
+          fichiers: obj(e.fichiers)
+            .map(f => ({ p: relTo(ref.racine, text(f.p)) ?? text(f.p), ...(text(f.role) ? { role: text(f.role) } : {}) }))
+            .filter(f => f.p),
+        }
+      : {}),
+    ...(Array.isArray(e.pieges)
+      ? {
+          pieges: obj(e.pieges)
+            .map(x => ({ txt: text(x.txt), ...(text(x.p) ? { p: relTo(ref.racine, text(x.p)) ?? text(x.p) } : {}) }))
+            .filter(x => x.txt),
+        }
+      : {}),
+    ...(Array.isArray(e.deps) ? { deps: texts(e.deps) } : {}),
     corrections: texts(e.corrections),
   }
   const { graph: next, rejected } = learn(graph, input, ctx)
@@ -777,6 +890,28 @@ async function closeFlowCache($: $) {
   if (fc.feature && next.features[fc.feature]) next = completeFiche(next, fc.feature, [...new Set(fc.lus.map(l => l.p))])
   keepGraph(await saveGraph(ioOf($), next), await $.clock.now())
   await refreshStats($)
+}
+
+/**
+ * L'extrait de la fiche servie qui concerne un sous-agent du flow (agentExtract) et les hits à enregistrer à son nom (par = sa clé).
+ * Rien sans cache, sans fiche servie ou sans graphe ; jamais d'exception : l'extrait est un bonus, il ne doit pas gêner le lancement.
+ */
+async function agentCacheExtract($: $, a: FlowAgent, prompt: unknown): Promise<{ cle: string; text: string; hits: CacheHit[] } | undefined> {
+  if (!opts.cache) return undefined
+  try {
+    const fc = await read($, flowCacheA)
+    if (!fc?.feature) return undefined
+    const ref = await flowRefOf($, fc)
+    const graph = ref ? await graphOf($, ref) : null
+    const f = graph?.features[fc.feature]
+    if (!graph || !f) return undefined
+    const agent: AgentInfo = { name: a.name, tasks: a.tasks.map(t => t.title), prompt: typeof prompt === 'string' ? prompt : '' }
+    const text = agentExtract(graph, f, agent)
+    if (!text) return undefined
+    return { cle: fc.cle, text, hits: servedSubset(graph, f, extractFiles(graph, f, agent), a.key) }
+  } catch {
+    return undefined
+  }
 }
 
 /** Rappel après compaction : la fiche servie et les features connues du projet. */
@@ -1035,10 +1170,78 @@ function contextOf(c: SessionContextUsage): Context | null {
 
 const ENDED = new Set(['completed', 'failed', 'killed'])
 
-/** Un agent a fini : ses tâches sont closes, son heure de fin notée. */
-async function endAgent($: $, key: string, failed: boolean) {
+/** Comment finit le tour d'un agent : fini, en échec, ou en attente d'un autre agent. */
+type Outcome = 'done' | 'failed' | 'blocked'
+
+/**
+ * Un agent a fini : ses tâches sont closes, son heure de fin notée. blocked : il attend un autre agent ; sa tâche
+ * en cours repart en attente et il quitte son lancement (agentId, claimed) pour pouvoir être relancé.
+ * Seul un agent encore « running » est clos (deux vérifications simultanées ne le closent qu'une fois) : renvoie
+ * vrai s'il l'a été. isQuiet : sans les suites (relance de qui l'attendait, messages à l'orchestrateur).
+ */
+async function endAgent($: $, key: string, outcome: Outcome, isQuiet = false): Promise<boolean> {
   const now = await $.clock.now()
-  await setAgent($, key, x => ({ ...x, status: failed ? 'failed' : 'done', isDoing: false, endedAt: now, tasks: finishTasks(x.tasks, failed) }))
+  let isEnded = false as boolean
+  await setAgent($, key, x => {
+    if (x.status !== 'running') return x
+    isEnded = true
+    if (outcome === 'blocked') {
+      const { agentId: _id, ...rest } = x
+      return { ...rest, status: 'blocked', isDoing: false, endedAt: now, tasks: pauseTasks(x.tasks) }
+    }
+    const { waitingFor: _w, ...rest } = x
+    return { ...rest, status: outcome, isDoing: false, endedAt: now, tasks: finishTasks(x.tasks, outcome === 'failed') }
+  })
+  if (!isEnded) return false
+  if (outcome === 'blocked') claimed.delete(key)
+  if (!isQuiet) await afterEnd($, key, outcome)
+  return true
+}
+
+/**
+ * Les suites de la fin d'un agent. Fini : ceux qui l'attendaient sont relancés. En échec : ceux qui l'attendaient
+ * sont signalés à l'orchestrateur. En attente : relancé tout de suite si l'agent attendu a déjà fini, signalé à
+ * l'orchestrateur s'il a échoué, n'est pas du plan ou l'attend lui-même ; sinon il patiente.
+ */
+async function afterEnd($: $, key: string, outcome: Outcome) {
+  const flow = await read($, flowA)
+  const a = flow?.agents.find(x => x.key === key)
+  if (!flow || !a) return
+  const dependents = flow.agents.filter(x => x.status === 'blocked' && x.waitingFor?.key === key)
+  if (outcome === 'done') {
+    for (const x of dependents) await relaunch($, x.key, `« ${a.name} » a fini, « ${x.name} » l’attendait :`)
+    return
+  }
+  if (outcome === 'failed') {
+    for (const x of dependents) blockedNote($, x, 'en échec')
+    return
+  }
+  const target = a.waitingFor?.key ? flow.agents.find(x => x.key === a.waitingFor?.key) : undefined
+  $.ui.toast(`revo-flow : « ${a.name} » attend « ${target?.name ?? a.waitingFor?.name ?? 'un autre agent'} »`)
+  if (!target) return blockedNote($, a, 'hors plan')
+  if (target.status === 'done') return relaunch($, key, `« ${target.name} » a déjà fini, « ${a.name} » l’attendait :`)
+  if (target.status === 'failed') return blockedNote($, a, 'en échec')
+  if (target.status === 'blocked' && target.waitingFor?.key === key) return blockedNote($, a, 'attente croisée')
+}
+
+/** Personne ne viendra relancer cet agent en attente : l'orchestrateur est prévenu et décide. */
+function blockedNote($: $, a: FlowAgent, why: 'en échec' | 'hors plan' | 'attente croisée') {
+  const name = a.waitingFor?.name ?? 'un autre agent'
+  const left = remainingTasks(a)
+    .map(t => t.title)
+    .join(' ; ')
+  const todo =
+    why === 'en échec'
+      ? `Relance « ${name} » puis « ${a.name} », ou « ${a.name} » avec d’autres consignes`
+      : why === 'hors plan'
+        ? `« ${name} » n’est pas un agent du plan : relance « ${a.name} » avec ce qui lui manque`
+        : `Ils s’attendent l’un l’autre : relance l’un des deux avec d’autres consignes`
+  void $.prompt
+    .submit({
+      text: `revo-flow : l’agent « ${a.name} » attend « ${name} » (${why}) ; reste : ${left}. ${todo}, avec l’outil Agent (description = son nom exact).`,
+      asUser: true,
+    })
+    .catch(() => undefined)
 }
 
 /** Tous les agents ont fini pendant l'exécution : l'orchestrateur passe à la vérification. */
@@ -1059,17 +1262,21 @@ async function syncAgents($: $) {
     // Sorti de la liste : on ne le tient pour fini que si son dernier tour s'est terminé.
     const isEnded = info ? ENDED.has(info.status) : a.hasEndedTurn === true
     if (!isEnded) continue
-    const failed = (info !== undefined && info.status !== 'completed') || a.tasks.some(t => t.status === 'failed')
-    await endAgent($, a.key, failed)
-    if (failed) await notify($, `agent « ${a.name} » en échec`)
+    // L'état à jour (une attente a pu être signalée pendant la lecture de la liste).
+    const cur = (await read($, flowA))?.agents.find(x => x.key === a.key) ?? a
+    const isFailed = (info !== undefined && info.status !== 'completed') || cur.tasks.some(t => t.status === 'failed')
+    // Un agent qui a signalé une attente et n'a pas fini ses tâches attend : ni fini, ni en échec.
+    const outcome: Outcome = isFailed ? 'failed' : cur.waitingFor && remainingTasks(cur).length > 0 ? 'blocked' : 'done'
+    if (!(await endAgent($, a.key, outcome))) continue
+    if (outcome === 'failed') await notify($, `agent « ${a.name} » en échec`)
   }
   await toReview($)
 }
 
 // ── Arrêt, relance et validation du plan ─────────────────────────────────
 
-/** Arrête un sous-agent en cours avec TaskStop, comme le modèle le ferait, et le marque en échec. */
-async function stopAgent($: $, key: string) {
+/** Arrête un sous-agent en cours avec TaskStop, comme le modèle le ferait, et le marque en échec. isQuiet : voir endAgent. */
+async function stopAgent($: $, key: string, isQuiet = false) {
   const a = (await read($, flowA))?.agents.find(x => x.key === key)
   if (!a || a.status !== 'running') return
   if (a.agentId) {
@@ -1079,7 +1286,7 @@ async function stopAgent($: $, key: string) {
       // déjà fini, ou plus connu de Claude Code : on le marque quand même
     }
   }
-  await endAgent($, key, true)
+  await endAgent($, key, 'failed', isQuiet)
   await toReview($)
 }
 
@@ -1091,17 +1298,25 @@ async function stopAll($: $) {
   if (turnId) await $.turn.abort({ turnId }).catch(() => undefined)
 }
 
-/**
- * Relance un agent : il redevient « en attente » (nouvelle tentative), ses tâches non faites repartent de zéro,
- * et l'orchestrateur reçoit la consigne de le relancer avec l'outil Agent.
- */
+/** Bouton « Relancer » (agent en échec ou en attente) : un agent encore actif est d'abord arrêté, sans suites. */
 async function retryAgent($: $, key: string) {
   const a = (await read($, flowA))?.agents.find(x => x.key === key)
   if (!a) return
-  if (a.status === 'running') await stopAgent($, key)
+  if (a.status === 'running') await stopAgent($, key, true)
+  await relaunch($, key)
+}
+
+/**
+ * Réarme un agent et demande sa relance : il redevient « en attente de lancement » (nouvelle tentative), ses tâches
+ * non faites repartent de zéro, son attente est levée, et l'orchestrateur reçoit la consigne de le relancer avec
+ * l'outil Agent. `why` précède la consigne : pourquoi on le relance.
+ */
+async function relaunch($: $, key: string, why = '') {
+  const a = (await read($, flowA))?.agents.find(x => x.key === key)
+  if (!a) return
   claimed.delete(key)
   const tasks = a.tasks.map(t => (t.status === 'completed' ? t : { ...t, status: 'pending' as const }))
-  await setAgent($, key, ({ agentId: _id, startedAt: _start, endedAt: _end, ...x }) => ({
+  await setAgent($, key, ({ agentId: _id, startedAt: _start, endedAt: _end, waitingFor: _w, ...x }) => ({
     ...x,
     status: 'waiting',
     attempts: (x.attempts ?? 1) + 1,
@@ -1117,7 +1332,7 @@ async function retryAgent($: $, key: string) {
     .join(' ; ')
   void $.prompt
     .submit({
-      text: `revo-flow : relance l’agent « ${a.name} » avec l’outil Agent (description = son nom exact) pour ses tâches restantes : ${left}`,
+      text: `revo-flow : ${why ? `${why} ` : ''}relance l’agent « ${a.name} » avec l’outil Agent (description = son nom exact) pour ses tâches restantes : ${left}`,
       asUser: true,
     })
     .catch(() => undefined)
@@ -1174,7 +1389,8 @@ function statusText(flow: Flow | null) {
   const head = `revo-flow · ${flow.title} — ${flow.phase === 'planning' ? 'planification' : flow.phase === 'done' ? 'terminé' : `${flowPercent(flow)} %`}`
   const rows = flow.agents.map(a => {
     const p = progress(a.tasks, a.status, a.status === 'running')
-    return `  ${a.name} (${MODELS[a.model].label} · ${a.effort}) ${p.count}${p.label ? ` — ${p.label}` : ''} [${a.status}]`
+    const state = a.status === 'blocked' ? `en attente de « ${a.waitingFor?.name ?? '?'} »` : a.status
+    return `  ${a.name} (${MODELS[a.model].label} · ${a.effort}) ${p.count}${p.label ? ` — ${p.label}` : ''} [${state}]`
   })
   return [head, ...rows].join('\n')
 }
@@ -1435,23 +1651,35 @@ export const register: Register = (on, options) => {
     )
     if (!a) return next(e)
     claimed.add(a.key)
-    const r = await next({ ...e, model: MODELS[a.model].id, prompt: `${e.prompt}\n\n${agentBrief(a, opts.cache)}` })
+    const others = flow.agents.filter(x => x.key !== a.key).map(x => x.name)
+    // L'extrait de la fiche servie qui concerne cet agent, après ses consignes.
+    const extract = await agentCacheExtract($, a, e.prompt)
+    const prompt = `${e.prompt}\n\n${agentBrief(a, opts.cache, others)}${extract ? `\n\n${extract.text}` : ''}`
+    const r = await next({ ...e, model: MODELS[a.model].id, prompt })
     if (r.deny !== undefined || !r.agentId) {
       claimed.delete(a.key)
       return r
     }
+    if (extract) await served($, extract.cle, extract.hits, tokensOf(extract.text)).catch(() => undefined)
     const agentId = r.agentId
     const now = await $.clock.now()
-    await setAgent($, a.key, x => ({
+    // Un agent en attente relancé directement par l'orchestrateur (sans relaunch) : c'est une nouvelle tentative.
+    await setAgent($, a.key, ({ waitingFor: _w, ...x }) => ({
       ...x,
       agentId,
       modelId: r.model,
       status: 'running',
       startedAt: now,
       lastActiveAt: now,
-      attempts: x.attempts ?? 1,
+      hasEndedTurn: false,
+      attempts: x.status === 'blocked' ? (x.attempts ?? 1) + 1 : (x.attempts ?? 1),
     }))
-    await setFlow($, f => (f.phase === 'dispatch' ? { ...f, phase: 'running' } : f))
+    // Un agent en attente relancé après la fin du flow (l'orchestrateur prévenu le relance) : le flow repart.
+    await setFlow($, ({ endedAt, ...f }) =>
+      f.phase === 'dispatch' || (a.status === 'blocked' && (f.phase === 'review' || f.phase === 'done'))
+        ? { ...f, phase: 'running' }
+        : { ...f, ...(endedAt !== undefined ? { endedAt } : {}) },
+    )
     // L'exécution commence : c'est maintenant que le panneau s'ouvre.
     try {
       const shown = await read($, flowA)
@@ -1492,18 +1720,35 @@ export const register: Register = (on, options) => {
     return { result: dispatchText(plan) as never }
   }).catch(() => ({ deny: 'revo-flow : le plan n’a pas pu être enregistré, réessaie.' }))
 
-  // Un sous-agent signale une tâche : sa barre avance.
+  // Un sous-agent signale une tâche : sa barre avance. « attente » note qui il attend (waitingFor) ; tout autre
+  // statut retire l'attente : l'agent a repris.
   on('tool.call', { tool: STEP_TOOL }, async ($, e) => {
-    const input = e as unknown as { tache?: unknown; statut?: unknown; agent?: unknown }
+    const input = e as unknown as { tache?: unknown; statut?: unknown; agent?: unknown; attend?: unknown }
     const flow = await read($, flowA)
     const a = flow?.agents.find(x => (e.agentId ? x.agentId === e.agentId : x.key === slug(String(input.agent ?? ''))))
-    if (!a) return { result: 'revo-flow : pas de liste de tâches revo-flow pour cet agent, rien à suivre.' as never }
+    if (!flow || !a) return { result: 'revo-flow : pas de liste de tâches revo-flow pour cet agent, rien à suivre.' as never }
     const n = Number(input.tache)
     const statut = String(input.statut ?? 'en_cours')
     const tasks = applyStep(a.tasks, n, statut)
     if (!tasks) return { deny: `revo-flow : « tache » doit être un numéro entre 1 et ${a.tasks.length}.` }
-    await setAgent($, a.key, x => ({ ...x, tasks, hasReported: true }))
-    return { result: `ok — tâche ${Math.round(n)}/${a.tasks.length} (${tasks[Math.round(n) - 1]!.title}) : ${statut}` as never }
+    const head = `tâche ${Math.round(n)}/${a.tasks.length}`
+    if (slug(statut) === 'attente') {
+      const asked = String(input.attend ?? '').trim()
+      const target = findAgent(flow.agents, asked, a.key)
+      if (target?.status === 'done') {
+        await setAgent($, a.key, ({ waitingFor: _w, ...x }) => ({ ...x, tasks, hasReported: true }))
+        return { result: `revo-flow : « ${target.name} » a déjà fini : continue (${head}).` as never }
+      }
+      const since = await $.clock.now()
+      const name = target?.name ?? (asked.slice(0, 60) || 'un autre agent')
+      await setAgent($, a.key, x => ({ ...x, tasks, hasReported: true, waitingFor: { ...(target ? { key: target.key } : {}), name, since } }))
+      const then = target
+        ? `revo-flow te relancera quand « ${name} » aura fini`
+        : `ce n’est pas un agent du plan : l’orchestrateur sera prévenu à la fin de ton tour`
+      return { result: `ok — ${head} en attente de « ${name} » : termine ta réponse en précisant ce qui te manque ; ${then}.` as never }
+    }
+    await setAgent($, a.key, ({ waitingFor: _w, ...x }) => ({ ...x, tasks, hasReported: true }))
+    return { result: `ok — ${head} (${tasks[Math.round(n) - 1]!.title}) : ${statut}` as never }
   }).catch(() => ({ result: 'revo-flow : suivi indisponible, continue tes tâches.' as never }))
 
   // L'outil cache : autorisé en planification et hors flow ; aucune exception ne remonte, l'erreur est dite en texte.

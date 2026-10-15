@@ -4,7 +4,7 @@
 import type { EngineInterface } from 'claude-code'
 
 import type { Graph, SourceFile } from '../../types/cache'
-import { EXCLUS_DEFAUT, MECA_FORMAT, buildGraph, isExcluded, isIndexable, projectKey, updateFiles } from './graph'
+import { EXCLUS_DEFAUT, MECA_FORMAT, buildGraph, hashPath, isExcluded, isIndexable, projectKey, updateFiles } from './graph'
 
 type $ = EngineInterface
 
@@ -32,6 +32,11 @@ const MAX_READ = 4 * 1024 * 1024
 const MAX_WRITE = 4 * 1024 * 1024 - 1024
 /** Délai d'une commande git. */
 const GIT_MS = 30_000
+/** Délai d'un diff depuis l'apprentissage, et taille max du diff gardé (le reste est coupé avant d'être résumé par graph.ts). */
+const DIFF_MS = 10_000
+const MAX_DIFF = 200_000
+/** Lignes gardées d'un fichier supprimé (git show). */
+const GONE_LINES = 80
 /** Lectures de fichiers en parallèle. */
 const BATCH = 16
 /** Garde-fou du parcours sans git. */
@@ -421,19 +426,19 @@ export async function deleteGraph(io: Io, cle: string): Promise<void> {
 
 // ── Git ──────────────────────────────────────────────────────────────────
 
-type GitResult = { ok: boolean; out: string; truncated: boolean; spawnFailed: boolean }
+type GitResult = { ok: boolean; out: string; truncated: boolean; spawnFailed: boolean; code: number }
 
 /** Une commande git dans racine, sans jamais lever : ok = code 0 ; spawnFailed = git ne démarre pas. */
-async function git(io: Io, racine: string, args: string[], stdin?: string): Promise<GitResult> {
+async function git(io: Io, racine: string, args: string[], stdin?: string, timeoutMs = GIT_MS): Promise<GitResult> {
   try {
     const r = await io.run(['git', '-c', 'core.quotepath=false', '--literal-pathspecs', ...args], {
       cwd: racine,
-      timeoutMs: GIT_MS,
+      timeoutMs,
       ...(stdin !== undefined ? { stdin } : {}),
     })
-    return { ok: r.exitCode === 0, out: r.stdout, truncated: r.isStdoutTruncated, spawnFailed: false }
+    return { ok: r.exitCode === 0, out: r.stdout, truncated: r.isStdoutTruncated, spawnFailed: false, code: r.exitCode }
   } catch {
-    return { ok: false, out: '', truncated: false, spawnFailed: true }
+    return { ok: false, out: '', truncated: false, spawnFailed: true, code: -1 }
   }
 }
 
@@ -664,4 +669,71 @@ export async function refreshGraph(io: Io, graph: Graph): Promise<{ graph: Graph
   const head = usesGit ? await headInfo(io, racine) : { commit: graph.projet.indexe?.commit ?? '', branche: graph.projet.indexe?.branche ?? '' }
   const next = updateFiles(graph, sources, [...goneSet], renamed, { commit: head.commit, branche: head.branche, le: await nowIso(io) })
   return { graph: next, changed, removed: [...goneSet, ...renamed.map(([from]) => from)] }
+}
+
+// ── Diff depuis l'apprentissage ──────────────────────────────────────────
+
+const isBlob = (h: string) => /^[0-9a-f]{7,64}$/.test(h)
+
+/** Retire l'en-tête d'un diff git (diff --git, index, ---, +++ avant le premier « @@ ») : les noms y sont des hash ou des chemins temporaires, sans intérêt. */
+export function stripDiffHeader(out: string): string {
+  const lines = out.split(/\r?\n/)
+  const first = lines.findIndex(l => l.startsWith('@@'))
+  if (first >= 0) return lines.slice(first).join('\n').replace(/\n+$/, '')
+  const keep = lines.filter(l => l !== '' && !/^(diff --git|index |--- |\+\+\+ |new file mode|deleted file mode|old mode|new mode|similarity index)/.test(l))
+  return keep.join('\n')
+}
+
+/** Une sortie git coupée par le plafond du moteur ou le nôtre : on garde les lignes entières. */
+function cutOutput(out: string, truncated: boolean): string {
+  const over = out.length > MAX_DIFF
+  const text = over ? out.slice(0, MAX_DIFF) : out
+  return truncated || over ? text.slice(0, Math.max(0, text.lastIndexOf('\n'))) : text
+}
+
+/** Le fichier temporaire qui reçoit l'ancien blob pour le repli --no-index : <home>/.claude/revo-flow/tmp/<hashPath(p)>-<ancien hash>.txt */
+async function tmpBlobPath(io: Io, p: string, oldHash: string): Promise<string> {
+  return `${await homeDir(io)}/.claude/revo-flow/tmp/${hashPath(p)}-${oldHash.slice(0, 12)}.txt`
+}
+
+/** Un fichier supprimé : l'ancien contenu (git show) en lignes retirées, tronqué à 80 lignes, derrière « fichier supprimé ». */
+async function deletedDiff(io: Io, racine: string, oldHash: string): Promise<string | undefined> {
+  const r = await git(io, racine, ['show', oldHash], undefined, DIFF_MS)
+  if (!r.ok) return undefined
+  const lines = cutOutput(r.out, r.truncated).split(/\r?\n/)
+  if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
+  const shown = lines.slice(0, GONE_LINES)
+  const out = ['fichier supprimé', `@@ -1,${lines.length} +0,0 @@`, ...shown.map(l => `-${l}`)]
+  if (lines.length > shown.length) out.push(`… (tronqué, ${lines.length - shown.length} lignes de plus)`)
+  return out.join('\n')
+}
+
+/**
+ * Le diff unifié d'un fichier entre le blob appris (oldHash) et son état courant (newHash : hash du graphe, '' = supprimé).
+ * 1. git diff --no-color --unified=3 <oldHash> <newHash> (les deux blobs sont dans l'objet git quand le fichier est commité ou indexé) ;
+ * 2. repli (blob courant absent, par exemple modifié non indexé, ou commande en échec) : git show <oldHash> écrit sous <home>/.claude/revo-flow/tmp/, puis git diff --no-index contre le fichier du disque (code 1 = différences) ;
+ * 3. fichier supprimé : l'ancien contenu en lignes retirées (80 lignes au plus).
+ * Rend '' quand il n'y a aucune différence, undefined quand le diff est impossible (hash qui n'est pas un blob git, projet sans git, fichier illisible). Ne lève jamais. Délai : 10 s par commande.
+ */
+export async function diffSince(io: Io, racine: string, p: string, oldHash: string, newHash: string): Promise<string | undefined> {
+  try {
+    const root = normalizePath(racine)
+    const path = normalizePath(p)
+    if (!isBlob(oldHash)) return undefined
+    if (newHash === '') return await deletedDiff(io, root, oldHash)
+    if (isBlob(newHash)) {
+      const d = await git(io, root, ['diff', '--no-color', '--unified=3', oldHash, newHash], undefined, DIFF_MS)
+      if (d.spawnFailed) return undefined
+      if (d.ok) return stripDiffHeader(cutOutput(d.out, d.truncated))
+    }
+    const old = await git(io, root, ['show', oldHash], undefined, DIFF_MS)
+    if (!old.ok) return undefined
+    const tmp = await tmpBlobPath(io, path, oldHash)
+    await io.fs.write(tmp, old.out)
+    const d = await git(io, root, ['diff', '--no-index', '--no-color', '--unified=3', '--', tmp, `${root}/${path}`], undefined, DIFF_MS)
+    if (d.code !== 0 && d.code !== 1) return undefined
+    return stripDiffHeader(cutOutput(d.out, d.truncated))
+  } catch {
+    return undefined
+  }
 }

@@ -31,7 +31,13 @@ export type FlowAgent = Activity & {
   agentId?: string
   /** Le modèle réellement utilisé (identifiant complet). */
   modelId?: string
-  status: 'waiting' | 'running' | 'done' | 'failed'
+  /** blocked : son tour est fini, mais il attend le travail d'un autre agent (waitingFor) ; revo-flow le relance ensuite. */
+  status: 'waiting' | 'running' | 'blocked' | 'done' | 'failed'
+  /**
+   * Ce qu'il attend, signalé avec l'outil step (statut attente) : key = la clé de l'agent prévu s'il est reconnu,
+   * name = ce que l'agent a écrit (ou le nom de l'agent reconnu), since = l'heure du signalement.
+   */
+  waitingFor?: { key?: string; name: string; since: number }
   /** Vrai dès que l'agent a signalé lui-même une tâche. */
   hasReported?: boolean
   /** Son dernier tour s'est terminé ; il n'est fini que quand Claude Code le dit (il peut tourner encore en fond). */

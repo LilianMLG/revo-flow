@@ -141,3 +141,11 @@ export type LearnInput = {
 }
 export type LearnContext = { source: string; modele?: string; commit: string; branche: string; le: string; confiance?: number }
 export type SourceFile = { p: string; h: string; text: string }
+/** Un fichier de fiche dont le hash courant diffère du hash appris (nouveau = '' : supprimé). */
+export type PerimeEntry = { p: string; depuis: string; nouveau: string }
+/** Le diff d'un fichier depuis l'apprentissage ; diff undefined = indisponible (blob absent), '' = aucune différence. */
+export type DiffEntry = { p: string; depuis: string; diff: string | undefined }
+/** Ce que le prompt d'un sous-agent dit de sa mission, pour choisir l'extrait de fiche (agentExtract). */
+export type AgentInfo = { name: string; tasks: string[]; prompt: string }
+/** Contexte d'un rafraîchissement : date, commit court et branche au moment de la relecture. */
+export type RefreshContext = { le: string; commit: string; branche: string }

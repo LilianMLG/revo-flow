@@ -1,7 +1,7 @@
 {
   "name": "revo-flow",
-  "version": "1.2.2",
-  "description": "/revo-flow <demande> : l'orchestrateur lit les specs, fait un plan, répartit les tâches entre des sous-agents (modèle et effort choisis pour chacun) et affiche une barre de progression par agent dans le panneau latéral ; un cache par projet (graphe des fichiers et fiches de features apprises en fin de flow) lui évite de relire le code : /revo-flow cache",
+  "version": "1.3.0",
+  "description": "/revo-flow <demande> : l'orchestrateur lit les specs, fait un plan, répartit les tâches entre des sous-agents (modèle et effort choisis pour chacun) et affiche une barre de progression par agent dans le panneau latéral ; un cache par projet (graphe des fichiers et fiches de features apprises en fin de flow) lui évite de relire le code : /revo-flow cache. Un agent peut en attendre un autre (relancé quand il a fini) et reçoit l'extrait de fiche qui le concerne, qu'il vérifie et rafraîchit.",
   "author": {
     "name": "Lilian Malinge"
   },
@@ -33,7 +33,7 @@
     "cache": {
       "type": "boolean",
       "title": "Cache projet",
-      "description": "Au lancement de /revo-flow, un brief du cache du projet (features connues, fiche probable) est injecté à l'orchestrateur, et l'outil mcp__revo-flow__cache est proposé aux agents. Désactivé : rien n'est injecté ni proposé, mais la commande /revo-flow cache reste disponible.",
+      "description": "Au lancement de /revo-flow, un brief du cache du projet (features connues, fiche probable) est injecté à l'orchestrateur, chaque sous-agent reçoit l'extrait de la fiche servie qui le concerne, et l'outil mcp__revo-flow__cache est proposé aux agents. Désactivé : rien n'est injecté ni proposé, mais la commande /revo-flow cache reste disponible.",
       "default": true
     }
   }

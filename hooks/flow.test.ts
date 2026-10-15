@@ -5,13 +5,16 @@ import type { On } from 'claude-code'
 import {
   LEAD_BRIEF,
   agentBrief,
+  allFinished,
   applyStep,
+  findAgent,
   finishTasks,
   flowRecap,
   fmtDuration,
   leadBrief,
   matchAgent,
   parsePlan,
+  pauseTasks,
   planQuestion,
   progress,
   remainingTasks,
@@ -58,8 +61,14 @@ function world(on: On, os: Os = WINDOWS) {
   })
   // git : la branche feat/promo ; les fichiers suivis (ls-files) sont ceux que le test met dans `tracked`.
   const tracked: Record<string, string> = {}
+  // git diff <blob> <blob> (action diff du cache) : la sortie que le test décide, et les appels reçus.
+  const gitDiff = { out: '', calls: [] as string[][] }
   on('process.run', (_$, e) => {
     const out = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+    if (e.argv.includes('--unified=3')) {
+      gitDiff.calls.push([...e.argv])
+      return out(gitDiff.out)
+    }
     if (e.argv.includes('ls-files')) return out(Object.entries(tracked).map(([p, h]) => `100644 ${h.padEnd(40, '0')} 0\t${p}\0`).join(''))
     if (e.argv.includes('status') || e.argv.includes('log') || e.argv.includes('diff')) return out('')
     if (e.argv.includes('--short')) return out('abc1234\n')
@@ -153,7 +162,7 @@ function world(on: On, os: Os = WINDOWS) {
   on('turn.complete', () => ({ text: '' }))
   // Ce que l'engine dessinerait sans le mod : une boîte vide.
   on('ui.render', (hook$, e) => h(hook$.ui.resolve(e).Box as never, {}) as never)
-  return { clock, sent, opened, prompts, status, ctl, asked, notified, stopped, toasts, aborted, registered, disk, states, tracked }
+  return { clock, sent, opened, prompts, status, ctl, asked, notified, stopped, toasts, aborted, registered, disk, states, tracked, gitDiff }
 }
 
 const run = async ($: Engine, args: string) => (await $.command.run({ command: 'revo-flow', args } as never)).text ?? ''
@@ -495,9 +504,132 @@ test('notifier désactivé : aucune notification', { options: { notifier: false 
   expect(w.notified).toEqual([])
 })
 
+// ── Attente d'un autre agent ─────────────────────────────────────────────
+
+const STEP = 'mcp__revo-flow__step'
+const agentIn = (w: ReturnType<typeof world>, key: string) => (w.states.flow as Flow).agents.find(a => a.key === key)!
+const endTurn = async ($: Engine, w: ReturnType<typeof world>, agentId: string, status: string) => {
+  w.status[agentId] = status
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: status !== 'completed', turnId: 'x', reason: 'answer', agentId } as never)
+  await w.clock.settle()
+}
+
+test('attente : l’agent qui attend un autre n’est pas en échec, puis il est relancé quand l’autre a fini', async ($, on) => {
+  const w = world(on)
+  const { front, api } = await twoRunning($, w)
+  await $.tool.call({ tool: STEP, agentId: front, tache: 1, statut: 'fait' } as never)
+  const r = await $.tool.call({ tool: STEP, agentId: front, tache: 2, statut: 'attente', attend: '« api promo »' } as never)
+  expect(JSON.stringify(r)).toMatch(/tâche 2\/3 en attente de « API promo » : termine ta réponse/)
+  await endTurn($, w, front, 'completed')
+
+  // (a) Carte « Attend « API promo » », ni échec ni notification ; la tâche suspendue repart en pending.
+  const pane = await drawn($, 'desktop', 'Pane')
+  expect(pane.alts).toMatch(/Front panier, Sonnet 5\.5, Sonnet · medium, Attend « API promo »/)
+  expect(pane.alts).not.toMatch(/Front panier, .*Échec/)
+  expect(w.notified.join('\n')).not.toMatch(/en échec/)
+  expect(w.toasts.join('\n')).toMatch(/« Front panier » attend « API promo »/)
+  let fp = agentIn(w, 'front-panier')
+  expect(fp.status).toBe('blocked')
+  expect(fp.agentId).toBeUndefined()
+  expect(fp.waitingFor).toMatchObject({ key: 'api-promo', name: 'API promo' })
+  expect(fp.tasks.map(t => t.status)).toEqual(['completed', 'pending', 'pending'])
+  expect(w.sent.map(x => x.text).join('\n')).not.toMatch(/relance l’agent « Front panier »/)
+  const term = await drawn($, 'terminal', 'Pane')
+  expect(term.text).toMatch(/○ Attend « API promo »/)
+  expect(term.text).toMatch(/Relancer/)
+  expect(term.text).toMatch(/1 en attente/)
+
+  // (b) « API promo » finit : « Front panier » est réarmé (waiting, 2e tentative) et l'orchestrateur doit le relancer.
+  await endTurn($, w, api, 'completed')
+  expect(w.sent.map(x => x.text).join('\n')).toMatch(
+    /revo-flow : « API promo » a fini, « Front panier » l’attendait : relance l’agent « Front panier » avec l’outil Agent .*: Ajouter le champ ; Tester/,
+  )
+  fp = agentIn(w, 'front-panier')
+  expect(fp.status).toBe('waiting')
+  expect(fp.attempts).toBe(2)
+  expect(fp.waitingFor).toBeUndefined()
+  // L'orchestrateur le relance : il retravaille, toujours 2e tentative.
+  const again = await spawn($, 'Front panier')
+  expect(again.model).toBe('claude-sonnet-5-5')
+  fp = agentIn(w, 'front-panier')
+  expect(fp.status).toBe('running')
+  expect(fp.attempts).toBe(2)
+})
+
+test('attente : « Quelqu’un » hors plan, l’agent reste en attente et l’orchestrateur est prévenu', async ($, on) => {
+  const w = world(on)
+  const { front } = await twoRunning($, w)
+  const r = await $.tool.call({ tool: STEP, agentId: front, tache: 1, statut: 'attente', attend: 'Quelqu’un' } as never)
+  expect(JSON.stringify(r)).toMatch(/pas un agent du plan/)
+  await endTurn($, w, front, 'completed')
+  expect(w.sent.map(x => x.text).join('\n')).toMatch(/revo-flow : l’agent « Front panier » attend « Quelqu’un » \(hors plan\) ; reste : Lire le panier ; Ajouter le champ ; Tester/)
+  expect(agentIn(w, 'front-panier').status).toBe('blocked')
+  expect(w.notified.join('\n')).not.toMatch(/en échec/)
+})
+
+test('attente : l’agent attendu échoue, l’orchestrateur est prévenu ; un agent interrompu reste en échec', async ($, on) => {
+  const w = world(on)
+  const { front, api } = await twoRunning($, w)
+  await $.tool.call({ tool: STEP, agentId: front, tache: 2, statut: 'attente', attend: 'API promo' } as never)
+  await endTurn($, w, front, 'completed')
+  await endTurn($, w, api, 'killed')
+  expect(w.sent.map(x => x.text).join('\n')).toMatch(/l’agent « Front panier » attend « API promo » \(en échec\).*Relance « API promo » puis « Front panier »/)
+  expect(agentIn(w, 'front-panier').status).toBe('blocked')
+  expect(agentIn(w, 'api-promo').status).toBe('failed')
+  // Les deux ont fini (l'un en échec, l'autre en attente) : la fin du tour de l'orchestrateur clôt le flow.
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' } as never)
+  await w.clock.settle()
+  expect(w.notified.join('\n')).toMatch(/terminé .*1 agent en attente/)
+
+})
+
+test('attente : un agent tué après avoir signalé une attente reste en échec', async ($, on) => {
+  const w = world(on)
+  const { front } = await twoRunning($, w)
+  await $.tool.call({ tool: STEP, agentId: front, tache: 1, statut: 'attente', attend: 'API promo' } as never)
+  await endTurn($, w, front, 'killed')
+  expect(agentIn(w, 'front-panier').status).toBe('failed')
+  expect(w.notified.join('\n')).toMatch(/agent « Front panier » en échec/)
+})
+
+test('attente : l’agent attendu a déjà fini, step répond de continuer sans attente', async ($, on) => {
+  const w = world(on)
+  const { front, api } = await twoRunning($, w)
+  await endTurn($, w, api, 'completed')
+  const r = await $.tool.call({ tool: STEP, agentId: front, tache: 2, statut: 'attente', attend: 'API promo' } as never)
+  expect(JSON.stringify(r)).toMatch(/« API promo » a déjà fini : continue/)
+  expect(agentIn(w, 'front-panier').waitingFor).toBeUndefined()
+  expect(agentIn(w, 'front-panier').status).toBe('running')
+})
+
+test('conflit de fichiers, mode refuser : le refus propose l’attente', { options: { conflits: 'refuser' } }, async ($, on) => {
+  const w = world(on)
+  const { front, api } = await twoRunning($, w)
+  await $.tool.call({ tool: 'Edit', file_path: FILE, agentId: front, tool_use_id: 'u1' } as never)
+  const second = await $.tool.call({ tool: 'Edit', file_path: FILE, agentId: api, tool_use_id: 'u2' } as never)
+  expect(second.deny).toMatch(/statut attente, attend = « Front panier »/)
+})
+
 // ── Cache projet ─────────────────────────────────────────────────────────
 
 const flowCacheOf = (w: ReturnType<typeof world>) => w.states.flowCache as { lus: unknown[] } | null | undefined
+
+/** Un appel de l'outil cache par l'orchestrateur (ou hors flow) : sa réponse en texte. */
+const cacheCall = async ($: Engine, args: Record<string, unknown>) => JSON.stringify(await $.tool.call({ tool: 'mcp__revo-flow__cache', ...args } as never))
+
+type SavedFeature = {
+  resume: string
+  alias: string[]
+  flux: string[]
+  entrees: string[]
+  deps: string[]
+  fichiers: { p: string; role: string; h: string }[]
+  pieges: { txt: string; p?: string }[]
+  perime: unknown[]
+}
+/** Le graphe enregistré sur le disque en mémoire (le fichier .json, pas sa copie .tmp). */
+const savedGraph = (w: ReturnType<typeof world>) =>
+  JSON.parse(Object.entries(w.disk).find(([k, t]) => k.endsWith('.json') && t.includes('"features"'))![1]) as { features: Record<string, SavedFeature> }
 
 test('session.start : l’outil cache est enregistré tout de suite, sans attendre /revo-flow', async ($, on) => {
   const w = world(on)
@@ -637,6 +769,113 @@ for (const os of [WINDOWS, MACOS]) {
       const fc = w.states.flowCache as { servis: unknown[]; feature?: string }
       expect(fc.servis).toEqual([])
       expect(fc.feature).toBeUndefined()
+      // Sans fiche servie, les agents n'ont pas d'extrait (seulement leurs consignes).
+      w.ctl.answer = 'Lancer'
+      await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN } as never)
+      await spawn($, 'Front panier')
+      expect(w.prompts[0]).toMatch(/# Tes tâches/)
+      expect(w.prompts[0]).not.toMatch(/# Cache revo-flow — fiche/)
+    })
+
+    test('flow avec cache : chaque agent reçoit l’extrait de la fiche servie, compté à son nom', async ($, on) => {
+      const w = world(on, os)
+      seedProject(w, os)
+      await cacheCall($, {
+        action: 'apprendre',
+        feature: 'panier',
+        titre: 'Panier et code promo',
+        alias: ['panier', 'code promo'],
+        resume: 'Le panier et son code promo.',
+        fichiers: [{ p: 'components/Basket.vue', role: 'coeur' }, { p: 'components/Promo.vue', role: 'ui' }],
+        pieges: [{ txt: 'Le total se recalcule après la promo', p: 'components/Basket.vue' }],
+      })
+      w.ctl.answer = 'Utiliser'
+      await launch($, w)
+      w.ctl.answer = 'Lancer'
+      await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN } as never)
+      const before = (w.states.flowCache as { injecte: number }).injecte
+      await spawn($, 'Front panier')
+      // Après les consignes : l'extrait (en-tête, fichiers de sa mission, pièges, ligne d'outil).
+      expect(w.prompts[0]).toMatch(/# Tes tâches[\s\S]*# Cache revo-flow — fiche « panier : Panier et code promo » \(✓ fraîche/)
+      expect(w.prompts[0]).toMatch(/- components\/Basket\.vue · coeur/)
+      expect(w.prompts[0]).toMatch(/Le total se recalcule après la promo/)
+      expect(w.prompts[0]).toMatch(/feature « panier » pour la fiche entière/)
+      const fc = w.states.flowCache as { servis: { p: string; par: string }[]; injecte: number }
+      expect(fc.servis.filter(h => h.par === 'front-panier').map(h => h.p)).toEqual(['components/Basket.vue'])
+      expect(fc.injecte).toBeGreaterThan(before)
+    })
+
+    test('outil cache, rafraichir : une fiche partiellement périmée est signalée, puis redevient fraîche', async ($, on) => {
+      const w = world(on, os)
+      seedProject(w, os)
+      await cacheCall($, {
+        action: 'apprendre',
+        feature: 'panier',
+        titre: 'Panier',
+        resume: 'Le panier.',
+        fichiers: [{ p: 'components/Basket.vue', role: 'coeur' }, { p: 'components/Promo.vue', role: 'ui' }],
+      })
+      // Promo.vue change (moins de la moitié des tokens de la fiche) ; le graphe se rafraîchit au plus toutes les 30 s.
+      w.tracked['components/Promo.vue'] = 'c3c3c3c3c3c3'
+      await w.clock.advance(31_000)
+      const shown = await cacheCall($, { action: 'feature', feature: 'panier' })
+      expect(shown).toMatch(/⚠ Modifiés depuis l'apprentissage : components\/Promo\.vue/)
+      expect(shown).toMatch(/action rafraichir \(feature, fichiers = ceux relus\)/)
+      const r = await cacheCall($, { action: 'rafraichir', feature: 'panier', fichiers: [{ p: 'components/Promo.vue' }, { p: 'components/Inconnu.vue' }] })
+      expect(r).toMatch(/fiche « panier » rafraîchie : 1 fichier ; fiche redevenue fraîche\./)
+      expect(r).toMatch(/Chemins inconnus de la fiche \(ignorés\) : components\/Inconnu\.vue/)
+      const f = savedGraph(w).features.panier!
+      expect(f.fichiers.find(x => x.p === 'components/Promo.vue')!.h.startsWith('c3c3c3c3c3c3')).toBe(true)
+      expect(f.perime).toEqual([])
+      expect(f.resume).toBe('Le panier.')
+      expect(await cacheCall($, { action: 'rafraichir', feature: 'panier' })).toMatch(/« fichiers » manquants/)
+    })
+
+    test('outil cache, diff : le diff des fichiers modifiés depuis l’apprentissage, par fiche ou par chemin', async ($, on) => {
+      const w = world(on, os)
+      seedProject(w, os)
+      await cacheCall($, { action: 'apprendre', feature: 'panier', titre: 'Panier', fichiers: [{ p: 'components/Basket.vue', role: 'coeur' }] })
+      expect(await cacheCall($, { action: 'diff', feature: 'panier' })).toMatch(/aucun fichier modifié, rien à comparer/)
+      w.tracked['components/Basket.vue'] = 'd4d4d4d4d4d4'
+      w.gitDiff.out = 'diff --git a/x b/x\nindex a1a1a1a..d4d4d4d 100644\n--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n <template><Promo /></template>\n-// panier\n+// panier promo\n'
+      await w.clock.advance(31_000)
+      const r = await cacheCall($, { action: 'diff', feature: 'panier' })
+      expect(r).toMatch(/### components\/Basket\.vue \(\+1\/-1 lignes\)/)
+      expect(r).toMatch(/@@ -1,3 \+1,3 @@/)
+      expect(r).toMatch(/\+\/\/ panier promo/)
+      expect(r).not.toMatch(/index a1a1a1a/)
+      const argv = w.gitDiff.calls[0]!
+      expect(argv.some(x => x.startsWith('a1a1a1a1a1a1'))).toBe(true)
+      expect(argv.some(x => x.startsWith('d4d4d4d4d4d4'))).toBe(true)
+      const byPath = await cacheCall($, { action: 'diff', chemin: native(os, 'Documents', 'Front', 'ui-vel', 'components', 'Basket.vue') })
+      expect(byPath).toMatch(/### components\/Basket\.vue \(\+1\/-1 lignes\)/)
+      expect(await cacheCall($, { action: 'diff', chemin: 'components/Promo.vue' })).toMatch(/pas de fiche ne connaît components\/Promo\.vue/)
+    })
+
+    test('outil cache, apprendre partiel : les champs absents gardent leur valeur, la correction devient un piège', async ($, on) => {
+      const w = world(on, os)
+      seedProject(w, os)
+      await cacheCall($, {
+        action: 'apprendre',
+        feature: 'panier',
+        titre: 'Panier',
+        alias: ['basket'],
+        resume: 'Le panier.',
+        flux: ['Saisie du code', 'Validation côté API'],
+        entrees: ['components/Basket.vue'],
+        fichiers: [{ p: 'components/Basket.vue', role: 'coeur' }],
+        pieges: [{ txt: 'Le total arrondit au centime' }],
+        deps: ['paiement'],
+      })
+      expect(await cacheCall($, { action: 'apprendre', feature: 'panier', corrections: ['la validation se fait à l’envoi, pas à la frappe'] })).toMatch(/apprise \(1 fichier\)/)
+      const f = savedGraph(w).features.panier!
+      expect(f.flux).toEqual(['Saisie du code', 'Validation côté API'])
+      expect(f.entrees).toEqual(['components/Basket.vue'])
+      expect(f.deps).toEqual(['paiement'])
+      expect(f.alias).toEqual(['basket'])
+      expect(f.resume).toBe('Le panier.')
+      expect(f.fichiers.map(x => x.p)).toEqual(['components/Basket.vue'])
+      expect(f.pieges.map(x => x.txt)).toEqual(['Corrigé : la validation se fait à l’envoi, pas à la frappe', 'Le total arrondit au centime'])
     })
 
     test('/revo-flow cache build <feature> : coût confirmé, agent revo-flow-cache lancé hors flow', async ($, on) => {
@@ -668,14 +907,20 @@ test('LEAD_BRIEF : cache d’abord (une carte, pas la vérité), extrait aux age
   expect(LEAD_BRIEF).toMatch(/carte, pas la vérité/)
   expect(LEAD_BRIEF).toMatch(/extrait de fiche du cache qui le concerne/)
   expect(LEAD_BRIEF).toMatch(/mcp__revo-flow__cache action « apprendre »/)
-  expect(leadBrief(false)).not.toMatch(/cache/)
+  expect(LEAD_BRIEF).toMatch(/revo-flow ajoute lui-même à chaque agent l'extrait de fiche/)
+  expect(LEAD_BRIEF).toMatch(/action « rafraichir » \(feature, fichiers relus\)/)
+  expect(leadBrief(false)).not.toMatch(/cache|rafraichir|extrait/i)
   expect(leadBrief(false)).toMatch(/1\. Plan : lis toi-même la demande/)
 })
 
-test('agentBrief : la ligne voisins seulement avec le cache', () => {
+test('agentBrief : le paragraphe du cache (chercher, voisins, diff, rafraichir) seulement avec le cache', () => {
   const a = agentOf({ tasks: [{ title: 'Lire', kind: 'analyse', status: 'pending' }] })
-  expect(agentBrief(a)).toMatch(/Avant un grep « qui utilise X », essaie mcp__revo-flow__cache action voisins\./)
-  expect(agentBrief(a, false)).not.toMatch(/voisins/)
+  const brief = agentBrief(a)
+  expect(brief).toMatch(/Cache revo-flow \(outil mcp__revo-flow__cache\) : avant d'explorer, action chercher/)
+  expect(brief).toMatch(/voisins avant un grep « qui utilise X »/)
+  expect(brief).toMatch(/action diff pour voir ce qui a changé[\s\S]*rafraichir \(feature, fichiers relus\)[\s\S]*apprendre avec corrections/)
+  expect(brief).toMatch(/carte, pas la vérité/)
+  expect(agentBrief(a, false)).not.toMatch(/cache|voisins|rafraichir/i)
 })
 
 test('flowRecap : la ligne du cache après l’état des agents ; sans cache, aucune consigne sur le cache', () => {
@@ -699,6 +944,39 @@ const agentOf = (over: Partial<FlowAgent>): FlowAgent =>
     costUsd: 0,
     ...over,
   }) as unknown as FlowAgent
+
+test('attente, logique pure : applyStep, pauseTasks, allFinished, findAgent, agentBrief, flowRecap', () => {
+  const t = (title: string, status: string) => ({ title, kind: 'codage', status }) as never
+  const tasks = [t('A', 'completed'), t('B', 'pending'), t('C', 'pending')]
+  expect(applyStep(tasks, 2, 'attente')?.map(x => x.status)).toEqual(['completed', 'in_progress', 'pending'])
+  expect(pauseTasks([t('A', 'completed'), t('B', 'in_progress'), t('C', 'failed')]).map(x => x.status)).toEqual(['completed', 'pending', 'failed'])
+  const flow = (statuses: string[]) => ({ agents: statuses.map(s => agentOf({ status: s as never })) }) as unknown as Flow
+  expect(allFinished(flow(['done', 'blocked']))).toBe(true)
+  expect(allFinished(flow(['failed', 'blocked']))).toBe(true)
+  expect(allFinished(flow(['running', 'blocked']))).toBe(false)
+  expect(allFinished(flow(['waiting', 'done']))).toBe(false)
+  const agents = [agentOf({}), agentOf({ key: 'api-promo', name: 'API promo' })]
+  expect(findAgent(agents, '« API Promo »', 'front-panier')?.key).toBe('api-promo')
+  expect(findAgent(agents, 'l’agent api-promo', 'front-panier')?.key).toBe('api-promo')
+  expect(findAgent(agents, 'Front panier', 'front-panier')).toBeUndefined()
+  expect(findAgent(agents, 'Quelqu’un')).toBeUndefined()
+  const brief = agentBrief(agentOf({ tasks: [t('Lire', 'pending')] }), true, ['API promo', 'Tests'])
+  expect(brief).toMatch(/"attente" avec "attend" = le nom de l'agent du plan dont tu dépends/)
+  expect(brief).toMatch(/revo-flow te relancera quand il aura fini/)
+  expect(brief).toMatch(/"echec" seulement pour ce que tu ne peux pas faire du tout/)
+  expect(brief).toMatch(/Les autres agents du plan \(à nommer dans "attend"\) : « API promo », « Tests »\./)
+  expect(agentBrief(agentOf({ tasks: [t('Lire', 'pending')] }))).not.toMatch(/Les autres agents/)
+  const recap = flowRecap({
+    id: '1',
+    request: 'r',
+    title: 'T',
+    summary: '',
+    phase: 'running',
+    startedAt: 0,
+    agents: [agentOf({ status: 'blocked', waitingFor: { key: 'api-promo', name: 'API promo', since: 0 }, tasks: [t('Coder', 'pending')] })],
+  } as unknown as Flow)
+  expect(recap).toMatch(/« Front panier » .*\[en attente de « API promo »\] — reste : Coder/)
+})
 
 test('fmtDuration : secondes, minutes, heures', () => {
   expect(fmtDuration(0)).toBe('0 s')

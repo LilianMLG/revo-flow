@@ -3,9 +3,11 @@
 
 import { euros, fmt, modelLabel, slug } from '../lib'
 import type {
+  AgentInfo,
   CacheHit,
   CacheStats,
   Candidate,
+  DiffEntry,
   EdgeKind,
   Edges,
   Feature,
@@ -19,6 +21,8 @@ import type {
   LearnContext,
   LearnInput,
   NodeKind,
+  PerimeEntry,
+  RefreshContext,
   SourceFile,
 } from '../../types/cache'
 
@@ -758,17 +762,20 @@ function gc(g: Graph): void {
   }
 }
 
+/** Les fichiers de la fiche dont le hash courant diffère du hash appris (nouveau = '' : supprimé), d'après `f.fichiers` et les hash du graphe. */
+export function perimeOf(graph: Graph, f: Feature): PerimeEntry[] {
+  const out: PerimeEntry[] = []
+  for (const ff of f?.fichiers ?? []) {
+    const cur = graph.fichiers[ff.p]
+    if (!cur) out.push({ p: ff.p, depuis: ff.h, nouveau: '' })
+    else if (!sameHash(cur.h, ff.h)) out.push({ p: ff.p, depuis: ff.h, nouveau: cur.h })
+  }
+  return out
+}
+
 /** Recalcule `perime` de chaque fiche d'après les hash actuels (les hash font foi, pas le commit). */
 function refreshPerime(g: Graph): void {
-  for (const f of Object.values(g.features)) {
-    const perime: Feature['perime'] = []
-    for (const ff of f.fichiers) {
-      const cur = g.fichiers[ff.p]
-      if (!cur) perime.push({ p: ff.p, depuis: ff.h, nouveau: '' })
-      else if (!sameHash(cur.h, ff.h)) perime.push({ p: ff.p, depuis: ff.h, nouveau: cur.h })
-    }
-    f.perime = perime
-  }
+  for (const f of Object.values(g.features)) f.perime = perimeOf(g, f)
 }
 
 function setIndexed(g: Graph, ctx: { commit: string; branche: string; le: string }): void {
@@ -1341,17 +1348,75 @@ export function completeFiche(graph: Graph, id: string, lus: string[]): Graph {
   return { ...graph, features: { ...graph.features, [id]: { ...f, fichiers } } }
 }
 
+/** Le chemin de la fiche que désigne `p` (relatif, absolu sous la racine, suffixe unique parmi ses fichiers), même si le fichier a disparu du graphe. */
+function ficheKey(graph: Graph, f: Feature, p: unknown): string | undefined {
+  if (typeof p !== 'string' || !p.trim()) return undefined
+  const inFiche = (k: string | undefined) => (k !== undefined && f.fichiers.some(x => x.p === k) ? k : undefined)
+  const hit = inFiche(resolveKey(graph, p))
+  if (hit) return hit
+  let n = norm(p.trim())
+  const root = norm(graph.projet.racine).replace(/\/$/, '')
+  if (root && n.toLowerCase().startsWith(`${root.toLowerCase()}/`)) n = n.slice(root.length + 1)
+  const exact = inFiche(n)
+  if (exact) return exact
+  const tail = n.replace(/^\/+/, '')
+  const c = f.fichiers.filter(x => x.p.endsWith(`/${tail}`))
+  return c.length === 1 ? c[0]!.p : undefined
+}
+
+/**
+ * Confirme une fiche après relecture : remet le hash courant sur les seuls fichiers de la fiche listés dans `paths` et les retire de `perime`.
+ * Ni le résumé, ni le flux, ni les pièges, ni la confiance ne bougent. Un fichier listé mais absent de la fiche n'est pas ajouté (`unknown`) ;
+ * un fichier listé qui a disparu du graphe est retiré de la fiche (et compté dans `refreshed`).
+ * Si plus aucun fichier de la fiche n'est périmé après coup, `appris` (date, commit, branche) prend `ctx` : la fiche vient d'être revérifiée en entier.
+ * Fiche inconnue ou rien de rafraîchi : le même graphe.
+ */
+export function refreshFiles(graph: Graph, id: string, paths: string[], ctx: RefreshContext): { graph: Graph; refreshed: string[]; unknown: string[] } {
+  const f = graph?.features?.[id]
+  const list = Array.isArray(paths) ? paths : []
+  if (!f) return { graph, refreshed: [], unknown: list.map(String) }
+  const refreshed: string[] = []
+  const unknown: string[] = []
+  const gone = new Set<string>()
+  const fresh = new Map<string, string>()
+  for (const raw of list) {
+    const k = ficheKey(graph, f, raw)
+    if (!k) {
+      unknown.push(String(raw))
+      continue
+    }
+    if (refreshed.includes(k)) continue
+    refreshed.push(k)
+    const n = graph.fichiers[k]
+    if (n) fresh.set(k, n.h)
+    else gone.add(k)
+  }
+  if (!refreshed.length) return { graph, refreshed, unknown }
+  const next: Feature = {
+    ...f,
+    fichiers: f.fichiers.filter(x => !gone.has(x.p)).map(x => (fresh.has(x.p) ? { ...x, h: fresh.get(x.p)! } : x)),
+  }
+  next.perime = perimeOf(graph, next)
+  if (!next.perime.length && ctx) next.appris = { le: ctx.le, commit: ctx.commit, branche: ctx.branche }
+  return { graph: { ...graph, features: { ...graph.features, [id]: next } }, refreshed, unknown }
+}
+
 // ── Mesure des gains ─────────────────────────────────────────────────────
 
-/** Les hits à enregistrer quand une fiche est servie : ses fichiers existants, frais si leur hash n'a pas changé. */
-export function servedFiles(graph: Graph, f: Feature, par: string): CacheHit[] {
+/** Les hits à enregistrer quand une fiche est servie : ses fichiers existants, frais si leur hash n'a pas changé ; `only` limite aux chemins donnés (extrait d'un agent). */
+export function servedFiles(graph: Graph, f: Feature, par: string, only?: string[]): CacheHit[] {
   const out: CacheHit[] = []
+  const keep = only ? new Set(only) : undefined
   for (const ff of f.fichiers) {
+    if (keep && !keep.has(ff.p)) continue
     const n = graph.fichiers[ff.p]
     if (n) out.push({ p: ff.p, tok: n.tok, feature: f.id, frais: sameHash(n.h, ff.h), par })
   }
   return out
 }
+
+/** Les hits d'un extrait de fiche : seulement les fichiers `paths` (ceux que rend extractFiles). */
+export const servedSubset = (graph: Graph, f: Feature, paths: string[], par: string): CacheHit[] => servedFiles(graph, f, par, paths)
 
 type Gains = { evites: number; servis: number; net: number; lus: number; completude: number; byFeature: Map<string, number>; feats: string[]; hits: CacheHit[] }
 
@@ -1505,14 +1570,24 @@ function featureHeader(f: Feature, fr: Freshness, prefix = '## Fiche'): string {
   return `${prefix} ${name} (confiance ${c}, apprise le ${dateFr(f.appris.le)} ${sourceLabel(f.source)}${model}) · ${freshWord(fr)}`
 }
 
+/** Que faire d'une fiche partiellement périmée, une fois les fichiers modifiés relus (rafraichir, apprendre ou diff). */
+const CONSIGNE_PARTIELLE =
+  'Après relecture : si la fiche reste juste pour ces fichiers, action rafraichir (feature, fichiers = ceux relus) ; si elle est fausse, action apprendre avec corrections (et flux/pieges corrigés). Action diff (feature ou chemin) pour voir ce qui a changé sans tout relire.'
+/** Que faire d'une fiche très périmée. */
+const CONSIGNE_PERIMEE = 'Relis les fichiers (ou action diff) puis action apprendre pour la réécrire.'
+
 /** Le corps d'une fiche selon sa fraîcheur (§3.3) : flux masqué au-delà de 50 % de tokens modifiés. */
 function featureBody(graph: Graph, f: Feature, fr: Freshness): string[] {
   const L: string[] = []
   const changed = new Set(fr.perimes)
   if (fr.niveau === 'perimee') {
     L.push(`⚠ Fiche très périmée (${pct(fr.ratio)} des tokens modifiés depuis l'apprentissage) : résumé et flux masqués, tout est à revérifier dans le code.`)
+    L.push(CONSIGNE_PERIMEE)
   } else {
-    if (fr.niveau === 'partielle') L.push(`⚠ Modifiés depuis l'apprentissage : ${fr.perimes.join(', ')} : relis ces fichiers avant de te fier au flux.`)
+    if (fr.niveau === 'partielle') {
+      L.push(`⚠ Modifiés depuis l'apprentissage : ${fr.perimes.join(', ')} : relis ces fichiers avant de te fier au flux.`)
+      L.push(CONSIGNE_PARTIELLE)
+    }
     L.push(f.resume ? `Résumé : ${f.resume}` : 'Fiche automatique : pas de résumé, seulement les fichiers vus pendant un flow.')
     if (f.flux.length) {
       L.push('Flux :')
@@ -1565,11 +1640,188 @@ export function briefText(graph: Graph, feature: Feature | undefined, max = 1200
   ]
   const tail = [
     'Le cache est une carte, pas la vérité : vérifie dans le code tout ce que tu affirmes ou modifies.',
-    'Outil mcp__revo-flow__cache : chercher (mots-clés), feature (id), voisins (chemin : ce qu’il utilise, qui l’utilise), apprendre (en fin de flow).',
+    'Outil mcp__revo-flow__cache : chercher (mots-clés), feature (id), voisins (chemin : ce qu’il utilise, qui l’utilise), diff (feature ou chemin : ce qui a changé depuis l’apprentissage), rafraichir (fiche encore juste après relecture), apprendre (en fin de flow, ou fiche fausse).',
   ]
   if (!feature) return capLines(head, max, tail)
   const fr = freshness(graph, feature)
   return capLines([...head, featureHeader(feature, fr, '## Fiche probable :'), ...featureBody(graph, feature, fr)], max, tail)
+}
+
+// ── Extrait de fiche pour un sous-agent ──────────────────────────────────
+
+/** Les noms trop génériques pour désigner un fichier (nom de base ou export) dans un prompt. */
+const GENERIC = new Set(['index', 'main', 'default', 'types', 'type', 'utils', 'util', 'config', 'test', 'tests', 'setup', 'helpers'])
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+/** Fichiers de rôle central gardés quand rien ne correspond à la mission, et plafond des fichiers retenus par mission. */
+const EXTRACT_FALLBACK = 10
+const EXTRACT_MAX = 15
+
+/** Le texte de la mission d'un agent : son prompt et ses tâches (jamais d'exception sur une entrée bizarre). */
+function missionText(agent: AgentInfo): string {
+  const tasks = Array.isArray(agent?.tasks) ? agent.tasks.map(t => String(t ?? '')) : []
+  return [typeof agent?.prompt === 'string' ? agent.prompt : '', ...tasks].join('\n')
+}
+
+/** Les fichiers de la fiche que la mission cite : par chemin, par nom de base ou par export (casse ignorée, mots entiers ou slug). */
+function mentioned(graph: Graph, f: Feature, text: string): string[] {
+  const hay = text.toLowerCase().replace(/\\/g, '/')
+  // Les jetons qui sont des chemins (avec « / ») ne désignent que le fichier entier : leur dernier mot n'est pas une citation d'un autre fichier du même nom de base.
+  const pathRe = /[^\s'"`()<>,;:]*\/[^\s'"`()<>,;:]+/g
+  const tokens = (hay.match(pathRe) ?? []).map(t => t.replace(/^(\.\/)+/, ''))
+  const plain = hay.replace(pathRe, ' ')
+  const slugHay = `-${slug(plain)}-`
+  const word = (t: string) => {
+    if (t.length < 4 || GENERIC.has(t.toLowerCase())) return false
+    if (new RegExp(`(?<![\\w$])${escapeRe(t.toLowerCase())}(?![\\w$])`).test(plain)) return true
+    const sl = slug(t)
+    return sl.length >= 4 && slugHay.includes(`-${sl}-`)
+  }
+  const out: string[] = []
+  for (const ff of f.fichiers) {
+    const p = ff.p.toLowerCase()
+    const byPath = hay.includes(p) || tokens.some(t => p.endsWith(`/${t}`))
+    if (byPath || [baseName(ff.p), ...(graph.fichiers[ff.p]?.exp ?? [])].some(word)) out.push(ff.p)
+  }
+  return out
+}
+
+/** Les chemins de la fiche à montrer à cet agent : ceux que sa mission cite, sinon les fichiers entree, coeur et donnees (10 au plus). */
+export function extractFiles(graph: Graph, f: Feature, agent: AgentInfo): string[] {
+  try {
+    const cited = mentioned(graph, f, missionText(agent)).slice(0, EXTRACT_MAX)
+    if (cited.length) return cited
+    return f.fichiers.filter(x => x.role === 'entree' || x.role === 'coeur' || x.role === 'donnees').slice(0, EXTRACT_FALLBACK).map(x => x.p)
+  } catch {
+    return []
+  }
+}
+
+/**
+ * L'extrait de fiche ajouté au prompt d'un sous-agent (≤ max tokens, 600 par défaut) : en-tête, fichiers qui concernent sa mission (taille, ⚠ modifié, ✕ supprimé),
+ * pièges rattachés à ces fichiers (et 3 pièges sans fichier), résumé si la fiche n'est pas très périmée et s'il reste du budget, ligne d'outil.
+ */
+export function agentExtract(graph: Graph, f: Feature, agent: AgentInfo, max = 600): string {
+  const fr = freshness(graph, f)
+  const paths = extractFiles(graph, f, agent)
+  const set = new Set(paths)
+  const changed = new Set(fr.perimes)
+  const name = f.titre && f.titre !== f.id ? `${f.id} : ${f.titre}` : f.id
+  const L = [`# Cache revo-flow — fiche « ${name} » (${freshWord(fr)}, confiance ${conf(fr.confiance)})`]
+  for (const ff of f.fichiers) {
+    if (!set.has(ff.p)) continue
+    const n = graph.fichiers[ff.p]
+    const mark = !n ? ' ✕ supprimé' : changed.has(ff.p) ? " ⚠ modifié depuis l'apprentissage" : ''
+    L.push(`- ${ff.p} · ${ff.role}${n ? ` · ${fmt(n.tok)}` : ''}${mark}`)
+  }
+  const pieges = [...f.pieges.filter(x => x.p && set.has(x.p)), ...f.pieges.filter(x => !x.p).slice(0, 3)]
+  if (pieges.length) {
+    L.push('Pièges :')
+    for (const x of pieges) L.push(`- ${x.txt}${x.p ? ` (${x.p})` : ''}`)
+  }
+  const tail = [
+    'Outil mcp__revo-flow__cache : feature « ' + f.id + ' » pour la fiche entière, voisins (chemin), diff (fichier modifié), rafraichir ou apprendre après relecture d’un fichier ⚠.',
+  ]
+  if (fr.niveau !== 'perimee' && f.resume) {
+    const resume = `Résumé : ${f.resume}`
+    if (tokensOf([...L, resume, ...tail].join('\n')) <= max) L.push(resume)
+  }
+  return capLines(L, max, tail)
+}
+
+// ── Diff depuis l'apprentissage ──────────────────────────────────────────
+
+/** Budget de la réponse de l'action « diff », et plancher par fichier. */
+const DIFF_MAX = 2500
+const DIFF_MIN_FILE = 200
+const DIFF_LINE = 240
+
+/** Une ligne de diff coupée si elle est démesurée (fichier minifié). */
+const diffLine = (l: string) => (l.length > DIFF_LINE ? `${l.slice(0, DIFF_LINE)}…` : l)
+
+/** Les lignes ajoutées et retirées d'un diff unifié (hors en-têtes ---/+++ éventuels). */
+function diffCounts(lines: string[]): { plus: number; minus: number } {
+  let plus = 0
+  let minus = 0
+  for (const l of lines) {
+    if (l.startsWith('+') && !l.startsWith('+++')) plus++
+    else if (l.startsWith('-') && !l.startsWith('---')) minus++
+  }
+  return { plus, minus }
+}
+
+/** Découpe un diff en hunks (chacun commence à « @@ ») ; ce qui précède le premier « @@ » rejoint le premier hunk. */
+function hunksOf(lines: string[]): string[][] {
+  const hunks: string[][] = []
+  for (const l of lines) {
+    if (l.startsWith('@@') || hunks.length === 0) hunks.push([l])
+    else hunks[hunks.length - 1]!.push(l)
+  }
+  return hunks
+}
+
+/** Le diff d'un fichier coupé au budget : hunks entiers tant que ça tient (au moins le début du premier), puis « … (tronqué, n lignes de plus) ». */
+function clipDiff(lines: string[], budget: number): string[] {
+  const hunks = hunksOf(lines)
+  const out: string[] = []
+  let used = 0
+  const cost = (l: string) => tokensOf(l) + 1
+  for (const h of hunks) {
+    const size = h.reduce((s, l) => s + cost(l), 0)
+    if (used + size <= budget) {
+      out.push(...h)
+      used += size
+      continue
+    }
+    if (out.length === 0) {
+      for (const l of h) {
+        if (used + cost(l) > budget) break
+        out.push(l)
+        used += cost(l)
+      }
+    }
+    break
+  }
+  const rest = lines.length - out.length
+  if (rest > 0) out.push(`… (tronqué, ${plural(rest, 'ligne')} de plus)`)
+  return out
+}
+
+/**
+ * La réponse de l'action « diff » (≤ 2 500 tokens) : en-tête avec la date et le commit de l'apprentissage, puis par fichier « ### p (+n/-m lignes) » et son diff.
+ * Le budget est partagé entre les fichiers ; chaque diff garde ses hunks entiers tant que sa part le permet. diff undefined : « diff indisponible ».
+ */
+export function diffText(graph: Graph, f: Feature | undefined, p: string | undefined, diffs: DiffEntry[]): string {
+  try {
+    const list = Array.isArray(diffs) ? diffs : []
+    const what = f ? `de « ${f.id} » (le ${dateFr(f.appris.le)}, commit ${f.appris.commit.slice(0, 8) || '?'})` : p ? `de ${clip(p, 120)}` : ''
+    const head = `Diff depuis l'apprentissage ${what}`.trim()
+    if (!list.length) return `${head} : aucun fichier modifié, rien à comparer.`
+    const L: string[] = [head]
+    let used = tokensOf(head)
+    for (let i = 0; i < list.length; i++) {
+      const d = list[i]
+      const left = list.length - i
+      const budget = Math.min(DIFF_MAX - used, Math.max(DIFF_MIN_FILE, Math.floor((DIFF_MAX - used) / left)))
+      if (budget < 30) {
+        L.push(`… et ${plural(left, 'fichier')} de plus (budget atteint) : action diff avec un chemin pour chacun.`)
+        break
+      }
+      const lines = typeof d?.diff === 'string' ? d.diff.split(/\r?\n/).filter((l, k, arr) => l !== '' || k < arr.length - 1).map(diffLine) : undefined
+      const name = clip(d?.p, 200) || '?'
+      const block: string[] = []
+      if (lines === undefined) block.push(`### ${name}`, 'diff indisponible (blob absent) : relis le fichier.')
+      else if (!lines.length) block.push(`### ${name}`, 'aucune différence.')
+      else {
+        const { plus, minus } = diffCounts(lines)
+        block.push(`### ${name} (+${plus}/-${minus} lignes)`, ...clipDiff(lines, budget - 15))
+      }
+      L.push(...block)
+      used += tokensOf(block.join('\n')) + 1
+    }
+    return capLines(L, DIFF_MAX)
+  } catch {
+    return 'Diff indisponible : relis les fichiers modifiés.'
+  }
 }
 
 /** Réponse de l'action « chercher » : 5 features et 8 fichiers, une ligne chacun. */

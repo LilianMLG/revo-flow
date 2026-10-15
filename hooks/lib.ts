@@ -113,11 +113,26 @@ export function matchAgent(agents: readonly FlowAgent[], description: string, na
   )
 }
 
+/**
+ * L'agent du plan que nomme `text` (sa clé ou son nom ; guillemets, accents et casse ignorés), hors `self`, ou rien.
+ * Sert à l'outil step quand un agent dit qui il attend.
+ */
+export function findAgent(agents: readonly FlowAgent[], text: string, self?: string): FlowAgent | undefined {
+  const s = slug(text)
+  if (!s) return undefined
+  const others = agents.filter(a => a.key !== self)
+  return (
+    others.find(a => a.key === s || slug(a.name) === s) ??
+    others.find(a => s.includes(a.key) || (s.length >= 3 && a.key.includes(s)))
+  )
+}
+
 // ── Les tâches d'un agent ────────────────────────────────────────────────
 
 /**
  * L'agent signale une tâche (numérotée à partir de 1) : « en_cours » la démarre et clôt les précédentes,
- * « fait » la termine, « echec » la marque en échec.
+ * « fait » la termine, « echec » la marque en échec. « attente » vaut « en_cours » pour la tâche : l'attente
+ * est portée par l'agent (waitingFor), pas par la tâche.
  */
 export function applyStep(tasks: readonly FlowTask[], n: number, statut: string): FlowTask[] | undefined {
   const i = Math.round(n) - 1
@@ -139,6 +154,11 @@ export function applyTodos(tasks: readonly FlowTask[], todos: unknown): FlowTask
     const s = (todos[i] as { status?: unknown } | undefined)?.status
     return s === 'completed' || s === 'in_progress' || s === 'pending' ? { ...t, status: s } : t
   })
+}
+
+/** L'agent s'arrête pour attendre un autre agent : sa tâche en cours repart en attente de lancement (pending). */
+export function pauseTasks(tasks: readonly FlowTask[]): FlowTask[] {
+  return tasks.map(t => (t.status === 'in_progress' ? { ...t, status: 'pending' as const } : t))
 }
 
 /** L'agent a fini : tout est fait ; s'il a échoué, la tâche en cours (ou la première restante) passe en échec. */
@@ -221,8 +241,12 @@ export function flowPercent(flow: Flow): number {
   return Math.min(99, Math.round(10 + part * 85 + (flow.phase === 'review' ? 3 : 0)))
 }
 
-/** Tous les agents prévus ont fini (ou échoué). */
-export const allFinished = (flow: Flow) => flow.agents.length > 0 && flow.agents.every(a => a.status === 'done' || a.status === 'failed')
+/**
+ * Tous les agents prévus ont fini, échoué, ou attendent un autre agent qui ne viendra pas les relancer
+ * (blocked compte comme fini : sinon un flow dont l'agent attendu a échoué ne se terminerait jamais).
+ */
+export const allFinished = (flow: Flow) =>
+  flow.agents.length > 0 && flow.agents.every(a => a.status === 'done' || a.status === 'failed' || a.status === 'blocked')
 
 // ── Les consignes ────────────────────────────────────────────────────────
 
@@ -235,8 +259,8 @@ export function leadBrief(withCache: boolean): string {
   return `# revo-flow — tu es l'orchestrateur de cette demande
 1. Plan : ${cache(`commence par le cache revo-flow ci-dessous s'il y en a un (ou l'outil ${CACHE_TOOL} : chercher, feature, voisins). S'il connaît la feature, fie-toi à sa fiche pour comprendre le flux et ne lis que les fichiers à modifier et ceux signalés « modifiés depuis l'apprentissage ». Le cache est une carte, pas la vérité : vérifie dans le code tout ce que tu vas affirmer ou changer. Lis ensuite `)}${withCache ? 'toi-même' : 'lis toi-même'} la demande et les specs utiles (fichiers, code existant, tickets cités), seulement le nécessaire, sans rien modifier et sans lancer de sous-agent (revo-flow refuse tout agent avant le plan). Établis le plan.
 2. Équipe : appelle UNE fois l'outil ${PLAN_TOOL} avec le titre de la feature, le résumé du plan et les sous-agents nécessaires (1 à 6, pas plus que le travail ne le demande). Pour chacun : un nom court et unique, son rôle, le type d'agent (general-purpose par défaut, Explore pour de la lecture seule), le modèle le plus fiable pour SES tâches (haiku : mécanique et localisé ; sonnet : la plupart des features et correctifs ; opus : transverse, ambigu, délicat, sécurité) avec l'effort adapté (low, medium, high, xhigh), et la liste ordonnée de SES tâches (2 à 10, titres courts à l'infinitif) avec leur type (analyse, codage, test, review, doc, deploy). Découpe pour que les agents avancent en parallèle sans modifier les mêmes fichiers.
-3. Exécution : lance ensuite chaque sous-agent avec l'outil Agent : description = son nom exact, prompt = sa mission avec tout le contexte utile (fichiers, conventions, contraintes, ce que les autres font)${cache(", dont l'extrait de fiche du cache qui le concerne (fichiers, rôles, pièges) : il ne doit pas réexplorer ce que le cache sait déjà")}. Lance-les dans un même message quand ils sont indépendants. revo-flow applique son modèle et son effort et lui transmet sa liste de tâches : ne la recopie pas.
-4. Fin : quand tous ont fini, vérifie l'ensemble (tests et lint ciblés), corrige si besoin${cache(`, puis appelle ${CACHE_TOOL} action « apprendre » pour chaque feature touchée : feature (identifiant court), titre, alias, resume, flux, entrees, fichiers et leur rôle, pièges découverts, et corrections de ce que le cache disait de faux (revo-flow écrit sinon une fiche minimale à partir des fichiers lus et modifiés pendant le flow)`)}. Conclus par une synthèse courte.
+3. Exécution : lance ensuite chaque sous-agent avec l'outil Agent : description = son nom exact, prompt = sa mission avec tout le contexte utile (fichiers, conventions, contraintes, ce que les autres font)${cache(`. revo-flow ajoute lui-même à chaque agent l'extrait de fiche du cache qui le concerne (fichiers, rôles, pièges) et l'agent a l'outil ${CACHE_TOOL} : ajoute seulement ce qui manque (pièges transverses, décisions prises) pour qu'il ne réexplore pas ce que le cache sait déjà`)}. Lance-les dans un même message quand ils sont indépendants. revo-flow applique son modèle et son effort et lui transmet sa liste de tâches : ne la recopie pas.
+4. Fin : quand tous ont fini, vérifie l'ensemble (tests et lint ciblés), corrige si besoin${cache(`, puis appelle ${CACHE_TOOL} action « apprendre » pour chaque feature touchée : feature (identifiant court), titre, alias, resume, flux, entrees, fichiers et leur rôle, pièges découverts, et corrections de ce que le cache disait de faux (revo-flow écrit sinon une fiche minimale à partir des fichiers lus et modifiés pendant le flow) ; une fiche seulement périmée qui reste juste après relecture : action « rafraichir » (feature, fichiers relus) suffit`)}. Conclus par une synthèse courte.
 Ne fais pas toi-même les tâches confiées aux sous-agents. Pas de commit, de push ni de MR sans que l'utilisateur le demande.`
 }
 
@@ -276,7 +300,8 @@ export function flowRecap(flow: Flow, cache?: string | false): string {
   const rows = flow.agents.map(a => {
     const left = remainingTasks(a)
     const todo = left.length ? `reste : ${left.map(t => t.title).join(' ; ')}` : 'plus rien à faire'
-    return `- « ${a.name} » (${MODELS[a.model].label}, effort ${a.effort}) [${a.status}] — ${todo}`
+    const state = a.status === 'blocked' ? `en attente de « ${a.waitingFor?.name ?? '?'} »` : a.status
+    return `- « ${a.name} » (${MODELS[a.model].label}, effort ${a.effort}) [${state}] — ${todo}`
   })
   return [
     cache === false ? leadBrief(false) : LEAD_BRIEF,
@@ -297,12 +322,20 @@ export function planQuestion(plan: PlanInput): string {
   return [`Plan « ${plan.title} » : ${plan.agents.length} agent${plan.agents.length > 1 ? 's' : ''}.`, ...rows, 'Lancer ce plan ?'].join('\n')
 }
 
-/** Ajouté au prompt du sous-agent : ses tâches, comment les signaler et, avec le cache, l'outil voisins. */
-export function agentBrief(a: FlowAgent, withCache = true): string {
+/** Le paragraphe du cache dans les consignes d'un sous-agent (seulement avec le cache). */
+const AGENT_CACHE = `Cache revo-flow (outil ${CACHE_TOOL}) : avant d'explorer, action chercher avec les mots-clés de tes tâches, puis feature si une fiche ressort ; voisins avant un grep « qui utilise X ».
+Une fiche ou un extrait marqué ⚠ liste les fichiers modifiés depuis l'apprentissage : action diff pour voir ce qui a changé, relis ce qu'il faut, puis rafraichir (feature, fichiers relus) si la fiche reste juste, ou apprendre avec corrections si elle est fausse.
+Le cache est une carte, pas la vérité : vérifie dans le code ce que tu modifies.`
+
+/**
+ * Ajouté au prompt du sous-agent : ses tâches, comment les signaler et, avec le cache, comment s'en servir (chercher, feature, voisins, diff, rafraichir).
+ * `others` : les noms des autres agents du plan, ceux qu'il peut attendre (statut attente).
+ */
+export function agentBrief(a: FlowAgent, withCache = true, others: readonly string[] = []): string {
   return `# Tes tâches (revo-flow) — « ${a.name} »${a.role ? ` : ${a.role}` : ''}
 ${a.tasks.map((t, i) => `${i + 1}. ${t.title}`).join('\n')}
-${withCache ? `\nAvant un grep « qui utilise X », essaie ${CACHE_TOOL} action voisins.\n` : ''}
-Suivi : fais ces tâches dans l'ordre. Au début de chacune, appelle l'outil ${STEP_TOOL} avec {"tache": <numéro>, "statut": "en_cours"} ; quand elle est finie, {"tache": <numéro>, "statut": "fait"} (ou "echec" si tu ne peux pas la faire, en expliquant pourquoi dans ta réponse). C'est ce qui fait avancer ta barre de progression ; n'utilise cet outil pour rien d'autre.`
+${withCache ? `\n${AGENT_CACHE}\n` : ''}
+Suivi : fais ces tâches dans l'ordre. Au début de chacune, appelle l'outil ${STEP_TOOL} avec {"tache": <numéro>, "statut": "en_cours"} ; ensuite, pour la même tâche, "statut" vaut "fait" quand elle est finie ; "attente" avec "attend" = le nom de l'agent du plan dont tu dépends si la tâche ne peut pas avancer tant qu'il n'a pas fini (termine alors ta réponse en disant ce qui manque : revo-flow te relancera quand il aura fini) ; "echec" seulement pour ce que tu ne peux pas faire du tout, en expliquant pourquoi dans ta réponse. C'est ce qui fait avancer ta barre de progression ; n'utilise cet outil pour rien d'autre.${others.length ? `\nLes autres agents du plan (à nommer dans "attend") : ${others.map(n => `« ${n} »`).join(', ')}.` : ''}`
 }
 
 // ── Tokens, jour et semaine ──────────────────────────────────────────────
