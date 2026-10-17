@@ -23,7 +23,11 @@ claude plugin install revo-flow@revo-flow
 
 Dans les deux cas, le mod est ensuite chargé dans chaque nouvelle session, en terminal comme dans l'app desktop.
 
-**Mise à jour :**
+**Mise à jour automatique (recommandé) :** dans Claude Code, `/plugin` → **Marketplaces** → **revo-flow** → **Enable auto-update**. Au lancement de chaque session, Claude Code récupère alors la dernière version publiée du mod, sans commande à taper ; **Disable auto-update** au même endroit l'arrête. Les marketplaces tiers sont désactivés par défaut, d'où ce réglage à faire une fois.
+
+Une nouvelle version n'est détectée que si `version` change dans `.claude-plugin/plugin.json` : chaque modification publiée sur `main` monte ce numéro. Si l'option n'apparaît pas, c'est que les mises à jour automatiques de Claude Code sont coupées sur ce poste (`DISABLE_AUTOUPDATER`) ; `FORCE_AUTOUPDATE_PLUGINS=1` les rétablit pour les plugins seuls.
+
+**Mise à jour à la main :**
 
 ```
 claude plugin marketplace update revo-flow
@@ -38,7 +42,7 @@ claude plugin update revo-flow@revo-flow
 
 1. **Analyse** : le modèle de la session lit la demande et les specs. Le panneau affiche « En attente du plan d'exécution ».
 2. **Plan** : il décide combien de sous-agents il faut (1 à 6), le modèle (Haiku, Sonnet, Opus) et l'effort de chacun, et la liste des tâches de chacun.
-3. **Validation** : le plan s'affiche (agents, modèles, efforts, nombre de tâches) et attend **Lancer** ou **Annuler**, dans le dialogue ou avec les boutons du panneau. Aucun agent ne part avant. Annuler renvoie l'orchestrateur à la planification.
+3. **Validation** : le plan s'affiche (agents, modèles, efforts, nombre de tâches) et attend **Lancer** ou **Annuler**, dans le dialogue ou avec les boutons du panneau. Le dialogue montre le plan complet en markdown dans un aperçu à côté des deux choix : chaque agent, son rôle, la raison de son modèle et ses tâches numérotées. Le même plan est écrit dans `~/.claude/revo-flow/plans/<titre>.md`, que le bouton **plan.md** du panneau ouvre dans l'application par défaut. Aucun agent ne part avant. Annuler renvoie l'orchestrateur à la planification.
 4. **Exécution** : les agents sont lancés. revo-flow ajoute au prompt de chacun sa liste de tâches, la façon de les signaler et, avec le cache, l'extrait de la fiche servie qui le concerne. Chacun a sa barre de progression, de sa couleur, avec « n/total » et la tâche en cours. Un agent qui dépend du travail d'un autre signale une **attente** (« Attend « Y » » dans le panneau, ni fini ni en échec) et termine son tour ; quand Y a fini, revo-flow demande à l'orchestrateur de le relancer pour ses tâches restantes. Si Y a échoué, n'est pas du plan ou l'attend lui-même, l'orchestrateur est prévenu et décide. Un Agent lancé hors du plan n'est pas suivi.
 5. **Fin** : l'orchestrateur vérifie le tout et fait la synthèse. Une notification donne la durée, le coût et le nombre de fichiers.
 
@@ -56,7 +60,7 @@ Sans `/revo-flow`, le mod ne fait rien.
 | `/revo-flow cache clear [feature]` | supprime le graphe du projet, ou une seule fiche, après confirmation |
 | `/revo-flow cache <mot-clé>` | cherche dans le graphe (3 mots au plus) ; alias sans ambiguïté : `/revo-flow graphe …` |
 
-**Boutons du panneau** : **Lancer** / **Annuler** (validation du plan), **Arrêter** sur chaque agent en cours, **Tout arrêter**, et **Relancer** sur un agent en échec ou en attente (« Attend « Y » ») : il repart de ses tâches non terminées et l'orchestrateur le relance. Un agent en attente est aussi relancé tout seul dès que l'agent qu'il attend a fini. Le panneau s'adapte aussi au mobile.
+**Boutons du panneau** : **Lancer** / **Annuler** / **plan.md** (validation du plan), **Arrêter** sur chaque agent en cours, **Tout arrêter**, et **Relancer** sur un agent en échec ou en attente (« Attend « Y » ») : il repart de ses tâches non terminées et l'orchestrateur le relance. Un agent en attente est aussi relancé tout seul dès que l'agent qu'il attend a fini. Le panneau s'adapte aussi au mobile.
 
 **Tokens et contexte** : en terminal, la ligne de fin de tour (« Baked for… ») devient `⏱ durée · tokens in · out · cache API · coût · modèle` (et `cache n hits ≈ -18k` quand le cache projet a servi). La barre au-dessus du prompt ajoute une 2e ligne avec le dernier prompt et `ctx n %`, et le panneau a une jauge de contexte. Après une compaction, le rôle d'orchestrateur et l'état des agents sont réinjectés.
 

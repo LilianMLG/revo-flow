@@ -68,6 +68,8 @@ export type PaneActions = {
   retryAgent(key: string): unknown
   approvePlan(): unknown
   cancelPlan(): unknown
+  /** Ouvre le plan en .md dans l'application par défaut du système. */
+  openPlan(): unknown
   toggleCache(): unknown
 }
 
@@ -524,6 +526,7 @@ export function DesktopPane(t: Elements['desktop'], d: ViewData, actions: PaneAc
             <Box flexDirection="row" gap={2}>
               <Button key="approve" label="Lancer" onPress={() => actions.approvePlan()} />
               <Button key="cancel" plain label="Annuler" onPress={() => actions.cancelPlan()} />
+              {flow.planFile && <Button key="plan-file" plain label="plan.md" onPress={() => actions.openPlan()} />}
             </Box>
           </Box>
         )}
@@ -909,6 +912,7 @@ export function TerminalPane(t: Elements['terminal'], d: ViewData, actions: Pane
           <Box gap={2} paddingLeft={2}>
             <Button key="approve" label="Lancer" onPress={() => actions.approvePlan()} />
             <Button key="cancel" plain label="Annuler" onPress={() => actions.cancelPlan()} />
+            {flow.planFile && <Button key="plan-file" plain label="plan.md" onPress={() => actions.openPlan()} />}
           </Box>
         </Box>
       )}

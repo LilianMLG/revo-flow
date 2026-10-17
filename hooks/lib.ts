@@ -322,6 +322,34 @@ export function planQuestion(plan: PlanInput): string {
   return [`Plan « ${plan.title} » : ${plan.agents.length} agent${plan.agents.length > 1 ? 's' : ''}.`, ...rows, 'Lancer ce plan ?'].join('\n')
 }
 
+/** Ce que le fichier plan.md ajoute à l'aperçu : la demande, le projet et l'heure. */
+export type PlanMeta = { request?: string; project?: string; branch?: string; date?: string }
+
+/**
+ * Le plan en markdown : l'aperçu du dialogue de validation (sans meta) et le fichier plan.md (avec).
+ * Pas de tableau : l'aperçu du terminal est une colonne étroite, en police fixe.
+ */
+export function planMarkdown(plan: PlanInput, meta?: PlanMeta): string {
+  const tasks = plan.agents.reduce((n, a) => n + a.tasks.length, 0)
+  const out = [`# ${plan.title}`, '']
+  if (meta) {
+    const where = [meta.project, meta.branch].filter(Boolean).join(' · ')
+    if (meta.request) out.push(`**Demande** : ${meta.request}  `)
+    if (where) out.push(`**Projet** : ${where}  `)
+    if (meta.date) out.push(`**Posé le** : ${meta.date}  `)
+    out.push('')
+  }
+  if (plan.summary) out.push(plan.summary, '')
+  out.push(`**${plan.agents.length} agent${plan.agents.length > 1 ? 's' : ''} · ${tasks} tâche${tasks > 1 ? 's' : ''}**`, '')
+  for (const [i, a] of plan.agents.entries()) {
+    out.push(`## ${i + 1}. ${a.name}`, '', `${MODELS[a.model].label} · effort ${a.effort} · ${a.subagentType}`, '')
+    if (a.role) out.push(`*${a.role}*`, '')
+    if (a.why) out.push(`> ${a.why}`, '')
+    out.push(...a.tasks.map((t, j) => `${j + 1}. ${t.title} \`${t.kind}\``), '')
+  }
+  return out.join('\n').trimEnd() + '\n'
+}
+
 /** Le paragraphe du cache dans les consignes d'un sous-agent (seulement avec le cache). */
 const AGENT_CACHE = `Cache revo-flow (outil ${CACHE_TOOL}) : avant d'explorer, action chercher avec les mots-clés de tes tâches, puis feature si une fiche ressort ; voisins avant un grep « qui utilise X ».
 Une fiche ou un extrait marqué ⚠ liste les fichiers modifiés depuis l'apprentissage : action diff pour voir ce qui a changé, relis ce qu'il faut, puis rafraichir (feature, fichiers relus) si la fiche reste juste, ou apprendre avec corrections si elle est fausse.

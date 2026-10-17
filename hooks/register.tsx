@@ -36,6 +36,7 @@ import {
   isOutdated,
   listGraphs,
   loadGraph,
+  normalizePath,
   refreshGraph,
   resolveProject,
   saveGraph,
@@ -72,6 +73,7 @@ import {
   matchAgent,
   modelLabel,
   parsePlan,
+  planMarkdown,
   planQuestion,
   progress,
   remainingTasks,
@@ -127,6 +129,8 @@ let leadTurnId: string | undefined
 let pendingDecision: ((d: Decision) => void) | undefined
 /** La réponse à la validation du plan ; note = ce que l'utilisateur a tapé à la place d'un choix. */
 type Decision = { isLaunched: boolean; note?: string }
+/** Le dialogue de validation ouvert : sa question, et le plan en markdown à montrer en aperçu à côté des choix. */
+let pendingPreview: { question: string; markdown: string } | undefined
 /** La vérification périodique de l'état des agents tourne-t-elle déjà (une par chargement du module) ? */
 let isWatching = false
 
@@ -1158,6 +1162,7 @@ function paneActions($: $): PaneActions {
     retryAgent: key => retryAgent($, key),
     approvePlan: () => approvePlan($),
     cancelPlan: () => cancelPlan($),
+    openPlan: () => openPlan($),
     toggleCache: () => update($, cacheOpenA, v => !v),
   }
 }
@@ -1374,14 +1379,42 @@ function decide($: $, plan: PlanInput): Promise<Decision> {
       if (isSettled) return
       isSettled = true
       if (pendingDecision === settle) pendingDecision = undefined
+      if (pendingPreview?.question === question) pendingPreview = undefined
       resolve(d)
     }
+    const question = planQuestion(plan)
     pendingDecision = settle
-    $.ui.ask(planQuestion(plan), { options: ['Lancer', 'Annuler'], header: 'revo-flow' }).then(
+    pendingPreview = { question, markdown: planMarkdown(plan) }
+    $.ui.ask(question, { options: ['Lancer', 'Annuler'], header: PLUGIN }).then(
       answer => settle(answer === 'Lancer' ? { isLaunched: true } : answer === 'Annuler' ? { isLaunched: false } : { isLaunched: false, note: answer }),
       () => settle({ isLaunched: true }),
     )
   })
+}
+
+/** Le plan en markdown, à côté des graphes : ~/.claude/revo-flow/plans/<titre>.md, réécrit à chaque nouveau plan. */
+async function writePlanFile($: $, plan: PlanInput, flow: Flow): Promise<string | undefined> {
+  const home = await ioOf($).home()
+  if (!home) return undefined
+  const d = new Date(await $.clock.now())
+  const p = (n: number) => String(n).padStart(2, '0')
+  const date = `${dayKey(d)} ${p(d.getHours())}:${p(d.getMinutes())}`
+  const path = `${normalizePath(home)}/.claude/revo-flow/plans/${slug(plan.title) || 'plan'}.md`
+  await $.fs.write(path, planMarkdown(plan, { request: flow.request, project: flow.project, branch: flow.branch, date }))
+  return path
+}
+
+/** Bouton « plan.md » : ouvre le fichier du plan dans l'application par défaut du système ; sinon, un toast donne son chemin. */
+async function openPlan($: $) {
+  const file = (await read($, flowA))?.planFile
+  if (!file) return
+  const isWindows = Boolean(await $.env.get('USERPROFILE').catch(() => undefined))
+  const tries = isWindows ? [['cmd', '/c', 'start', '', file.replace(/\//g, '\\')]] : [['open', file], ['xdg-open', file]]
+  for (const argv of tries) {
+    const r = await $.process.run(argv, { timeoutMs: 5000 }).catch(() => undefined)
+    if (r?.exitCode === 0) return
+  }
+  $.ui.toast(`revo-flow : le plan est dans ${file}`)
 }
 
 function statusText(flow: Flow | null) {
@@ -1701,12 +1734,15 @@ export const register: Register = (on, options) => {
     if ('error' in parsed) return { deny: `Plan refusé : ${parsed.error}` }
     const { plan } = parsed
     claimed.clear()
+    // Le plan en .md : un fichier à garder ou à rouvrir (bouton « plan.md » du panneau) ; il ne bloque jamais le plan.
+    const planFile = await writePlanFile($, plan, flow).catch(() => undefined)
     await setFlow($, f => ({
       ...f,
       title: plan.title,
       summary: plan.summary,
       phase: 'dispatch',
       isApproved: !opts.validerPlan,
+      planFile,
       agents: plan.agents.map(a => ({ ...a, status: 'waiting' as const, tokens: EMPTY, costUsd: 0 })),
     }))
     if (opts.validerPlan) {
@@ -1719,6 +1755,16 @@ export const register: Register = (on, options) => {
     }
     return { result: dispatchText(plan) as never }
   }).catch(() => ({ deny: 'revo-flow : le plan n’a pas pu être enregistré, réessaie.' }))
+
+  // Le dialogue de validation du plan : le plan en markdown s'affiche en aperçu à côté de « Lancer » et « Annuler ».
+  // $.ui.ask passe par l'outil AskUserQuestion, que ce hook voit (seul le hook qui pose la question est sauté).
+  on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
+    const preview = pendingPreview
+    const input = e as unknown as { questions?: { question?: string; header?: string; options?: { label: string }[] }[] }
+    const q = input.questions?.length === 1 ? input.questions[0] : undefined
+    if (!preview || !q || q.header !== PLUGIN || q.question !== preview.question) return next(e)
+    return next({ ...e, questions: [{ ...q, options: (q.options ?? []).map(o => ({ ...o, preview: preview.markdown })) }] } as typeof e)
+  }).catch(($, e, next) => next(e))
 
   // Un sous-agent signale une tâche : sa barre avance. « attente » note qui il attend (waitingFor) ; tout autre
   // statut retire l'attente : l'agent a repris.

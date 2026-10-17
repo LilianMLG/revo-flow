@@ -15,12 +15,13 @@ import {
   matchAgent,
   parsePlan,
   pauseTasks,
+  planMarkdown,
   planQuestion,
   progress,
   remainingTasks,
 } from './lib'
 import type { Flow, FlowAgent } from '../types'
-import { MACOS, WINDOWS, diskKey, native, type Os } from './test-os'
+import { MACOS, OSES, WINDOWS, diskKey, native, type Os } from './test-os'
 
 const rootOf = (os: Os) => native(os, 'Documents', 'Front', 'ui-vel')
 const ROOT = rootOf(WINDOWS)
@@ -63,7 +64,9 @@ function world(on: On, os: Os = WINDOWS) {
   const tracked: Record<string, string> = {}
   // git diff <blob> <blob> (action diff du cache) : la sortie que le test décide, et les appels reçus.
   const gitDiff = { out: '', calls: [] as string[][] }
+  const runs: string[][] = []
   on('process.run', (_$, e) => {
+    runs.push([...e.argv])
     const out = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     if (e.argv.includes('--unified=3')) {
       gitDiff.calls.push([...e.argv])
@@ -162,7 +165,7 @@ function world(on: On, os: Os = WINDOWS) {
   on('turn.complete', () => ({ text: '' }))
   // Ce que l'engine dessinerait sans le mod : une boîte vide.
   on('ui.render', (hook$, e) => h(hook$.ui.resolve(e).Box as never, {}) as never)
-  return { clock, sent, opened, prompts, status, ctl, asked, notified, stopped, toasts, aborted, registered, disk, states, tracked, gitDiff }
+  return { clock, sent, opened, prompts, status, ctl, asked, notified, stopped, toasts, aborted, registered, disk, states, tracked, gitDiff, runs }
 }
 
 const run = async ($: Engine, args: string) => (await $.command.run({ command: 'revo-flow', args } as never)).text ?? ''
@@ -368,6 +371,61 @@ test('plan validé (« Lancer ») : le dialogue décrit le plan, puis agent.spaw
   expect(r.deny).toBeUndefined()
   expect(r.model).toBe('claude-sonnet-5-5')
 })
+
+test('dialogue de validation : le plan en markdown est en aperçu sur « Lancer » et « Annuler »', async ($, on) => {
+  const w = world(on)
+  await launch($, w)
+  await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN } as never)
+  const q = (JSON.parse(w.asked[0]!) as { questions: { header: string; options: { label: string; preview?: string }[] }[] }).questions[0]!
+  expect(q.header).toBe('revo-flow')
+  expect(q.options.map(o => o.label)).toEqual(['Lancer', 'Annuler'])
+  for (const o of q.options) {
+    expect(o.preview).toMatch(/^# Code promo panier\n/)
+    expect(o.preview).toMatch(/## 1\. Front panier\n\nSonnet 5\.5 · effort medium · general-purpose/)
+    expect(o.preview).toMatch(/## 2\. API promo/)
+    expect(o.preview).toMatch(/2\. Ajouter le champ `codage`/)
+  }
+})
+
+test('une autre question de revo-flow (stop) n’a pas d’aperçu', async ($, on) => {
+  const w = world(on)
+  await launch($, w)
+  await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN } as never)
+  await spawn($, 'Front panier')
+  w.ctl.answer = 'Garder les agents'
+  await run($, 'stop')
+  expect(w.asked.length).toBe(2)
+  expect(w.asked[1]!).not.toMatch(/preview/)
+})
+
+for (const os of OSES) {
+  test(`plan.md (${os.nom}) : écrit dans ~/.claude/revo-flow/plans, le bouton du panneau l’ouvre`, async ($, on) => {
+    const w = world(on, os)
+    w.ctl.answer = undefined
+    await launch($, w)
+    const planned = $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN } as never)
+    await w.clock.settle()
+    const md = w.disk['/Users/x/.claude/revo-flow/plans/code-promo-panier.md']
+    expect(md).toBeDefined()
+    expect(md!).toMatch(/^# Code promo panier\n/)
+    expect(md!).toMatch(/\*\*Demande\*\* : ajoute un code promo dans le panier/)
+    expect(md!).toMatch(/\*\*Projet\*\* : ui-vel · feat\/promo/)
+    for (const surface of ['terminal', 'desktop'] as const) {
+      w.runs.length = 0
+      const ui = await $.ui.mount({ plugin: 'revo-flow', surface, component: 'Pane', requestId: 'revo-flow', props: { bodyColumns: 100 } as never } as never)
+      await ui.press({ key: 'plan-file' })
+      await ui.unmount()
+      const opener = w.runs.find(r => r[0] === 'open' || r[0] === 'cmd')
+      expect(opener).toEqual(
+        os === WINDOWS
+          ? ['cmd', '/c', 'start', '', 'C:\\Users\\x\\.claude\\revo-flow\\plans\\code-promo-panier.md']
+          : ['open', '/Users/x/.claude/revo-flow/plans/code-promo-panier.md'],
+      )
+    }
+    w.ctl.pending!('Lancer')
+    await planned
+  })
+}
 
 test('plan en attente de validation : agent.spawn refusé tant que l’utilisateur n’a pas répondu', async ($, on) => {
   const w = world(on)
@@ -1010,6 +1068,18 @@ test('planQuestion : titre, une ligne par agent, question finale', () => {
   expect(q).toMatch(/• Front panier — Sonnet 5\.5, effort medium, 3 tâches/)
   expect(q).toMatch(/• API promo — Opus 5\.5, effort high, 7 tâches/)
   expect(q.endsWith('Lancer ce plan ?')).toBe(true)
+})
+
+test('planMarkdown : titre, résumé, un chapitre par agent ; la meta seulement pour le fichier', () => {
+  const parsed = parsePlan(PLAN as never)
+  if (!('plan' in parsed)) throw new Error('plan invalide')
+  const preview = planMarkdown(parsed.plan)
+  expect(preview).toMatch(/^# Code promo panier\n\nUn champ code promo dans le panier, validé côté GraphQL\.\n\n\*\*2 agents · 10 tâches\*\*/)
+  expect(preview).toMatch(/\*Champ et affichage\*/)
+  expect(preview).toMatch(/7\. Synthèse `\w+`\n$/)
+  expect(preview).not.toMatch(/Demande/)
+  const file = planMarkdown(parsed.plan, { request: 'la demande', project: 'ui-vel', branch: 'main', date: '2026-10-17 09:00' })
+  expect(file).toMatch(/\*\*Demande\*\* : la demande {2}\n\*\*Projet\*\* : ui-vel · main {2}\n\*\*Posé le\*\* : 2026-10-17 09:00/)
 })
 
 test('flowRecap : rôle d’orchestrateur, phase, et ce qui reste à chaque agent', () => {

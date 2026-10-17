@@ -77,6 +77,8 @@ export type Flow = {
   endedAt?: number
   /** Le plan a été validé (ou n'avait pas à l'être) : en dispatch sans cela, il attend l'utilisateur. */
   isApproved?: boolean
+  /** Le plan en markdown sur le disque (~/.claude/revo-flow/plans/<titre>.md), une fois posé. */
+  planFile?: string
 }
 
 /** L'orchestrateur : le fil principal, sur le modèle de la session. */
