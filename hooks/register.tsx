@@ -100,7 +100,7 @@ import {
   pixels,
   type PaneActions,
   type ViewData,
-} from './views'
+} from './ui/views'
 
 type $ = EngineInterface
 

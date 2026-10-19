@@ -1,8 +1,8 @@
 /** Les vues du mod : panneau et bande, en terminal, desktop et mobile. */
 import type { Elements } from 'claude-code'
 
-import type { CacheStats } from '../types/cache'
-import type { Context, Entry, Flow, FlowAgent, FlowTask, Lead, LastTurn, Limit, Tally, Tokens } from '../types'
+import type { CacheStats } from '../../types/cache'
+import type { Context, Entry, Flow, FlowAgent, FlowTask, Lead, LastTurn, Limit, Tally, Tokens } from '../../types'
 import {
   AGENT_COLORS,
   PALETTE,
@@ -40,7 +40,7 @@ import {
   total,
   usagePercents,
   type Progress,
-} from './lib'
+} from '../lib'
 
 /** Tout ce que les vues ont besoin de savoir : de la donnée simple, aucun appel à `$`. */
 export type ViewData = {

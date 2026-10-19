@@ -3,10 +3,10 @@ import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import type { Feature, Graph } from '../../types/cache'
-import { diffSince, graphFileName, mergeGraphs, normalizePath, parseLsFiles, parseNameStatus, parseStatus, refreshGraph, stripDiffHeader } from './store'
-import type { Io } from './store'
-import { MECA_FORMAT, hashPath } from './graph'
-import { OSES, diskKey, native, type Os } from '../test-os'
+import { diffSince, graphFileName, mergeGraphs, normalizePath, parseLsFiles, parseNameStatus, parseStatus, refreshGraph, stripDiffHeader } from '../../hooks/cache/store'
+import type { Io } from '../../hooks/cache/store'
+import { MECA_FORMAT, hashPath } from '../../hooks/cache/graph'
+import { OSES, diskKey, native, type Os } from '../helpers/os'
 
 const DOCS = 'C:/Users/x/Documents'
 const NOW = Date.UTC(2026, 9, 14, 9)

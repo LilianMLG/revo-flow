@@ -1,5 +1,5 @@
 // Les deux machines que les tests du cache simulent, quelle que soit celle qui les lance.
-import { normalizePath } from './cache/store'
+import { normalizePath } from '../../hooks/cache/store'
 
 export type Os = {
   nom: string

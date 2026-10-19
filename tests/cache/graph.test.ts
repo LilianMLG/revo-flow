@@ -39,7 +39,7 @@ import {
   coldRank,
   headSummary,
   keywordsOf,
-} from './graph'
+} from '../../hooks/cache/graph'
 import type { Feature, FlowCache, Graph, LearnContext, SourceFile } from '../../types/cache'
 
 // ── Mini projet Nuxt 3 ───────────────────────────────────────────────────

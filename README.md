@@ -112,3 +112,32 @@ Sur l'app desktop, `/revo-flow` n'apparaît pas toujours dans le menu `/` : tape
 claude plugin validate .
 claude plugin test .
 ```
+
+Les tests vivent dans `tests/`, à la racine, en miroir de `hooks/` : c'est ce que prévoit le `tsconfig.json` que Claude Code écrit pour le mod (`hooks`, `types`, `tests`).
+
+### Arborescence
+
+```
+revo-flow/
+├── .claude-plugin/
+│   ├── plugin.json        manifeste (version, options)
+│   ├── marketplace.json   pour /plugin install
+│   └── types/             écrit par Claude Code au chargement (ignoré par git)
+├── hooks/                 le code du mod, chargé par le moteur
+│   ├── hooks.json         désigne le module d'entrée
+│   ├── register.tsx       entrée : commande /revo-flow, outils plan, step et cache, suivi des agents
+│   ├── lib.ts             logique pure du flow : plan, tâches, progression, consignes, coûts
+│   ├── ui/
+│   │   ├── views.tsx      panneau et bande (terminal, desktop, mobile)
+│   │   └── art.ts         les dessins SVG
+│   └── cache/
+│       ├── graph.ts       graphe du cache, module pur
+│       └── store.ts       disque et git du cache
+├── tests/                 lancés par claude plugin test .
+│   ├── flow.test.ts
+│   ├── cache/             graph.test.ts, store.test.ts
+│   └── helpers/os.ts      les deux machines simulées (Windows, macOS)
+├── types/                 contrats : état du mod (index.d.ts), graphe du cache (cache.d.ts)
+├── docs/rd-graphe-cache/  conception et R&D du cache
+└── tsconfig.json
+```

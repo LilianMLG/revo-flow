@@ -19,9 +19,9 @@ import {
   planQuestion,
   progress,
   remainingTasks,
-} from './lib'
+} from '../hooks/lib'
 import type { Flow, FlowAgent } from '../types'
-import { MACOS, OSES, WINDOWS, diskKey, native, type Os } from './test-os'
+import { MACOS, OSES, WINDOWS, diskKey, native, type Os } from './helpers/os'
 
 const rootOf = (os: Os) => native(os, 'Documents', 'Front', 'ui-vel')
 const ROOT = rootOf(WINDOWS)

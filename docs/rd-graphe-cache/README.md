@@ -67,11 +67,11 @@ Les imports explicites ne suffisent pas : auto-imports Nuxt (140 dans reservatio
 
 ## Implémentation (v1.2.0)
 
-- `hooks/cache/graph.ts` : module pur (modèle, indexeur, fraîcheur, recherche, apprentissage, stats, textes) ; tests dans `graph.test.ts`. Mesuré : 65 Ko et 163 ms pour reservation-tool, 95 Ko et 193 ms pour ui-vel.
-- `hooks/cache/store.ts` : fichier `~/.claude/revo-flow/graphs/<cle>.json`, git (ls-files, status, hash-object, log, diff -M), écriture atomique et fusion par feature, rafraîchissement incrémental ; tests dans `store.test.ts`.
+- `hooks/cache/graph.ts` : module pur (modèle, indexeur, fraîcheur, recherche, apprentissage, stats, textes) ; tests dans `tests/cache/graph.test.ts`. Mesuré : 65 Ko et 163 ms pour reservation-tool, 95 Ko et 193 ms pour ui-vel.
+- `hooks/cache/store.ts` : fichier `~/.claude/revo-flow/graphs/<cle>.json`, git (ls-files, status, hash-object, log, diff -M), écriture atomique et fusion par feature, rafraîchissement incrémental ; tests dans `tests/cache/store.test.ts`.
 - `hooks/register.tsx` : outil `mcp__revo-flow__cache`, commande `cache`/`graphe`, brief au lancement avec confirmation, mesure des tokens lus et servis, fiche auto en fin de flow, agent `revo-flow:cache-indexer` pour `cache build`.
 - `hooks/lib.ts` : `LEAD_BRIEF`, `agentBrief` et `flowRecap` adaptés.
-- `hooks/views.tsx`, `hooks/art.ts` : section « Cache », ligne de bande, segment de fin de tour.
+- `hooks/ui/views.tsx`, `hooks/ui/art.ts` : section « Cache », ligne de bande, segment de fin de tour.
 - `types/cache.d.ts` : contrat du graphe (recopié en partie dans `types/index.d.ts`, qui doit rester autonome).
 
 ## Décisions (2026-10-14)
