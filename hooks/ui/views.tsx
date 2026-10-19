@@ -157,6 +157,33 @@ const typeCounts = (c: CacheStats) =>
     .map(([k, n]) => `${TYPE_LABEL[k] ?? k} ${n}`)
     .join(' · ')
 
+/**
+ * La mesure tirée du journal des flows, en une ligne : tokens lus en moyenne par flow sans cache, avec cache sans fiche, avec fiche
+ * (n flows entre parenthèses), seulement les groupes non vides ; undefined sans aucun flow mesuré.
+ */
+export function measureLine(c: CacheStats, compact = false): string | undefined {
+  const m = c.mesure
+  if (!m) return undefined
+  const groups: [string, string, { flows: number; lus: number }][] = [
+    ['sans cache', 'sans', m.sans],
+    ['sans fiche', 's. fiche', m.sansFiche],
+    ['avec fiche', 'fiche', m.avecFiche],
+  ]
+  const parts = groups.filter(([, , g]) => g.flows > 0).map(([long, short, g]) => `${compact ? short : long} ${fmt(g.lus)} (${g.flows})`)
+  return parts.length ? `${compact ? 'Lus/flow' : 'Lus par flow'} : ${parts.join(' · ')}` : undefined
+}
+
+/** La feature qui gagne le plus entre ses flows sans fiche et ses flows avec fiche (mesure.parFeature) ; undefined sans comparaison. */
+export function bestFeatureLine(c: CacheStats, compact = false): string | undefined {
+  const drop = (x: CacheStats['mesure']['parFeature'][number]) => (x.avant.lus > 0 ? 1 - x.apres.lus / x.avant.lus : 0)
+  const best = [...(c.mesure?.parFeature ?? [])].sort((a, b) => drop(b) - drop(a))[0]
+  if (!best) return undefined
+  const pct = Math.round(drop(best) * 100)
+  const delta = pct ? ` (${pct > 0 ? '−' : '+'}${Math.abs(pct)} %)` : ''
+  const flows = compact ? '' : ` · ${best.avant.flows} → ${best.apres.flows} flows`
+  return `« ${best.id} » : ${fmt(best.avant.lus)} → ${fmt(best.apres.lus)} lus/flow${delta}${flows}`
+}
+
 /** Les morceaux de la ligne de cache : le texte, les tokens évités (pour les colorer) et le nombre de périmés. */
 function cacheParts(d: ViewData, columns = 100): { text: string; saved?: string; stale: number } | undefined {
   const c = d.cache
@@ -642,6 +669,8 @@ export function DesktopPane(t: Elements['desktop'], d: ViewData, actions: PaneAc
           const limit = inner < 360 ? 5 : 8
           const shown = shownNodes(c, limit)
           const types = typeCounts(c)
+          const measure = measureLine(c, inner < 360)
+          const best = bestFeatureLine(c, inner < 360)
           return (
             <Box key="cache" flexDirection="column" gap={1} width="100%">
               <Box flexDirection="row" alignItems="center" gap={1}>
@@ -656,6 +685,8 @@ export function DesktopPane(t: Elements['desktop'], d: ViewData, actions: PaneAc
                     width={inner}
                   />
                   {types ? <Text color={PALETTE.muted} wrap="truncate-end">{types}</Text> : null}
+                  {measure ? <Text color={PALETTE.muted} wrap="truncate-end">{measure}</Text> : null}
+                  {best ? <Text color={PALETTE.muted} wrap="truncate-end">{best}</Text> : null}
                   {shown.map(n => {
                     const color = hitColor(d, n.hit)
                     return (
@@ -834,6 +865,8 @@ export function TerminalPane(t: Elements['terminal'], d: ViewData, actions: Pane
     const types = typeCounts(c)
     const share = cacheShare(c)
     const gain = c.flow.evites > 0 || c.flow.lus > 0
+    const measure = measureLine(c)
+    const best = bestFeatureLine(c)
     return (
       <Box key="cache" flexDirection="column">
         <Box justifyContent="space-between">
@@ -841,6 +874,8 @@ export function TerminalPane(t: Elements['terminal'], d: ViewData, actions: Pane
           <Text dimColor wrap="truncate-end">{`${plural(nodes, 'nœud')}${c.perimees > 0 ? ` · ${c.perimees} périmé${c.perimees > 1 ? 's' : ''}` : ''}`}</Text>
         </Box>
         {d.cacheOpen && types ? <Text dimColor wrap="truncate-end">{`  ${types}`}</Text> : null}
+        {d.cacheOpen && measure ? <Text dimColor wrap="truncate-end">{`  ${measure}`}</Text> : null}
+        {d.cacheOpen && best ? <Text dimColor wrap="truncate-end">{`  ${best}`}</Text> : null}
         {d.cacheOpen &&
           shown.map(n => {
             const warn = n.niveau !== 'fraiche'

@@ -7,6 +7,7 @@ import {
   agentBrief,
   allFinished,
   applyStep,
+  bashReadFile,
   findAgent,
   finishTasks,
   flowRecap,
@@ -20,7 +21,9 @@ import {
   progress,
   remainingTasks,
 } from '../hooks/lib'
+import { bestFeatureLine, measureLine } from '../hooks/ui/views'
 import type { Flow, FlowAgent } from '../types'
+import type { CacheStats } from '../types/cache'
 import { MACOS, OSES, WINDOWS, diskKey, native, type Os } from './helpers/os'
 
 const rootOf = (os: Os) => native(os, 'Documents', 'Front', 'ui-vel')
@@ -132,7 +135,16 @@ function world(on: On, os: Os = WINDOWS) {
       })
     }
     if (e.tool === 'TaskStop') stopped.push(String((e as unknown as { task_id?: string }).task_id))
-    return { result: {} as never }
+    // La sortie de l'outil telle que le modèle la lit (Grep, Glob, Bash) : celle que le test passe dans `sortie`.
+    const sortie = (e as unknown as { sortie?: unknown }).sortie
+    return { result: {} as never, ...(typeof sortie === 'string' ? { text: sortie } : {}) }
+  })
+  // $.model.complete (Haiku tranche la zone grise) : la réponse que le test décide ; sans réponse, pas de texte.
+  const haiku = { reply: undefined as string | undefined, prompts: [] as string[] }
+  on('model.complete', (_$, e) => {
+    haiku.prompts.push(e.prompt)
+    const usage = { input_tokens: 100, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+    return { value: haiku.reply === undefined ? { isAnswered: false, reason: 'empty-reply', usage } : { isAnswered: true, text: haiku.reply, usage } } as never
   })
   on('ui.notify', (_$, e) => {
     notified.push(e.text)
@@ -198,6 +210,7 @@ function world(on: On, os: Os = WINDOWS) {
     states,
     tracked,
     gitDiff,
+    haiku,
     runs,
     surfaces,
     statuses,
@@ -960,7 +973,23 @@ for (const os of [WINDOWS, MACOS]) {
       // Hors flow (un agent inconnu) : rien n'est compté.
       await $.tool.call({ tool: 'Read', file_path: native(os, 'Documents', 'Front', 'ui-vel', 'components', 'Basket.vue'), agentId: 'inconnu', tool_use_id: 'r2' } as never)
       await w.clock.settle()
-      expect(flowCacheOf(w)?.lus).toEqual([{ p: 'components/Basket.vue', tok: 120, par: 'front-panier' }])
+      // Un Read partiel : 9 tokens par ligne.
+      expect(flowCacheOf(w)?.lus).toEqual([{ p: 'components/Basket.vue', tok: 360, par: 'front-panier' }])
+    })
+
+    test('mesure : Grep et Glob comptent dans outils, une lecture Bash d’un fichier dans lus, toute autre commande Bash est ignorée', async ($, on) => {
+      const w = world(on, os)
+      const { front } = await twoRunning($, w)
+      await $.tool.call({ tool: 'Grep', pattern: 'promo', agentId: front, tool_use_id: 'g1', sortie: 'x'.repeat(400) } as never)
+      await $.tool.call({ tool: 'Glob', pattern: '**/*.vue', agentId: front, tool_use_id: 'g2', sortie: 'y'.repeat(80) } as never)
+      await $.tool.call({ tool: 'Bash', command: 'sed -n 1,20p components/Promo.vue', agentId: front, tool_use_id: 'b1', sortie: 'z'.repeat(200) } as never)
+      await $.tool.call({ tool: 'Bash', command: 'cat components/Basket.vue | grep promo', agentId: front, tool_use_id: 'b2', sortie: 'w'.repeat(200) } as never)
+      await $.tool.call({ tool: 'Bash', command: 'npm test', agentId: front, tool_use_id: 'b3', sortie: 'v'.repeat(4000) } as never)
+      await w.clock.settle()
+      const fc = w.states.flowCache as { cache: boolean; lus: unknown[]; outils?: number }
+      expect(fc.cache).toBe(true)
+      expect(fc.outils).toBe(120)
+      expect(fc.lus).toEqual([{ p: 'components/Promo.vue', tok: 50, par: 'front-panier', via: 'bash' }])
     })
 
     test('outil cache : une erreur revient en texte, jamais en exception', async ($, on) => {
@@ -1029,11 +1058,102 @@ for (const os of [WINDOWS, MACOS]) {
       w.status[api] = 'completed'
       await w.clock.advance(3000)
       await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' } as never)
-      expect(w.notified.join('\n')).toMatch(/« Code promo panier » terminé .* fiche auto « panier »/)
+      expect(w.notified.join('\n')).toMatch(/« Code promo panier » terminé .* fiche auto « panier » \(rattachée\)/)
       const saved = Object.values(w.disk).find(t => t.includes('"panier"') && t.includes('"features"'))!
-      const graph = JSON.parse(saved) as { features: Record<string, { fichiers: { p: string; role: string }[]; usages: { servie: number } }> }
+      const graph = JSON.parse(saved) as {
+        features: Record<string, { fichiers: { p: string; role: string }[]; usages: { servie: number } }>
+        journal?: { cache: boolean; feature?: string; appris?: string[]; lus: number }[]
+      }
       expect(graph.features.panier!.fichiers.map(f => `${f.p}:${f.role}`)).toEqual(['components/Basket.vue:coeur', 'components/Promo.vue:peripherique'])
       expect(graph.features.panier!.usages.servie).toBe(1)
+      // La mesure : une entrée au journal du graphe (cache actif, fiche servie, fiche apprise), plus de baseline à part.
+      expect(graph.journal).toEqual([expect.objectContaining({ cache: true, feature: 'panier', appris: ['panier'], lus: 90 })])
+    })
+
+    test('fin de flow sans fiche servie : fichiers non rattachés, la fiche auto est un brouillon, inscrit au journal', async ($, on) => {
+      const w = world(on, os)
+      seedProject(w, os)
+      await launch($, w)
+      await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN } as never)
+      const front = (await spawn($, 'Front panier')).agentId!
+      const api = (await spawn($, 'API promo')).agentId!
+      await $.tool.call({ tool: 'Read', file_path: native(os, 'Documents', 'Front', 'ui-vel', 'components', 'Promo.vue'), agentId: front, tool_use_id: 'r1' } as never)
+      await w.clock.settle()
+      w.status[front] = 'completed'
+      w.status[api] = 'completed'
+      await w.clock.advance(3000)
+      await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' } as never)
+      expect(w.notified.join('\n')).toMatch(/brouillon « code-promo-panier »/)
+      const graph = savedGraph(w) as unknown as { features: Record<string, { brouillon?: unknown }>; journal?: { cache: boolean; appris?: string[] }[] }
+      expect(graph.features['code-promo-panier']?.brouillon).toBeDefined()
+      expect(graph.journal).toEqual([expect.objectContaining({ cache: true, appris: ['code-promo-panier'] })])
+    })
+
+    test('L17 : un Edit pendant le flow fait revérifier le graphe au prochain appel, sans attendre 30 s', async ($, on) => {
+      const w = world(on, os)
+      seedProject(w, os)
+      const { front } = await twoRunning($, w)
+      await cacheCall($, { action: 'chercher', requete: 'panier' })
+      const lsFiles = () => w.runs.filter(a => a.includes('ls-files')).length
+      const before = lsFiles()
+      await cacheCall($, { action: 'chercher', requete: 'promo' })
+      expect(lsFiles()).toBe(before)
+      await $.tool.call({ tool: 'Edit', file_path: native(os, 'Documents', 'Front', 'ui-vel', 'components', 'Promo.vue'), agentId: front, tool_use_id: 'e1' } as never)
+      await cacheCall($, { action: 'chercher', requete: 'promo' })
+      expect(lsFiles()).toBeGreaterThan(before)
+    })
+
+    test('outil cache : chercher et voisins créditent les fichiers listés, à poids réduit', async ($, on) => {
+      const w = world(on, os)
+      seedProject(w, os)
+      await launch($, w)
+      await cacheCall($, { action: 'chercher', requete: 'promo' })
+      await cacheCall($, { action: 'voisins', chemin: 'components/Basket.vue' })
+      const fc = w.states.flowCache as { servis: { p: string; par: string; poids?: number }[] }
+      expect(fc.servis.some(h => h.p === 'components/Promo.vue' && h.par === 'lead' && h.poids !== undefined && h.poids < 1)).toBe(true)
+    })
+
+    test('zone grise : Haiku tranche, la confirmation dit « proposée par Haiku »', async ($, on) => {
+      const w = world(on, os)
+      seedProject(w, os)
+      // Une fiche que la demande touche à peine (« validation ») : ni nette, ni absente.
+      await cacheCall($, { action: 'apprendre', feature: 'reduction', titre: 'Remises', alias: ['remise', 'validation'], fichiers: [{ p: 'components/Promo.vue', role: 'coeur' }] })
+      await cacheCall($, { action: 'apprendre', feature: 'paiement', titre: 'Paiement', alias: ['carte'], fichiers: [{ p: 'components/Basket.vue', role: 'coeur' }] })
+      w.haiku.reply = 'reduction'
+      w.ctl.answer = 'Utiliser'
+      await launch($, w)
+      expect(w.haiku.prompts.length).toBe(1)
+      expect(w.haiku.prompts[0]).toMatch(/- reduction · Remises/)
+      expect(w.asked[0]).toMatch(/« Remises » \(proposée par Haiku\)/)
+      expect((w.states.flowCache as { feature?: string }).feature).toBe('reduction')
+    })
+
+    test('zone grise : Haiku répond « aucune », aucune question, aucune fiche', async ($, on) => {
+      const w = world(on, os)
+      seedProject(w, os)
+      await cacheCall($, { action: 'apprendre', feature: 'reduction', titre: 'Remises', alias: ['remise', 'validation'], fichiers: [{ p: 'components/Promo.vue', role: 'coeur' }] })
+      await cacheCall($, { action: 'apprendre', feature: 'paiement', titre: 'Paiement', alias: ['carte'], fichiers: [{ p: 'components/Basket.vue', role: 'coeur' }] })
+      w.haiku.reply = 'aucune'
+      await launch($, w)
+      expect(w.haiku.prompts.length).toBe(1)
+      expect(w.asked.filter(q => /Je pense qu’il s’agit/.test(q))).toEqual([])
+      expect((w.states.flowCache as { feature?: string }).feature).toBeUndefined()
+    })
+
+    test('cache désactivé : le flow entre quand même au journal d’un graphe existant (population « sans cache »)', { options: { cache: false } }, async ($, on) => {
+      const w = world(on, os)
+      seedProject(w, os)
+      // Le graphe existe déjà (construit par /revo-flow cache) ; le flow ne le construit pas.
+      await run($, 'cache')
+      const { front, api } = await twoRunning($, w)
+      await $.tool.call({ tool: 'Read', file_path: native(os, 'Documents', 'Front', 'ui-vel', 'components', 'Promo.vue'), limit: 10, agentId: front, tool_use_id: 'r1' } as never)
+      await w.clock.settle()
+      w.status[front] = 'completed'
+      w.status[api] = 'completed'
+      await w.clock.advance(3000)
+      await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' } as never)
+      const graph = JSON.parse(Object.entries(w.disk).find(([k, t]) => k.endsWith('.json') && t.includes('"journal"'))![1]) as { journal: { cache: boolean; lus: number }[] }
+      expect(graph.journal).toEqual([expect.objectContaining({ cache: false, lus: 90 })])
     })
 
     test('brief : « Ignorer » ne sert pas la fiche, le brief court part quand même', async ($, on) => {
@@ -1360,4 +1480,48 @@ test('flowRecap : rôle d’orchestrateur, phase, et ce qui reste à chaque agen
   expect(r).toMatch(/« Front panier » \(Sonnet 5\.5, effort medium\) \[running\] — reste : Coder/)
   expect(r).toMatch(/« API promo » .* plus rien à faire/)
   expect(flowRecap({ ...flow, agents: [], summary: '' })).toMatch(/Aucun agent prévu/)
+})
+
+test('bashReadFile : le fichier d’une lecture simple (cat, sed -n, head, tail), rien pour le reste', () => {
+  expect(bashReadFile('cat components/Basket.vue')).toBe('components/Basket.vue')
+  expect(bashReadFile('cat -n "dossier avec espace/a.ts"')).toBe('dossier avec espace/a.ts')
+  expect(bashReadFile("sed -n '10,40p' hooks/lib.ts")).toBe('hooks/lib.ts')
+  expect(bashReadFile('head -n 50 README.md')).toBe('README.md')
+  expect(bashReadFile('head -50 README.md')).toBe('README.md')
+  expect(bashReadFile('tail -n 20 hooks/register.tsx')).toBe('hooks/register.tsx')
+  // Tube, enchaînement, redirection, substitution, glob, plusieurs fichiers, sed sans -n, autre commande : non attribuable.
+  expect(bashReadFile('cat a.ts | grep x')).toBeUndefined()
+  expect(bashReadFile('cat a.ts && cat b.ts')).toBeUndefined()
+  expect(bashReadFile('cat a.ts; ls')).toBeUndefined()
+  expect(bashReadFile('cat a.ts > b.ts')).toBeUndefined()
+  expect(bashReadFile('cat $HOME/a.ts')).toBeUndefined()
+  expect(bashReadFile('cat *.ts')).toBeUndefined()
+  expect(bashReadFile('cat a.ts b.ts')).toBeUndefined()
+  expect(bashReadFile("sed 's/a/b/' a.ts")).toBeUndefined()
+  expect(bashReadFile('sed -i -n 1p a.ts')).toBeUndefined()
+  expect(bashReadFile('grep -n x a.ts')).toBeUndefined()
+  expect(bashReadFile('')).toBeUndefined()
+})
+
+test('vues, mesure du cache : lus par flow des groupes non vides, et la feature qui gagne le plus', () => {
+  const pop = (flows: number, lus: number) => ({ flows, lus })
+  const stats = (mesure: CacheStats['mesure']) => ({ mesure }) as unknown as CacheStats
+  const vide = { sans: pop(0, 0), sansFiche: pop(0, 0), avecFiche: pop(0, 0), parFeature: [] }
+  expect(measureLine(stats(vide))).toBeUndefined()
+  expect(bestFeatureLine(stats(vide))).toBeUndefined()
+  const m = {
+    sans: pop(4, 12_000),
+    sansFiche: pop(0, 0),
+    avecFiche: pop(3, 5_000),
+    parFeature: [
+      { id: 'panier', avant: pop(2, 20_000), apres: pop(3, 6_000) },
+      { id: 'paiement', avant: pop(1, 10_000), apres: pop(1, 9_000) },
+    ],
+  }
+  const line = measureLine(stats(m))!
+  expect(line).toMatch(/^Lus par flow : sans cache .+ \(4\) · avec fiche .+ \(3\)$/)
+  expect(line).not.toMatch(/sans fiche/)
+  expect(measureLine(stats(m), true)).toMatch(/^Lus\/flow : sans .+ \(4\) · fiche .+ \(3\)$/)
+  expect(bestFeatureLine(stats(m))).toMatch(/^« panier » : .+ → .+ lus\/flow \(−70 %\) · 2 → 3 flows$/)
+  expect(bestFeatureLine(stats(m), true)).not.toMatch(/flows$/)
 })

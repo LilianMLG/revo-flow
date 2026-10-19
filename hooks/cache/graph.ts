@@ -19,6 +19,7 @@ import type {
   Freshness,
   Graph,
   GraphNode,
+  JournalEntry,
   LearnContext,
   LearnInput,
   LearnResult,
@@ -1206,6 +1207,11 @@ export function candidatesFromLog(log: string, graph: Graph): Candidate[] {
 
 const round2 = (x: number) => Math.round(x * 100) / 100
 
+/** Une fiche automatique non rattachée (autoFiche) : hors brief, hors correspondance, purgée après 10 flows sans usage, jusqu'à un apprendre. */
+export function isDraft(f: Feature | undefined): boolean {
+  return Boolean(f?.brouillon)
+}
+
 /**
  * Fraîcheur d'une fiche d'après les hash actuels : ratio = part des tokens de la fiche modifiés depuis l'apprentissage
  * (un fichier supprimé compte pour la taille moyenne des autres). < 50 % : partielle ; ≥ 50 % : périmée.
@@ -1241,7 +1247,49 @@ export function freshness(graph: Graph, f: Feature): Freshness {
   const all = total + gone * avg
   const ratio = all > 0 ? (changed + gone * avg) / all : perimes.length > nonVerifies.length ? 1 : 0
   const niveau: Freshness['niveau'] = perimes.length === 0 ? 'fraiche' : ratio < 0.5 ? 'partielle' : 'perimee'
-  return { niveau, ratio: round2(ratio), perimes, confiance: round2(f.confiance * (1 - ratio)), ...(nonVerifies.length ? { nonVerifies } : {}) }
+  let confiance = round2(f.confiance * (1 - ratio))
+  if (f.derive) {
+    const age = (Date.parse(f.derive.calcule) - Date.parse(f.appris.le)) / 86_400_000
+    confiance = confidenceDrift(confiance, { ageDays: Number.isFinite(age) ? age : 0, commits: Number(f.derive.commits) || 0 })
+  }
+  return { niveau, ratio: round2(ratio), perimes, confiance, ...(nonVerifies.length ? { nonVerifies } : {}) }
+}
+
+/** Décroissance (§3.9 (d)) : −10 % par tranche de 20 commits sur les voisins ; un mois de grâce, puis −5 % par mois entier ; jamais sous 0,3. */
+const DRIFT_COMMITS = 20
+const DRIFT_PAR_TRANCHE = 0.1
+const DRIFT_GRACE_JOURS = 30
+const DRIFT_PAR_MOIS = 0.05
+export const DRIFT_PLANCHER = 0.3
+
+/**
+ * La confiance après dérive : conf × f(âge) × g(commits). g = 1 − 0,1 par tranche entière de 20 commits sur les voisins à 1 saut hors fiche
+ * (une dépendance qui change de contrat, ce que les hash de la fiche ne voient pas) ; f = 1 pendant 30 jours, puis −0,05 par période entière
+ * de 30 jours (le code autour vieillit même sans commit visible sur les voisins). Plancher 0,3 : la dérive seule ne descend jamais sous 0,3,
+ * et une confiance déjà plus basse (fiche très périmée) n'est pas touchée.
+ */
+export function confidenceDrift(conf: number, d: { ageDays: number; commits: number }): number {
+  const c = Number.isFinite(conf) ? conf : 0
+  if (c <= DRIFT_PLANCHER) return round2(c)
+  const g = 1 - DRIFT_PAR_TRANCHE * Math.floor(Math.max(0, d?.commits || 0) / DRIFT_COMMITS)
+  const f = 1 - DRIFT_PAR_MOIS * Math.floor(Math.max(0, (d?.ageDays || 0) - DRIFT_GRACE_JOURS) / DRIFT_GRACE_JOURS)
+  return round2(Math.max(DRIFT_PLANCHER, c * Math.max(0, f) * Math.max(0, g)))
+}
+
+/** Les voisins à 1 saut des fichiers d'une fiche, hors fiche (fichiers du graphe, ni tests ni docs ; arêtes teste et documente ignorées), triés : ce que withDrift compte. */
+export function driftNeighbors(graph: Graph, f: Feature): string[] {
+  const own = new Set((f?.fichiers ?? []).map(x => x.p))
+  const rev = reverseIndex(graph)
+  const out = new Set<string>()
+  const keep = (t: string) => {
+    const n = graph.fichiers[t]
+    if (n && !own.has(t) && n.k !== 'test' && n.k !== 'doc') out.add(t)
+  }
+  for (const p of own) {
+    for (const [k, list] of Object.entries(graph.fichiers[p]?.out ?? {})) if (k !== 'teste' && k !== 'documente') for (const t of list ?? []) keep(t)
+    for (const [k, list] of rev.get(p) ?? []) if (k !== 'teste' && k !== 'documente') for (const t of list) keep(t)
+  }
+  return [...out].sort()
 }
 
 // ── Recherche (BM25 simplifié) ───────────────────────────────────────────
@@ -1352,11 +1400,71 @@ export function search(graph: Graph, query: string): { features: { id: string; s
 export const MATCH_MIN = 6
 export const MATCH_RATIO = 1.5
 
-/** La feature que vise la demande, seulement si elle ressort nettement (seuil absolu et avance sur la deuxième) ; une fiche sans fichier n'est jamais servie. */
+/** Score minimal d'une fiche pour ouvrir la zone grise (reranking par Haiku), et nombre de candidats envoyés au plus. */
+export const MATCH_GRIS = 2
+const CANDIDATS_MAX = 25
+
+/** Une fiche candidate à la correspondance : id, titre, alias et score BM25 de la demande. */
+export type MatchCandidate = { id: string; titre: string; alias: string[]; score: number }
+export type MatchZone = { zone: 'nette' | 'grise' | 'absente'; id?: string; score?: number; candidats: MatchCandidate[] }
+
+/**
+ * La zone de correspondance d'une demande (§3.5, §3.7) : nette = une fiche ressort (score ≥ MATCH_MIN et MATCH_RATIO fois la deuxième ; id renseigné) ;
+ * grise = aucune ne ressort mais au moins une a un score ≥ 2 ; absente sinon. candidats (nette et grise) : les fiches servables triées par score
+ * (puis usages), 25 au plus, y compris celles que BM25 ne voit pas (synonymes, français-anglais) : c'est ce que le reranking doit rattraper.
+ * Ni les brouillons ni les fiches sans fichier n'y figurent jamais.
+ */
+export function matchZone(graph: Graph, request: string): MatchZone {
+  const ok = (f: Feature | undefined): f is Feature => Boolean(f && f.fichiers.length && !isDraft(f))
+  const scored = scoreAll(graph, String(request ?? '')).filter(x => x.feature && ok(graph.features[x.key]))
+  const score = new Map(scored.map(x => [x.key, x.score]))
+  const candidats = () =>
+    Object.values(graph.features)
+      .filter(ok)
+      .map(f => ({ id: f.id, titre: f.titre, alias: f.alias, score: score.get(f.id) ?? 0 }))
+      .sort((a, b) => b.score - a.score || (graph.features[b.id]!.usages.servie - graph.features[a.id]!.usages.servie) || a.id.localeCompare(b.id))
+      .slice(0, CANDIDATS_MAX)
+  const [best, second] = scored
+  if (best && best.score >= MATCH_MIN && !(second && best.score < MATCH_RATIO * second.score)) return { zone: 'nette', id: best.key, score: best.score, candidats: candidats() }
+  if (best && best.score >= MATCH_GRIS) return { zone: 'grise', candidats: candidats() }
+  return { zone: 'absente', candidats: [] }
+}
+
+/** La feature que vise la demande, seulement si elle ressort nettement (zone nette de matchZone) ; ni brouillon, ni fiche sans fichier. */
 export function matchRequest(graph: Graph, request: string): { id: string; score: number } | undefined {
-  const [best, second] = scoreAll(graph, request).filter(x => x.feature && graph.features[x.key]?.fichiers.length)
-  if (!best || best.score < MATCH_MIN || (second && best.score < MATCH_RATIO * second.score)) return undefined
-  return { id: best.key, score: best.score }
+  const z = matchZone(graph, request)
+  return z.zone === 'nette' && z.id ? { id: z.id, score: z.score ?? 0 } : undefined
+}
+
+/** La consigne de reranking pour Haiku (zone grise) : la demande, une ligne par fiche (id · titre · alias), réponse = un id exact ou « aucune ». */
+export function rerankPrompt(request: string, candidats: MatchCandidate[]): string {
+  const list = (Array.isArray(candidats) ? candidats : []).map(c => {
+    const alias = (c.alias ?? []).slice(0, 6).join(', ')
+    return `- ${c.id}${c.titre && c.titre !== c.id ? ` · ${clip(c.titre, 80)}` : ''}${alias ? ` · ${clip(alias, 120)}` : ''}`
+  })
+  return [
+    'Tu relies une demande de développement à la fiche de feature du projet qu’elle concerne (les fiches décrivent des parties du code ; la demande peut mêler français et anglais, ou employer un synonyme).',
+    `Demande : « ${clip(request, 600)} »`,
+    'Fiches (id · titre · alias) :',
+    ...list,
+    'Réponds uniquement par l’id exact d’une fiche de la liste si la demande la concerne clairement, sinon par « aucune ». Aucun autre mot.',
+  ].join('\n')
+}
+
+/** L'id que rend Haiku, s'il désigne exactement un candidat (guillemets, ponctuation et casse ignorés ; un seul id cité dans une phrase) ; « aucune » ou autre chose : undefined. */
+export function parseRerank(text: string, candidats: MatchCandidate[]): string | undefined {
+  const ids = (Array.isArray(candidats) ? candidats : []).map(c => c.id).filter(Boolean)
+  const t = String(text ?? '')
+    .trim()
+    .replace(/^[\s"'`«»“”‘’*_-]+|[\s"'`«»“”‘’*_.!-]+$/g, '')
+    .toLowerCase()
+  if (!t || /^aucun/.test(t)) return undefined
+  const exact = ids.find(id => id.toLowerCase() === t)
+  if (exact) return exact
+  const cited = ids.filter(id => new RegExp(`(^|[^\\w-])${escapeRe(id.toLowerCase())}($|[^\\w-])`).test(t))
+  // Plusieurs ids cités (l'un préfixe de l'autre) : le plus long, s'il les contient tous ; sinon c'est ambigu.
+  const longest = cited.sort((a, b) => b.length - a.length)[0]
+  return longest && cited.every(id => longest.includes(id)) ? longest : undefined
 }
 
 // ── Voisins ──────────────────────────────────────────────────────────────
@@ -1461,7 +1569,9 @@ const byRole = (a: FeatureFile, b: FeatureFile) => ROLES.indexOf(a.role) - ROLES
 /**
  * Écrit ou complète une fiche. Les chemins de fichiers et de pièges inconnus de la couche mécanique sont rejetés (et renvoyés) ;
  * les entrées (routes, commandes, mutations…) sont du texte : gardées telles quelles, ramenées à la clé du graphe quand elles en désignent une.
- * Les hash de tous les fichiers de la fiche sont remis à jour et `perime` est vidé.
+ * Seuls les fichiers cités dans `input.fichiers` prennent le hash courant (L14) : ceux gardés de l'ancienne fiche gardent leur hash appris
+ * (h = '' compris), et restent dans `perime` s'ils ont changé ; un apprendre partiel ne masque donc pas un fichier que personne n'a relu.
+ * Un brouillon (autoFiche) devient une fiche normale ; la dérive (`derive`), relative à l'ancien apprentissage, est retirée.
  * Une fiche nouvelle sans aucun fichier valide est refusée (`refus`, graphe inchangé) ; une fiche existante restée sans fichier est écrite avec un `avertissement`.
  */
 export function learn(graph: Graph, input: LearnInput, ctx: LearnContext): LearnResult {
@@ -1475,13 +1585,20 @@ export function learn(graph: Graph, input: LearnInput, ctx: LearnContext): Learn
   }
 
   const files = new Map<string, FileRole>()
-  for (const ff of old?.fichiers ?? []) if (graph.fichiers[ff.p]) files.set(ff.p, ff.role)
+  const learnt = new Map<string, string>()
+  const cited = new Set<string>()
+  for (const ff of old?.fichiers ?? [])
+    if (graph.fichiers[ff.p]) {
+      files.set(ff.p, ff.role)
+      learnt.set(ff.p, ff.h)
+    }
   for (const x of input.fichiers ?? []) {
     const k = typeof x?.p === 'string' ? known(x.p) : undefined
     if (!k) {
       rejected.push(String(x?.p ?? '?'))
       continue
     }
+    cited.add(k)
     files.set(k, roleOf(x.role, graph.fichiers[k]!.k) ?? files.get(k) ?? guessRole(graph.fichiers[k]!.k))
   }
 
@@ -1517,7 +1634,7 @@ export function learn(graph: Graph, input: LearnInput, ctx: LearnContext): Learn
     flux: input.flux ? input.flux.map(s => clip(s, 240)).filter(Boolean).slice(0, 12) : (old?.flux ?? []),
     entrees: [...new Set(entrees)],
     fichiers: [...files]
-      .map(([p, role]) => ({ p, role, h: graph.fichiers[p]!.h }))
+      .map(([p, role]) => ({ p, role, h: cited.has(p) ? graph.fichiers[p]!.h : (learnt.get(p) ?? graph.fichiers[p]!.h) }))
       .sort(byRole)
       .slice(0, 60),
     pieges: pieges.slice(0, 12),
@@ -1529,6 +1646,7 @@ export function learn(graph: Graph, input: LearnInput, ctx: LearnContext): Learn
     perime: [],
     usages: old?.usages ?? { servie: 0, evites: 0 },
   }
+  feature.perime = perimeOf(graph, feature)
   if (!feature.fichiers.length) {
     if (!old)
       return {
@@ -1542,35 +1660,67 @@ export function learn(graph: Graph, input: LearnInput, ctx: LearnContext): Learn
   return { graph: { ...graph, features: { ...graph.features, [id]: feature } }, rejected }
 }
 
+/** Rattachement d'une fiche automatique à une fiche existante (L15) : au moins 2 fichiers en commun, et 30 % des fichiers du flow. */
+const RATTACHE_MIN = 2
+const RATTACHE_PART = 0.3
+
 /**
- * Fiche minimale « flow-auto » (fichiers sans résumé, confiance 0,5) ; une fiche existante est seulement complétée.
- * Personne n'a vérifié ces fichiers pour la fiche : ils sont enregistrés non vérifiés (h = '') et comptent comme à relire.
+ * La fiche automatique de fin de flow (L15), sans résumé ni flux :
+ * 1. une fiche existe déjà sous cet id (la fiche servie, ou un brouillon) : elle est complétée ;
+ * 2. sinon, les fichiers rejoignent la fiche non brouillon qui en partage le plus (≥ 2 fichiers communs et ≥ 30 % des fichiers donnés) ;
+ * 3. sinon, une fiche « brouillon » (source flow-auto, confiance 0,5, brouillon.flow = stats.flows) : hors brief et hors correspondance,
+ *    purgée par recordUsage après 10 flows sans usage, promue en fiche normale par un apprendre.
+ * Personne n'a vérifié ces fichiers pour la fiche : ils sont ajoutés non vérifiés (h = '') et comptent comme à relire.
+ * Rend le graphe (le même s'il n'y a aucun fichier valide), l'id de la fiche écrite et `rattachee` (fichiers ajoutés à une fiche non brouillon).
  */
-export function autoFiche(graph: Graph, id: string, files: { p: string; role?: string }[], ctx: LearnContext): Graph {
-  const key = slug(id)
-  if (!key) return graph
-  const valid = files
-    .map(x => ({ k: resolveKey(graph, x.p), role: x.role }))
-    .filter((x): x is { k: string; role: string | undefined } => Boolean(x.k && graph.fichiers[x.k]))
-  if (!valid.length) return graph
-  const old = graph.features[key]
-  const fichiers = [...(old?.fichiers ?? [])]
-  for (const x of valid) {
-    if (fichiers.some(f => f.p === x.k)) continue
-    const n = graph.fichiers[x.k]!
-    fichiers.push({ p: x.k, role: roleOf(x.role, n.k) ?? guessRole(n.k), h: '' })
+export function autoFiche(graph: Graph, id: string, files: { p: string; role?: string }[], ctx: LearnContext): { graph: Graph; id: string; rattachee: boolean } {
+  const key = slug(String(id ?? ''))
+  const seen = new Set<string>()
+  const valid: { k: string; role: string | undefined }[] = []
+  for (const x of Array.isArray(files) ? files : []) {
+    const k = typeof x?.p === 'string' ? resolveKey(graph, x.p) : undefined
+    if (!k || !graph.fichiers[k] || seen.has(k)) continue
+    seen.add(k)
+    valid.push({ k, role: x.role })
   }
-  if (old) return { ...graph, features: { ...graph.features, [key]: { ...old, fichiers: fichiers.slice(0, 60) } } }
+  if (!key || !valid.length) return { graph, id: key, rattachee: false }
+  const added = (old: FeatureFile[]) => {
+    const fichiers = [...old]
+    for (const x of valid) {
+      if (fichiers.some(f => f.p === x.k)) continue
+      const n = graph.fichiers[x.k]!
+      fichiers.push({ p: x.k, role: roleOf(x.role, n.k) ?? guessRole(n.k), h: '' })
+    }
+    return fichiers.slice(0, 60)
+  }
+  const put = (f: Feature, rattachee: boolean) => ({ graph: { ...graph, features: { ...graph.features, [f.id]: { ...f, fichiers: added(f.fichiers) } } }, id: f.id, rattachee })
+
+  const same = graph.features[key]
+  if (same) return put(same, !isDraft(same))
+
+  let best: Feature | undefined
+  let bestCommon = 0
+  for (const f of Object.values(graph.features)) {
+    if (isDraft(f) || !f.fichiers.length) continue
+    const common = valid.filter(x => f.fichiers.some(y => y.p === x.k)).length
+    if (common < RATTACHE_MIN || common / valid.length < RATTACHE_PART) continue
+    if (common > bestCommon || (common === bestCommon && best && f.id < best.id)) {
+      best = f
+      bestCommon = common
+    }
+  }
+  if (best) return put(best, true)
+
   const rev = reverseIndex(graph)
   const entrees = valid.flatMap(x => rev.get(x.k)?.get('sert') ?? [])
   const feature: Feature = {
     id: key,
-    titre: id,
+    titre: clip(id, 120) || key,
     alias: [],
     resume: '',
     flux: [],
     entrees: [...new Set(entrees)],
-    fichiers: fichiers.sort(byRole).slice(0, 60),
+    fichiers: added([]).sort(byRole),
     pieges: [],
     deps: [],
     confiance: round2(ctx.confiance ?? 0.5),
@@ -1579,8 +1729,9 @@ export function autoFiche(graph: Graph, id: string, files: { p: string; role?: s
     appris: { le: ctx.le, commit: ctx.commit, branche: ctx.branche },
     perime: [],
     usages: { servie: 0, evites: 0 },
+    brouillon: { flow: graph.stats?.flows ?? 0 },
   }
-  return { ...graph, features: { ...graph.features, [key]: feature } }
+  return { graph: { ...graph, features: { ...graph.features, [key]: feature } }, id: key, rattachee: false }
 }
 
 /** Ajoute à la fiche, en « peripherique » et non vérifiés (h = ''), les fichiers lus pendant le flow qui n'y figuraient pas. */
@@ -1647,7 +1798,11 @@ export function refreshFiles(graph: Graph, id: string, paths: string[], ctx: Ref
     fichiers: f.fichiers.filter(x => !gone.has(x.p)).map(x => (fresh.has(x.p) ? { ...x, h: fresh.get(x.p)! } : x)),
   }
   next.perime = perimeOf(graph, next)
-  if (!next.perime.length && ctx) next.appris = { le: ctx.le, commit: ctx.commit, branche: ctx.branche }
+  if (!next.perime.length && ctx) {
+    next.appris = { le: ctx.le, commit: ctx.commit, branche: ctx.branche }
+    // La dérive se mesurait depuis l'ancien commit d'apprentissage : elle est à recalculer (withDrift).
+    delete next.derive
+  }
   return { graph: { ...graph, features: { ...graph.features, [id]: next } }, refreshed, unknown }
 }
 
@@ -1668,57 +1823,163 @@ export function servedFiles(graph: Graph, f: Feature, par: string, only?: string
 /** Les hits d'un extrait de fiche : seulement les fichiers `paths` (ceux que rend extractFiles). */
 export const servedSubset = (graph: Graph, f: Feature, paths: string[], par: string): CacheHit[] => servedFiles(graph, f, par, paths)
 
-type Gains = { evites: number; servis: number; net: number; lus: number; completude: number; byFeature: Map<string, number>; feats: string[]; hits: CacheHit[] }
+/**
+ * Poids d'un fichier seulement listé par chercher ou voisins (chemin, type, taille, sum), quand personne ne le lit ensuite.
+ * Une liste n'épargne pas la lecture du fichier : elle épargne l'exploration qui l'aurait trouvé (grep, Glob, puis l'ouverture d'un ou deux
+ * candidats sur quatre environ). On compte donc le quart de sa taille, et un dixième pour le second saut de voisins (liste plus longue, moins visée) :
+ * une borne basse, pour que le net reste pessimiste plutôt que flatteur (L10, L12).
+ */
+export const POIDS_LISTE = 0.25
+export const POIDS_SAUT2 = 0.1
+/** Rôles d'un fichier de fiche qu'un flow de la feature aurait lu de toute façon : servis frais et non lus, ils comptent comme évités. */
+const ROLES_EVITES = new Set<FileRole>(['coeur', 'entree', 'donnees'])
+/** Taille du journal des flows, et des fichiers lus gardés par fiche (usages.lus). */
+export const JOURNAL_MAX = 200
+const USAGES_LUS_MAX = 60
+/** Un brouillon jamais servi est purgé après ce nombre de flows. */
+export const BROUILLON_FLOWS = 10
 
-/** Évités = fichiers servis frais que personne n'a lus (une seule fois par fichier) ; net = évités − injectés ; complétude = part des fichiers lus présents dans les fiches servies. */
+type Gains = {
+  evites: number
+  servis: number
+  net: number
+  /** Tokens des fichiers lus (Read et Bash), sans les sorties d'outils. */
+  lusFichiers: number
+  /** lusFichiers + outils. */
+  lus: number
+  completude: number
+  byFeature: Map<string, number>
+  feats: string[]
+  hits: CacheHit[]
+  /** Les chemins lus, dans l'ordre de première lecture. */
+  read: string[]
+}
+
+/**
+ * Ce qu'un hit fait éviter s'il n'est pas lu (contrefactuel prudent, §3.2 (j)) : un fichier de fiche frais seulement s'il a le rôle coeur, entree
+ * ou donnees, ou s'il a été lu dans un flow antérieur où la fiche était servie (usages.lus) ; un fichier listé (sans feature) : tok × poids.
+ * Un fichier ajouté sans vérification (h = '') n'est jamais frais : la boucle completeFiche → « évité » (L11) est coupée.
+ */
+function hitCredit(graph: Graph | null, h: CacheHit): number {
+  if (!h.frais) return 0
+  if (!h.feature) return Math.round(h.tok * Math.max(0, Math.min(1, h.poids ?? 1)))
+  const f = graph?.features[h.feature]
+  if (!f) return 0
+  const role = f.fichiers.find(x => x.p === h.p)?.role
+  return (role && ROLES_EVITES.has(role)) || f.usages.lus?.includes(h.p) ? h.tok : 0
+}
+
+/** La fiche servie d'un flow : celle du brief, sinon la première servie par l'outil. */
+const servedFeature = (flow: FlowCache) => flow.feature ?? flow.servis.find(h => h.feature)?.feature
+
+/**
+ * Évités = fichiers servis non lus, comptés une fois par fichier selon hitCredit ; net = évités − injectés ;
+ * lus = fichiers lus (Read et Bash) + sorties des outils ; complétude = part des fichiers lus présents dans les fiches servies.
+ */
 function gains(graph: Graph | null, flow: FlowCache): Gains {
   const lus = new Map<string, number>()
-  for (const l of flow.lus) {
+  for (const l of Array.isArray(flow.lus) ? flow.lus : []) {
     const p = norm(l.p)
     lus.set(p, Math.max(lus.get(p) ?? 0, l.tok))
   }
-  const served = new Map<string, CacheHit>()
-  for (const h of flow.servis) {
-    const p = norm(h.p)
-    const o = served.get(p)
-    if (!o || (h.frais && !o.frais) || (h.frais === o.frais && h.tok > o.tok)) served.set(p, { ...h, p })
+  const servis = Array.isArray(flow.servis) ? flow.servis : []
+  // Par chemin : le hit qui fait le plus éviter (puis le plus gros), pour ne compter chaque fichier qu'une fois.
+  const served = new Map<string, { h: CacheHit; credit: number }>()
+  for (const raw of servis) {
+    const h = { ...raw, p: norm(raw.p) }
+    const credit = hitCredit(graph, h)
+    const o = served.get(h.p)
+    if (!o || credit > o.credit || (credit === o.credit && ((h.frais && !o.h.frais) || (h.frais === o.h.frais && h.tok > o.h.tok)))) served.set(h.p, { h, credit })
   }
   let evites = 0
-  let servis = 0
+  let total = 0
   const byFeature = new Map<string, number>()
-  for (const h of served.values()) {
-    servis += h.tok
-    if (!h.frais || lus.has(h.p)) continue
-    evites += h.tok
-    if (h.feature) byFeature.set(h.feature, (byFeature.get(h.feature) ?? 0) + h.tok)
+  for (const { h, credit } of served.values()) {
+    total += h.tok
+    if (!credit || lus.has(h.p)) continue
+    evites += credit
+    if (h.feature) byFeature.set(h.feature, (byFeature.get(h.feature) ?? 0) + credit)
   }
-  const feats = [...new Set([...(flow.feature ? [flow.feature] : []), ...flow.servis.flatMap(h => (h.feature ? [h.feature] : []))])]
+  const feats = [...new Set([...(flow.feature ? [flow.feature] : []), ...servis.flatMap(h => (h.feature ? [h.feature] : []))])]
   const fiche = new Set(feats.flatMap(id => graph?.features[id]?.fichiers.map(f => f.p) ?? []))
   const read = [...lus.keys()]
   const completude = read.length ? read.filter(p => fiche.has(p)).length / read.length : fiche.size ? 1 : 0
+  const lusFichiers = [...lus.values()].reduce((s, t) => s + t, 0)
   return {
     evites,
-    servis,
-    net: evites - flow.injecte,
-    lus: [...lus.values()].reduce((s, t) => s + t, 0),
+    servis: total,
+    net: evites - (flow.injecte || 0),
+    lusFichiers,
+    lus: lusFichiers + Math.max(0, flow.outils ?? 0),
     completude: round2(completude),
     byFeature,
     feats,
-    hits: [...served.values()],
+    hits: [...served.values()].map(x => x.h),
+    read,
   }
 }
 
-/** Fin de flow : incrémente les usages des fiches servies et les statistiques cumulées du projet. */
-export function recordUsage(graph: Graph, flow: FlowCache): Graph {
+/**
+ * Fin de flow : ajoute l'entrée du journal (toujours, cache actif ou non ; 200 derniers), incrémente les usages des fiches servies
+ * (servie, évités, fichiers lus dans usages.lus) et les statistiques cumulées, puis purge les brouillons jamais servis depuis 10 flows.
+ * ctx.le : date ISO de fin ; ctx.appris : les fiches apprises pendant le flow (apprendre ou autoFiche).
+ */
+export function recordUsage(graph: Graph, flow: FlowCache, ctx: { le: string; appris?: string[] }): Graph {
   const g = gains(graph, flow)
-  if (!flow.servis.length && !flow.injecte && !g.feats.length) return { ...graph, stats: { ...graph.stats, flows: graph.stats.flows + 1 } }
+  const s = graph.stats
+  const flows = s.flows + 1
   const features = { ...graph.features }
   for (const id of g.feats) {
     const f = features[id]
-    if (f) features[id] = { ...f, usages: { servie: f.usages.servie + 1, evites: f.usages.evites + (g.byFeature.get(id) ?? 0) } }
+    if (!f) continue
+    const lus = [...new Set([...g.read, ...(f.usages.lus ?? [])])].slice(0, USAGES_LUS_MAX)
+    features[id] = { ...f, usages: { ...f.usages, servie: f.usages.servie + 1, evites: f.usages.evites + (g.byFeature.get(id) ?? 0), ...(lus.length ? { lus } : {}) } }
   }
-  const s = graph.stats
-  return { ...graph, features, stats: { flows: s.flows + 1, servis: s.servis + g.servis, evites: s.evites + g.evites, net: s.net + g.net } }
+  for (const [id, f] of Object.entries(features)) if (f.brouillon && f.usages.servie === 0 && flows - f.brouillon.flow >= BROUILLON_FLOWS) delete features[id]
+  const feature = servedFeature(flow)
+  const appris = [...new Set((ctx?.appris ?? []).filter(x => typeof x === 'string' && x))]
+  const entry: JournalEntry = {
+    le: ctx?.le ?? '',
+    cache: flow.cache !== false,
+    ...(feature ? { feature } : {}),
+    ...(appris.length ? { appris } : {}),
+    lus: g.lusFichiers,
+    outils: Math.max(0, flow.outils ?? 0),
+    injecte: flow.injecte || 0,
+    evites: g.evites,
+  }
+  const journal = [...(graph.journal ?? []), entry].slice(-JOURNAL_MAX)
+  const quiet = !flow.servis?.length && !flow.injecte && !g.feats.length
+  const stats = quiet ? { ...s, flows } : { flows, servis: s.servis + g.servis, evites: s.evites + g.evites, net: s.net + g.net }
+  return { ...graph, features, stats, journal }
+}
+
+/** Moyenne de (lus + outils) par flow d'une population du journal. */
+function population(list: JournalEntry[]): { flows: number; lus: number } {
+  return { flows: list.length, lus: list.length ? Math.round(list.reduce((s, e) => s + (e.lus || 0) + (e.outils || 0), 0) / list.length) : 0 }
+}
+
+/**
+ * La mesure tirée du journal (§3.2 (j)) : sans cache, cache sans fiche, cache avec fiche ; puis, par feature, les flows où elle a été apprise
+ * sans être servie (avant) contre ceux où elle a été servie (après) : la comparaison à même feature réduit la variance. 5 features au plus.
+ */
+export function measureOf(journal: JournalEntry[] | undefined): CacheStats['mesure'] {
+  const j = Array.isArray(journal) ? journal : []
+  const ids = new Set<string>()
+  for (const e of j) for (const id of e.appris ?? []) ids.add(id)
+  const parFeature: CacheStats['mesure']['parFeature'] = []
+  for (const id of ids) {
+    const avant = j.filter(e => e.appris?.includes(id) && e.feature !== id)
+    const apres = j.filter(e => e.feature === id)
+    if (avant.length && apres.length) parFeature.push({ id, avant: population(avant), apres: population(apres) })
+  }
+  parFeature.sort((a, b) => b.avant.flows + b.apres.flows - (a.avant.flows + a.apres.flows) || a.id.localeCompare(b.id))
+  return {
+    sans: population(j.filter(e => !e.cache)),
+    sansFiche: population(j.filter(e => e.cache && !e.feature)),
+    avecFiche: population(j.filter(e => e.cache && e.feature)),
+    parFeature: parFeature.slice(0, 5),
+  }
 }
 
 /** Les données du panneau et de la bande. */
@@ -1761,6 +2022,7 @@ export function computeStats(graph: Graph | null, flow: FlowCache | null, nom: s
       ? { injecte: flow!.injecte, evites: g.evites, net: g.net, lus: g.lus, completude: g.completude, ...(flow!.feature ? { feature: flow!.feature } : {}) }
       : { injecte: 0, evites: 0, net: 0, lus: 0, completude: 0 },
     cumul: { flows: graph.stats.flows, evites: graph.stats.evites, net: graph.stats.net },
+    mesure: measureOf(graph.journal),
   }
 }
 // ── Textes (français, compacts, jamais de JSON) ──────────────────────────
@@ -1840,6 +2102,25 @@ function fileLine(graph: Graph, ff: FeatureFile, changed: Set<string>, unchecked
   return `- ${ff.p} · ${ff.role}${n ? ` · ${fmt(n.tok)}` : ''}${mark}`
 }
 
+/**
+ * Les dépendances d'une fiche, une ligne chacune (§3.10 (l), ≈ 50 tokens) : id, titre et fraîcheur, sans précharger la fiche voisine ;
+ * l'agent appelle l'action feature s'il en a besoin. Une dépendance sans fiche est signalée.
+ */
+function depLines(graph: Graph, f: Feature): string[] {
+  const L = ['Dépend de (action feature, id, pour la fiche entière) :']
+  for (const id of f.deps.slice(0, 8)) {
+    const d = graph.features[id]
+    if (!d) {
+      L.push(`- ${id} · pas de fiche`)
+      continue
+    }
+    const fr = freshness(graph, d)
+    L.push(`- ${id}${d.titre && d.titre !== id ? ` : ${clip(d.titre, 60)}` : ''}${isDraft(d) ? ' · brouillon' : ''} · ${freshWord(fr)} · confiance ${conf(fr.confiance)}`)
+  }
+  if (f.deps.length > 8) L.push(`… et ${f.deps.length - 8} autres : ${f.deps.slice(8).join(', ')}`)
+  return L
+}
+
 /** Le corps d'une fiche selon sa fraîcheur (§3.3) : flux masqué au-delà de 50 % de tokens modifiés ; pièges avant les fichiers. */
 function featureBody(graph: Graph, f: Feature, fr: Freshness): string[] {
   const L: string[] = []
@@ -1869,7 +2150,7 @@ function featureBody(graph: Graph, f: Feature, fr: Freshness): string[] {
     L.push(fr.niveau === 'perimee' ? 'Pièges (à revérifier) :' : 'Pièges :')
     for (const x of f.pieges) L.push(`- ${x.txt}${x.p ? ` (${x.p})` : ''}`)
   }
-  if (f.deps.length) L.push(`Dépend de : ${f.deps.join(', ')}`)
+  if (f.deps.length) L.push(...depLines(graph, f))
   if (f.fichiers.length) {
     L.push(`Fichiers (${f.fichiers.length}, rôle · taille) :`)
     for (const ff of f.fichiers.slice(0, 30)) L.push(fileLine(graph, ff, changed, unchecked, ' ⚠ modifié'))
@@ -1884,9 +2165,11 @@ export function featureText(graph: Graph, f: Feature): string {
   return capLines([featureHeader(f, fr), ...featureBody(graph, f, fr)], 1500)
 }
 
-/** « Features connues : a ✓ · b ⚠2 ; candidates sans fiche : ird (18 commits) ». */
+/** « Features connues : a ✓ · b ⚠2 ; candidates sans fiche : ird (18 commits) ». Les brouillons n'y figurent pas. */
 function featuresLine(graph: Graph): string {
-  const feats = Object.values(graph.features).sort((a, b) => b.usages.servie - a.usages.servie || a.id.localeCompare(b.id))
+  const feats = Object.values(graph.features)
+    .filter(f => !isDraft(f))
+    .sort((a, b) => b.usages.servie - a.usages.servie || a.id.localeCompare(b.id))
   const cands = graph.candidates.filter(c => !graph.features[c.id]).slice(0, 5)
   const known = feats
     .slice(0, 15)
@@ -2066,8 +2349,9 @@ export function coldMap(graph: Graph, request: string, maxTok = 700): string {
     const any = ranked.some(x => x.pertinent)
     const max = any ? 25 : 12
     const top = ranked[0]!.score
+    // Les brouillons restent hors brief : la carte ne les cite pas.
     const ficheOf = new Map<string, string[]>()
-    for (const f of Object.values(graph.features)) for (const x of f.fichiers) ficheOf.set(x.p, [...(ficheOf.get(x.p) ?? []), f.id])
+    for (const f of Object.values(graph.features)) if (!isDraft(f)) for (const x of f.fichiers) ficheOf.set(x.p, [...(ficheOf.get(x.p) ?? []), f.id])
     const L = [any ? COLD_TITLE : COLD_TITLE_CENTRAL]
     let used = tokensOf(L[0]!)
     for (const [i, x] of ranked.entries()) {
@@ -2197,6 +2481,8 @@ export function agentExtract(graph: Graph, f: Feature, agent: AgentInfo, max = 6
 const DIFF_MAX = 2500
 const DIFF_MIN_FILE = 200
 const DIFF_LINE = 240
+/** Au-delà de cette part des tokens du fichier, le diff n'est pas servi (§3.6 (c)) : un refactor massif se relit mieux en entier. */
+export const DIFF_PART_MAX = 0.3
 
 /** Une ligne de diff coupée si elle est démesurée (fichier minifié). */
 const diffLine = (l: string) => (l.length > DIFF_LINE ? `${l.slice(0, DIFF_LINE)}…` : l)
@@ -2252,6 +2538,7 @@ function clipDiff(lines: string[], budget: number): string[] {
 /**
  * La réponse de l'action « diff » (≤ 2 500 tokens) : en-tête avec la date et le commit de l'apprentissage, puis par fichier « ### p (+n/-m lignes) » et son diff.
  * Le budget est partagé entre les fichiers ; chaque diff garde ses hunks entiers tant que sa part le permet. diff undefined : « diff indisponible ».
+ * Un diff de plus de 30 % des tokens du fichier (taille du graphe) n'est pas servi : « relis le fichier » (refactor massif, illisible en diff).
  */
 export function diffText(graph: Graph, f: Feature | undefined, p: string | undefined, diffs: DiffEntry[]): string {
   try {
@@ -2277,7 +2564,14 @@ export function diffText(graph: Graph, f: Feature | undefined, p: string | undef
       else if (!lines.length) block.push(`### ${name}`, 'aucune différence.')
       else {
         const { plus, minus } = diffCounts(lines)
-        block.push(`### ${name} (+${plus}/-${minus} lignes)`, ...clipDiff(lines, budget - 15))
+        const fileTok = graph?.fichiers?.[typeof d?.p === 'string' ? norm(d.p) : '']?.tok ?? 0
+        const diffTok = tokensOf(d!.diff as string)
+        if (fileTok > 0 && diffTok > DIFF_PART_MAX * fileTok)
+          block.push(
+            `### ${name} (+${plus}/-${minus} lignes)`,
+            `diff trop gros (≈ ${fmt(diffTok)} tokens, plus de ${pct(DIFF_PART_MAX)} du fichier de ≈ ${fmt(fileTok)}) : relis le fichier entier.`,
+          )
+        else block.push(`### ${name} (+${plus}/-${minus} lignes)`, ...clipDiff(lines, budget - 15))
       }
       L.push(...block)
       used += tokensOf(block.join('\n')) + 1
@@ -2302,7 +2596,9 @@ export function searchText(graph: Graph, query: string): string {
     for (const { id } of r.features) {
       const f = graph.features[id]!
       const fr = freshness(graph, f)
-      L.push(`- ${id}${f.titre !== id ? ` : ${f.titre}` : ''} · ${plural(f.fichiers.length, 'fichier')}, ≈ ${fmt(ficheTok(graph, f))} · ${freshWord(fr)} · confiance ${conf(fr.confiance)}`)
+      L.push(
+        `- ${id}${f.titre !== id ? ` : ${f.titre}` : ''}${isDraft(f) ? ' · brouillon' : ''} · ${plural(f.fichiers.length, 'fichier')}, ≈ ${fmt(ficheTok(graph, f))} · ${freshWord(fr)} · confiance ${conf(fr.confiance)}`,
+      )
     }
   }
   if (r.files.length) {
@@ -2335,11 +2631,55 @@ const inLabel = (k: string) =>
     .map(x => IN_LABEL[x] ?? x)
     .join(' › ')
 
+/** Les fichiers que liste searchText (les 8 fichiers de search) : hits frais, sans feature, de poids POIDS_LISTE. */
+export function searchHits(graph: Graph, query: string, par: string): CacheHit[] {
+  try {
+    return search(graph, query).files.flatMap(({ p }) => {
+      const n = graph.fichiers[p]
+      return n ? [{ p, tok: n.tok, frais: true, par, poids: POIDS_LISTE }] : []
+    })
+  } catch {
+    return []
+  }
+}
+
+/** La profondeur de voisins : 1 ou 2. */
+const depthOf = (depth: number) => Math.min(2, Math.max(1, Math.round(depth) || 1))
+
+/**
+ * Les fichiers que liste neighborsText (20 par liste, comme lui ; ni le fichier lui-même, ni les nœuds route, gql, api) : hits frais, sans feature,
+ * de poids POIDS_LISTE au premier saut et POIDS_SAUT2 au second.
+ */
+export function neighborHits(graph: Graph, p: string, depth: number, par: string): CacheHit[] {
+  try {
+    const key = resolveKey(graph, p)
+    if (!key) return []
+    const nb = neighbors(graph, key, depthOf(depth))
+    const lists: [string, string[]][] = [
+      ...Object.entries(nb.out),
+      ...Object.entries(nb.in).filter(([k]) => k !== 'teste' && k !== 'documente'),
+      ['teste', nb.tests],
+      ['documente', nb.docs],
+    ]
+    const out = new Map<string, CacheHit>()
+    for (const [k, arr] of lists)
+      for (const t of arr.slice(0, 20)) {
+        const n = graph.fichiers[t]
+        if (!n || t === key) continue
+        const poids = k.includes('/') ? POIDS_SAUT2 : POIDS_LISTE
+        if ((out.get(t)?.poids ?? 0) < poids) out.set(t, { p: t, tok: n.tok, frais: true, par, poids })
+      }
+    return [...out.values()]
+  } catch {
+    return []
+  }
+}
+
 /** Réponse de l'action « voisins » : ce que le fichier utilise, qui l'utilise, tests, docs et fiches. */
 export function neighborsText(graph: Graph, p: string, depth = 1): string {
   const key = resolveKey(graph, p)
   if (!key) return `« ${clip(p, 200)} » n'est pas dans le graphe de ${graph.projet.cle} (exclu, inconnu ou ambigu). Donne le chemin relatif au projet.`
-  const nb = neighbors(graph, key, Math.min(2, Math.max(1, Math.round(depth) || 1)))
+  const nb = neighbors(graph, key, depthOf(depth))
   const n = graph.fichiers[key]
   const node = graph.noeuds[key]
   const desc = n ? `${n.k}, ${fmt(n.tok)}` : node ? `${node.k}${node.def ? `, déclaré dans ${node.def}` : ''}` : ''
@@ -2379,7 +2719,7 @@ export function graphText(graph: Graph, stats: CacheStats | null): string {
   const count = (k: GraphNode['k']) => Object.values(graph.noeuds).filter(n => n.k === k).length
   const feats = Object.values(graph.features)
     .map(f => ({ f, fr: freshness(graph, f) }))
-    .sort((a, b) => b.f.usages.servie - a.f.usages.servie || a.f.id.localeCompare(b.f.id))
+    .sort((a, b) => Number(isDraft(a.f)) - Number(isDraft(b.f)) || b.f.usages.servie - a.f.usages.servie || a.f.id.localeCompare(b.f.id))
   const cands = graph.candidates.filter(c => !graph.features[c.id])
   const L: string[] = [
     `Graphe de cache · ${p.nom} (${p.cle}) : ${s.fichiers} fichiers · ${total} arêtes · ${count('route')} routes · ${plural(feats.length, 'fiche')}${s.perimees ? `, ${s.perimees} périmée${s.perimees > 1 ? 's' : ''}` : ''}`,
@@ -2400,6 +2740,10 @@ export function graphText(graph: Graph, stats: CacheStats | null): string {
     if (cands.length > 8) foot.push(`  … et ${cands.length - 8} autres (/revo-flow cache build)`)
   }
   foot.push(`Gains · ${plural(s.cumul.flows, 'flow')} · ≈ ${fmt(s.cumul.evites)} tokens évités · net ≈ ${signed(s.cumul.net)}`)
+  const m = s.mesure ?? measureOf(graph.journal)
+  const pop = (label: string, x: { flows: number; lus: number }) => `${label} ${x.flows} (≈ ${fmt(x.lus)} lus)`
+  if (m.sans.flows + m.sansFiche.flows + m.avecFiche.flows)
+    foot.push(`Mesure (moyenne lue par flow) · ${pop('sans cache', m.sans)} · ${pop('sans fiche', m.sansFiche)} · ${pop('avec fiche', m.avecFiche)}`)
   if (s.flow.injecte || s.flow.evites)
     foot.push(`Flow en cours · injecté ${fmt(s.flow.injecte)} · ≈ ${fmt(s.flow.evites)} évités · net ${signed(s.flow.net)} · complétude ${pct(s.flow.completude)}`)
   if (!feats.length) L.push("Features : aucune fiche pour l'instant (apprises en fin de flow, ou /revo-flow cache build <feature>).")
@@ -2410,7 +2754,7 @@ export function graphText(graph: Graph, stats: CacheStats | null): string {
     let shown = 0
     for (const { f, fr } of feats) {
       const lines = [
-        `  ${f.id}${f.titre !== f.id ? ` : ${clip(f.titre, 60)}` : ''} · ${plural(f.fichiers.length, 'fichier')}, ≈ ${fmt(ficheTok(graph, f))} · ${freshWord(fr)} · confiance ${conf(fr.confiance)} · servie ${f.usages.servie}×${f.usages.evites ? ` · ≈ ${fmt(f.usages.evites)} évités` : ''}`,
+        `  ${f.id}${f.titre !== f.id ? ` : ${clip(f.titre, 60)}` : ''}${isDraft(f) ? ' · brouillon' : ''} · ${plural(f.fichiers.length, 'fichier')}, ≈ ${fmt(ficheTok(graph, f))} · ${freshWord(fr)} · confiance ${conf(fr.confiance)} · servie ${f.usages.servie}×${f.usages.evites ? ` · ≈ ${fmt(f.usages.evites)} évités` : ''}`,
         ...(fr.perimes.length ? [`    ⚠ modifiés : ${fr.perimes.slice(0, 4).join(', ')}${fr.perimes.length > 4 ? ` … +${fr.perimes.length - 4}` : ''}`] : []),
       ]
       if (used + lines.length > room) break

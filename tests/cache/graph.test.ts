@@ -39,6 +39,16 @@ import {
   coldRank,
   headSummary,
   keywordsOf,
+  confidenceDrift,
+  driftNeighbors,
+  isDraft,
+  matchZone,
+  neighborHits,
+  parseRerank,
+  rerankPrompt,
+  searchHits,
+  POIDS_LISTE,
+  POIDS_SAUT2,
 } from '../../hooks/cache/graph'
 import type { Feature, FlowCache, Graph, LearnContext, SourceFile } from '../../types/cache'
 
@@ -327,8 +337,12 @@ test('freshness : fraîche, partielle (< 50 %), périmée (≥ 50 %), confiance 
   expect(txt).toContain('Relis les fichiers (ou action diff) puis action apprendre pour la réécrire.')
   expect(txt).not.toContain('action rafraichir')
 
-  // Un nouvel apprentissage remet les hash à jour et vide perime
-  const g3 = learn(g2, { feature: 'f' }, LEARN).graph
+  // Un apprendre partiel (L14) ne remet pas les hash des fichiers qu'il ne cite pas : la fiche reste périmée
+  const partiel = learn(g2, { feature: 'f', pieges: [{ txt: 'nouveau piège' }] }, LEARN).graph
+  expect(partiel.features.f!.perime.map(x => x.p)).toEqual(['utils/a.ts', 'utils/c.ts'])
+  expect(freshness(partiel, partiel.features.f!).niveau).toBe('perimee')
+  // Un nouvel apprentissage qui cite les fichiers remet leurs hash à jour et vide perime
+  const g3 = learn(g2, { feature: 'f', fichiers: [{ p: 'utils/a.ts' }, { p: 'utils/c.ts' }] }, LEARN).graph
   expect(g3.features.f!.perime).toEqual([])
   expect(freshness(g3, g3.features.f!).niveau).toBe('fraiche')
   expect(g3.features.f!.flux).toEqual(['étape un', 'étape deux'])
@@ -417,14 +431,16 @@ test('learn : chemins rejetés, hash enregistrés, confiance, corrections', () =
 
 test('autoFiche et completeFiche : fiche minimale, puis fichiers lus hors fiche en périphérique', () => {
   const g0 = nuxt3()
-  const g1 = autoFiche(g0, 'paiement', [{ p: 'pages/booking/offer.vue' }, { p: 'nope.ts' }], { ...LEARN, source: 'flow:2' })
+  const r1 = autoFiche(g0, 'paiement', [{ p: 'pages/booking/offer.vue' }, { p: 'nope.ts' }], { ...LEARN, source: 'flow:2' })
+  expect(r1).toMatchObject({ id: 'paiement', rattachee: false })
+  const g1 = r1.graph
   const f = g1.features.paiement!
   expect(f.source).toBe('flow-auto')
   expect(f.confiance).toBe(0.5)
   expect(f.resume).toBe('')
   expect(f.entrees).toEqual(['r:/booking/offer'])
   expect(f.fichiers).toEqual([{ p: 'pages/booking/offer.vue', role: 'entree', h: '' }])
-  expect(autoFiche(g0, 'vide', [{ p: 'nope.ts' }], LEARN)).toBe(g0)
+  expect(autoFiche(g0, 'vide', [{ p: 'nope.ts' }], LEARN).graph).toBe(g0)
   const g2 = completeFiche(g1, 'paiement', ['utils/price.ts', 'pages/booking/offer.vue', 'nope.ts'])
   expect(g2.features.paiement!.fichiers.map(x => `${x.p}:${x.role}`)).toEqual(['pages/booking/offer.vue:entree', 'utils/price.ts:peripherique'])
   expect(featureText(g2, g2.features.paiement!)).toContain('Fiche automatique')
@@ -441,6 +457,7 @@ test('computeStats et recordUsage : évités comptés une fois, net, complétude
   const tok = (p: string) => g.fichiers[p]!.tok
   const flow: FlowCache = {
     cle: g.projet.cle,
+    cache: true,
     servis: [...hits, { p: 'services/offer.ts', tok: tok('services/offer.ts'), frais: true, par: 'voisins' }],
     lus: [
       { p: 'pages/booking/offer.vue', tok: tok('pages/booking/offer.vue'), par: 'lead' },
@@ -461,10 +478,11 @@ test('computeStats et recordUsage : évités comptés une fois, net, complétude
   expect(s.parType.page).toBe(3)
   expect(computeStats(null, null, 'demo')).toBeNull()
 
-  const g2 = recordUsage(g, flow)
+  const g2 = recordUsage(g, flow, { le: '2026-10-14T11:00:00.000Z' })
   expect(g2.stats).toEqual({ flows: 1, servis: tok('services/offer.ts') + tok('stores/booking/Booking.ts') + tok('pages/booking/offer.vue'), evites, net: evites - 100 })
-  expect(g2.features[f.id]!.usages).toEqual({ servie: 1, evites })
+  expect(g2.features[f.id]!.usages).toEqual({ servie: 1, evites, lus: ['pages/booking/offer.vue', 'utils/price.ts'] })
   expect(computeStats(g2, null, 'demo')!.cumul).toEqual({ flows: 1, evites, net: evites - 100 })
+  expect(g2.journal).toEqual([{ le: '2026-10-14T11:00:00.000Z', cache: true, feature: f.id, lus: s.flow.lus, outils: 0, injecte: 100, evites }])
 })
 
 // ── Textes ───────────────────────────────────────────────────────────────
@@ -496,7 +514,7 @@ test('briefText : ≤ 1 200 tokens avec une grosse fiche, ≈ 200 sans fiche', (
 
 test('graphText ≤ 60 lignes, candidatesFromLog par scope', () => {
   let g = withFeatures()
-  for (let i = 0; i < 70; i++) g = autoFiche(g, `f${i}`, [{ p: 'utils/price.ts' }], LEARN)
+  for (let i = 0; i < 70; i++) g = autoFiche(g, `f${i}`, [{ p: 'utils/price.ts' }], LEARN).graph
   const log = [
     'feat(booking): ajoute X',
     'pages/booking/offer.vue',
@@ -524,6 +542,8 @@ test('graphText ≤ 60 lignes, candidatesFromLog par scope', () => {
   expect(txt.split('\n').length).toBeLessThanOrEqual(60)
   expect(txt).toContain('Graphe de cache · demo')
   expect(txt).toContain('autres fiches')
+  expect(txt).toContain('f0 · brouillon')
+  expect(txt.indexOf('complementary-products')).toBeLessThan(txt.indexOf('f0 · brouillon'))
   expect(txt).toContain('Candidates sans fiche (1)')
   expect(candidatesText(g)).toContain('booking · 2 commits')
 })
@@ -875,8 +895,14 @@ test('diffText : en-tête, compte des lignes, diff indisponible, aucune différe
   expect(() => diffText(g, f, undefined, [null, { p: 3, diff: 5 }] as never)).not.toThrow()
 })
 
+/** Des fichiers assez gros pour que la règle des 30 % (diff trop gros : relire) ne joue pas. */
+const bigFiles = (g: Graph, ...ps: string[]) => {
+  for (const p of ps) g.fichiers[p] = { ...g.fichiers[p]!, tok: 1_000_000 }
+  return g
+}
+
 test('diffText : ≤ 2 500 tokens, hunks entiers puis ligne de troncature', () => {
-  const g = extractGraph()
+  const g = bigFiles(extractGraph(), 'services/offer.ts')
   const f = g.features[CP]!
   const lines = Array.from({ length: 200 }, (_, i) => hunk(i * 30 + 1)).flat()
   const t = diffText(g, f, undefined, [{ p: 'services/offer.ts', depuis: 'a', diff: lines.join('\n') }])
@@ -892,7 +918,7 @@ test('diffText : ≤ 2 500 tokens, hunks entiers puis ligne de troncature', () =
 })
 
 test('diffText : un seul gros hunk coupé par lignes, budget partagé entre les fichiers', () => {
-  const g = extractGraph()
+  const g = bigFiles(extractGraph(), 'services/offer.ts', 'stores/booking/Booking.ts', 'pages/booking/offer.vue')
   const f = g.features[CP]!
   const one = ['@@ -1,3000 +1,3000 @@', ...Array.from({ length: 3000 }, () => `+${'y'.repeat(80)}`)].join('\n')
   const t1 = diffText(g, f, undefined, [{ p: 'services/offer.ts', depuis: 'a', diff: one }])
@@ -1023,7 +1049,7 @@ test('autoFiche et completeFiche : fichiers non vérifiés (h vide), à relire, 
   const g2 = refreshFiles(g1, 'panier', ['utils/price.ts'], LATER).graph
   expect(freshness(g2, g2.features.panier!).niveau).toBe('fraiche')
   // Fiche automatique neuve : tous ses fichiers sont à relire, confiance intacte
-  const g3 = autoFiche(g0, 'auto', [{ p: 'utils/price.ts' }, { p: 'services/offer.ts' }], LEARN)
+  const g3 = autoFiche(g0, 'auto', [{ p: 'utils/price.ts' }, { p: 'services/offer.ts' }], LEARN).graph
   expect(freshness(g3, g3.features.auto!)).toMatchObject({ niveau: 'partielle', ratio: 0, confiance: 0.5 })
 })
 
@@ -1135,4 +1161,207 @@ test('coldMap et briefText : carte à froid dans le budget, titre selon la perti
   expect(brief.trimEnd().endsWith('apprendre (en fin de flow, ou fiche fausse).')).toBe(true)
   expect(tokensOf(brief)).toBeLessThanOrEqual(1200)
   expect(briefText(g, undefined)).not.toContain('Fichiers probables')
+})
+
+// ── v1.5 : mesure honnête, zone de correspondance, brouillons, dérive ────
+
+const flowOf = (g: Graph, over: Partial<FlowCache> = {}): FlowCache => ({ cle: g.projet.cle, cache: true, servis: [], lus: [], injecte: 0, ...over })
+
+test('recordUsage : contrefactuel prudent (rôles, fichiers lus avant), poids des listes, lectures Bash et outils', () => {
+  const g0 = learn(withFeatures(), { feature: 'panier', fichiers: [{ p: 'utils/price.ts', role: 'peripherique' }] }, LEARN).graph
+  const tok = (p: string) => g0.fichiers[p]!.tok
+  const f = g0.features.panier!
+  const servis = [...servedFiles(g0, f, 'brief'), ...searchHits(g0, 'offer', 'chercher').filter(h => h.p === 'services/offer.ts')]
+  expect(servis.find(h => h.p === 'services/offer.ts')).toMatchObject({ frais: true, poids: POIDS_LISTE, par: 'chercher' })
+  expect(servis.find(h => h.p === 'services/offer.ts')!.feature).toBeUndefined()
+  const flow1 = flowOf(g0, { servis, feature: 'panier', injecte: 40, outils: 300, lus: [{ p: 'stores/booking/Booking.ts', tok: 50, par: 'lead', via: 'bash' }] })
+  const s1 = computeStats(g0, flow1, 'demo')!
+  // useCart (coeur) évité ; price.ts (périphérique jamais lu dans un flow de la fiche) non ; offer.ts seulement listé : un quart
+  expect(s1.flow.evites).toBe(tok('composables/useCart.ts') + Math.round(tok('services/offer.ts') * POIDS_LISTE))
+  // les lectures Bash comptent comme lues, les sorties des outils s'ajoutent
+  expect(s1.flow.lus).toBe(350)
+  const g1 = recordUsage(g0, flow1, { le: '2026-10-14T11:00:00.000Z' })
+  expect(g1.features.panier!.usages).toMatchObject({ servie: 1, evites: tok('composables/useCart.ts'), lus: ['stores/booking/Booking.ts'] })
+  expect(g1.journal).toEqual([{ le: '2026-10-14T11:00:00.000Z', cache: true, feature: 'panier', lus: 50, outils: 300, injecte: 40, evites: s1.flow.evites }])
+
+  // price.ts lu pendant un flow où la fiche était servie : au flow suivant, servi et non lu, il compte comme évité
+  const g2 = recordUsage(g1, flowOf(g1, { servis: servedFiles(g1, f, 'brief'), feature: 'panier', lus: [{ p: 'utils/price.ts', tok: 10, par: 'lead' }] }), { le: '2026-10-14T12:00:00.000Z' })
+  expect(g2.features.panier!.usages.lus).toEqual(['utils/price.ts', 'stores/booking/Booking.ts'])
+  const s3 = computeStats(g2, flowOf(g2, { servis: servedFiles(g2, g2.features.panier!, 'brief'), feature: 'panier' }), 'demo')!
+  expect(s3.flow.evites).toBe(tok('composables/useCart.ts') + tok('utils/price.ts'))
+  // voisins au second saut : un dixième
+  expect(neighborHits(g0, 'stores/booking/Booking.ts', 2, 'voisins').find(h => h.p === 'graphql/offers.ts')!.poids).toBe(POIDS_SAUT2)
+})
+
+test('recordUsage : journal (cache coupé compris, 200 derniers) et mesure par population et par feature', () => {
+  let g = withFeatures()
+  g = recordUsage(g, flowOf(g, { cache: false, lus: [{ p: 'utils/price.ts', tok: 1000, par: 'lead' }], outils: 200 }), { le: '2026-10-14T11:00:00.000Z' })
+  g = recordUsage(g, flowOf(g, { lus: [{ p: 'utils/price.ts', tok: 500, par: 'lead' }] }), { le: '2026-10-14T12:00:00.000Z' })
+  g = recordUsage(g, flowOf(g, { lus: [{ p: 'utils/price.ts', tok: 800, par: 'lead' }] }), { le: '2026-10-14T13:00:00.000Z', appris: ['panier'] })
+  g = recordUsage(g, flowOf(g, { feature: 'panier', lus: [{ p: 'utils/price.ts', tok: 100, par: 'lead' }] }), { le: '2026-10-14T14:00:00.000Z' })
+  expect(g.stats.flows).toBe(4)
+  expect(g.journal!.map(e => [e.cache, e.feature ?? '', e.lus])).toEqual([
+    [false, '', 1000],
+    [true, '', 500],
+    [true, '', 800],
+    [true, 'panier', 100],
+  ])
+  expect(g.journal![2]!.appris).toEqual(['panier'])
+  expect(computeStats(g, null, 'demo')!.mesure).toEqual({
+    sans: { flows: 1, lus: 1200 },
+    sansFiche: { flows: 2, lus: 650 },
+    avecFiche: { flows: 1, lus: 100 },
+    parFeature: [{ id: 'panier', avant: { flows: 1, lus: 800 }, apres: { flows: 1, lus: 100 } }],
+  })
+  expect(graphText(g, null)).toContain('Mesure (moyenne lue par flow) · sans cache 1 (≈ ')
+  // graphe ancien sans journal : mesure vide
+  expect(computeStats(withFeatures(), null, 'demo')!.mesure.sans).toEqual({ flows: 0, lus: 0 })
+  let big = withFeatures()
+  for (let i = 0; i < 205; i++) big = recordUsage(big, flowOf(big), { le: `2026-10-14T11:00:${String(i).padStart(3, '0')}Z` })
+  expect(big.journal).toHaveLength(200)
+  expect(big.journal![199]!.le).toBe('2026-10-14T11:00:204Z')
+})
+
+test('autoFiche : rattachement à la fiche qui partage le plus, sinon brouillon hors brief, purgé après 10 flows, promu par apprendre', () => {
+  const g0 = withFeatures()
+  // 2 fichiers communs sur 3 : rattachés à complementary-products, le nouveau non vérifié
+  const r = autoFiche(g0, 'Navettes du soir', [{ p: 'services/offer.ts' }, { p: 'stores/booking/Booking.ts' }, { p: 'utils/price.ts' }], LEARN)
+  expect(r).toMatchObject({ id: 'complementary-products', rattachee: true })
+  expect(r.graph.features['navettes-du-soir']).toBeUndefined()
+  expect(r.graph.features['complementary-products']!.fichiers.find(x => x.p === 'utils/price.ts')!.h).toBe('')
+  // la fiche de même id est complétée
+  expect(autoFiche(g0, 'panier', [{ p: 'utils/price.ts' }], LEARN)).toMatchObject({ id: 'panier', rattachee: true })
+  // un seul fichier commun : brouillon
+  const d = autoFiche(g0, 'Paiement CB', [{ p: 'utils/price.ts' }, { p: 'services/offer.ts' }], LEARN)
+  expect(d).toMatchObject({ id: 'paiement-cb', rattachee: false })
+  const g1 = d.graph
+  const draft = g1.features['paiement-cb']!
+  expect(draft.brouillon).toEqual({ flow: 0 })
+  expect(isDraft(draft)).toBe(true)
+  expect(briefText(g1, undefined)).not.toContain('paiement-cb')
+  expect(matchZone(g1, 'paiement CB').candidats.map(c => c.id)).not.toContain('paiement-cb')
+  expect(matchRequest(g1, 'paiement cb')).toBeUndefined()
+  expect(searchText(g1, 'paiement')).toContain('paiement-cb : Paiement CB · brouillon')
+  expect(graphText(g1, null)).toContain('paiement-cb : Paiement CB · brouillon')
+  // un brouillon au même id est complété, il reste brouillon
+  const again = autoFiche(g1, 'paiement-cb', [{ p: 'pages/index.vue' }], LEARN)
+  expect(again).toMatchObject({ id: 'paiement-cb', rattachee: false })
+  expect(again.graph.features['paiement-cb']!.fichiers).toHaveLength(3)
+  // purgé après 10 flows sans usage
+  let g = g1
+  for (let i = 0; i < 9; i++) g = recordUsage(g, flowOf(g), { le: `2026-10-14T11:0${i}:00Z` })
+  expect(g.features['paiement-cb']).toBeDefined()
+  g = recordUsage(g, flowOf(g), { le: '2026-10-14T11:10:00Z' })
+  expect(g.features['paiement-cb']).toBeUndefined()
+  expect(g.features.panier).toBeDefined()
+  // apprendre le promeut en fiche normale, ses fichiers restent à vérifier sauf ceux cités
+  const promu = learn(g1, { feature: 'paiement-cb', resume: 'Le paiement', fichiers: [{ p: 'utils/price.ts' }] }, LEARN).graph.features['paiement-cb']!
+  expect(promu.brouillon).toBeUndefined()
+  expect(promu.fichiers.find(x => x.p === 'utils/price.ts')!.h).toBe(g1.fichiers['utils/price.ts']!.h)
+  expect(promu.fichiers.find(x => x.p === 'services/offer.ts')!.h).toBe('')
+})
+
+test('learn (L14) : seuls les fichiers cités prennent le hash courant, les autres restent périmés', () => {
+  const g1 = touch(fiche(), 'utils/a.ts', 'utils/b.ts')
+  const r = learn(g1, { feature: 'f', resume: 'Relu en partie', fichiers: [{ p: 'utils/a.ts' }] }, LEARN).graph.features.f!
+  expect(r.fichiers.find(x => x.p === 'utils/a.ts')!.h).toBe('utils/a.ts-2')
+  expect(r.fichiers.find(x => x.p === 'utils/b.ts')!.h).toBe('b1')
+  expect(r.perime).toEqual([{ p: 'utils/b.ts', depuis: 'b1', nouveau: 'utils/b.ts-2' }])
+  expect(r.resume).toBe('Relu en partie')
+})
+
+test('matchZone : nette, grise (candidats triés, sans brouillon), absente ; consigne et lecture du reranking', () => {
+  const g0 = withFeatures()
+  const nette = matchZone(g0, "les navettes J-1 ne s'affichent plus")
+  expect(nette).toMatchObject({ zone: 'nette', id: 'complementary-products' })
+  expect(nette.score).toBe(matchRequest(g0, "les navettes J-1 ne s'affichent plus")!.score)
+  expect(matchZone(g0, 'refactor général du code')).toEqual({ zone: 'absente', candidats: [] })
+  // Deux fiches proches (« panier » en alias de l'une, en titre de l'autre) : aucune ne ressort, zone grise ; le brouillon n'y est jamais
+  const g1 = learn(g0, { feature: 'code-promo', titre: 'Code promo', alias: ['panier'], fichiers: [{ p: 'utils/price.ts' }] }, LEARN).graph
+  const g = autoFiche(g1, 'panier remise', [{ p: 'pages/index.vue' }], LEARN).graph
+  expect(isDraft(g.features['panier-remise'])).toBe(true)
+  const grise = matchZone(g, 'le panier')
+  expect(grise.zone).toBe('grise')
+  expect(grise.id).toBeUndefined()
+  expect(grise.candidats.map(c => c.id)).toHaveLength(3)
+  expect(grise.candidats.map(c => c.id).slice(0, 2).sort()).toEqual(['code-promo', 'panier'])
+  expect(grise.candidats.map(c => c.id)).not.toContain('panier-remise')
+  expect(grise.candidats[0]!.score).toBeGreaterThanOrEqual(grise.candidats[1]!.score)
+  expect(grise.candidats[1]!.score).toBeGreaterThanOrEqual(2)
+  expect(grise.candidats[2]).toMatchObject({ id: 'complementary-products', score: 0 })
+  expect(grise.candidats.find(c => c.id === 'panier')).toMatchObject({ titre: 'Panier', alias: ['cart', 'basket'] })
+  expect(matchRequest(g, 'le panier')).toBeUndefined()
+
+  const prompt = rerankPrompt('le panier et les navettes', grise.candidats)
+  expect(prompt).toContain('Demande : « le panier et les navettes »')
+  expect(prompt).toContain('- panier · Panier · cart, basket')
+  expect(prompt).toContain('« aucune »')
+  expect(tokensOf(prompt)).toBeLessThan(400)
+  const c = grise.candidats
+  expect(parseRerank('panier', c)).toBe('panier')
+  expect(parseRerank(' « Panier ». ', c)).toBe('panier')
+  expect(parseRerank('`complementary-products`', c)).toBe('complementary-products')
+  expect(parseRerank('La fiche complementary-products.', c)).toBe('complementary-products')
+  expect(parseRerank('aucune', c)).toBeUndefined()
+  expect(parseRerank('Aucune.', c)).toBeUndefined()
+  expect(parseRerank('navettes', c)).toBeUndefined()
+  expect(parseRerank('panier ou complementary-products', c)).toBeUndefined()
+  expect(parseRerank(undefined as never, c)).toBeUndefined()
+})
+
+test('searchHits et neighborHits : ce que listent chercher et voisins, frais, sans feature, poids prudent', () => {
+  const g = nuxt3()
+  const sh = searchHits(g, 'offer', 'chercher')
+  expect(sh.map(h => h.p)).toEqual(search(g, 'offer').files.map(x => x.p))
+  expect(sh.every(h => h.frais && h.feature === undefined && h.poids === POIDS_LISTE && h.par === 'chercher' && h.tok === g.fichiers[h.p]!.tok)).toBe(true)
+  const nh = neighborHits(g, 'stores/booking/Booking.ts', 1, 'voisins')
+  expect(nh.map(h => h.p).sort()).toEqual(['composables/useCart.ts', 'docs/A.md', 'pages/booking/offer.vue', 'services/offer.ts'])
+  expect(nh.every(h => h.poids === POIDS_LISTE && h.frais && h.par === 'voisins')).toBe(true)
+  const deep = neighborHits(g, 'stores/booking/Booking.ts', 2, 'voisins')
+  expect(deep.find(h => h.p === 'services/offer.ts')!.poids).toBe(POIDS_LISTE)
+  expect(deep.some(h => h.p.startsWith('q:') || h.p === 'stores/booking/Booking.ts')).toBe(false)
+  expect(neighborHits(g, 'inconnu.ts', 1, 'voisins')).toEqual([])
+  expect(searchHits(g, 'zzzz', 'chercher')).toEqual([])
+})
+
+test('confidenceDrift, freshness avec dérive, driftNeighbors', () => {
+  expect(confidenceDrift(0.9, { ageDays: 0, commits: 0 })).toBe(0.9)
+  expect(confidenceDrift(0.9, { ageDays: 29, commits: 19 })).toBe(0.9)
+  expect(confidenceDrift(0.9, { ageDays: 0, commits: 40 })).toBe(0.72)
+  expect(confidenceDrift(0.9, { ageDays: 95, commits: 0 })).toBe(0.81)
+  expect(confidenceDrift(0.9, { ageDays: 3000, commits: 500 })).toBe(0.3)
+  expect(confidenceDrift(0.2, { ageDays: 3000, commits: 500 })).toBe(0.2)
+  const g = withFeatures()
+  const cp = g.features['complementary-products']!
+  expect(freshness(g, cp).confiance).toBe(0.9)
+  const drifted = { ...cp, derive: { commits: 40, calcule: '2026-10-20T10:00:00.000Z' } }
+  expect(freshness(g, drifted)).toMatchObject({ niveau: 'fraiche', confiance: 0.72 })
+  expect(featureText(g, drifted)).toContain("confiance 0,72 (0,90 à l'apprentissage)")
+  expect(driftNeighbors(g, g.features.panier!)).toEqual(['pages/booking/offer.vue', 'stores/booking/Booking.ts'])
+  // un nouvel apprentissage efface la dérive
+  const g2 = { ...g, features: { ...g.features, [cp.id]: drifted } }
+  expect(learn(g2, { feature: cp.id, resume: 'x' }, LEARN).graph.features[cp.id]!.derive).toBeUndefined()
+})
+
+test('featureText : une ligne par dépendance (id, titre, fraîcheur), sans précharger la fiche voisine', () => {
+  const g = learn(withFeatures(), { feature: 'panier', deps: ['complementary-products', 'Inconnue'] }, LEARN).graph
+  const t = featureText(g, g.features.panier!)
+  expect(t).toContain('Dépend de (action feature, id, pour la fiche entière) :')
+  expect(t).toContain('- complementary-products : Produits complémentaires et transports · ✓ fraîche · confiance 0,90')
+  expect(t).toContain('- inconnue · pas de fiche')
+  expect(t).not.toContain('Onglets Complémentaires')
+})
+
+test('diffText : un diff de plus de 30 % du fichier n’est pas servi, il faut relire le fichier', () => {
+  const g = extractGraph()
+  const f = g.features[CP]!
+  const tok = g.fichiers['services/offer.ts']!.tok
+  const gros = ['@@ -1,40 +1,40 @@', ...Array.from({ length: 40 }, (_, i) => `${i % 2 ? '+' : '-'}${'x'.repeat(40)}`)].join('\n')
+  expect(tokensOf(gros)).toBeGreaterThan(0.3 * tok)
+  const t = diffText(g, f, undefined, [{ p: 'services/offer.ts', depuis: 'a', diff: gros }])
+  expect(t).toContain('### services/offer.ts (+20/-20 lignes)')
+  expect(t).toMatch(/diff trop gros \(≈ [\d,k]+ tokens, plus de 30 % du fichier de ≈ [\d,k]+\) : relis le fichier entier\./)
+  expect(t).not.toContain('x'.repeat(40))
+  // petit diff : servi
+  expect(diffText(g, f, undefined, [{ p: 'services/offer.ts', depuis: 'a', diff: '@@ -1 +1 @@\n-a\n+b' }])).toContain('-a\n+b')
 })

@@ -16,14 +16,20 @@ import {
   featureText,
   freshness,
   graphText,
+  isDraft,
   learn,
   matchRequest,
+  matchZone,
+  neighborHits,
   neighborsText,
+  parseRerank,
   perimeOf,
   recordUsage as recordCacheUsage,
   refreshFiles,
+  rerankPrompt,
   resolveKey,
   sameHash,
+  searchHits,
   searchText,
   servedFiles,
   servedSubset,
@@ -41,6 +47,7 @@ import {
   refreshGraph,
   resolveProject,
   saveGraph,
+  withDrift,
   type Io,
 } from './cache/store'
 import {
@@ -56,6 +63,7 @@ import {
   allFinished,
   applyStep,
   applyTodos,
+  bashReadFile,
   costUsd,
   dayKey,
   describeCall,
@@ -569,6 +577,25 @@ function keepGraph(graph: Graph, now: number) {
   return graph
 }
 
+/** Un fichier vient d'être modifié dans le projet : le graphe gardé sera revérifié par hash au prochain appel, sans attendre REFRESH_MS (L17). */
+function staleGraph(cle: string | undefined) {
+  const held = cle ? graphCache.get(cle) : undefined
+  if (held) held.refreshedAt = 0
+}
+
+/**
+ * La fiche avec sa dérive (withDrift : commits sur ses voisins depuis l'apprentissage), à calculer avant de la servir pour que freshness
+ * applique la décroissance de confiance. Le graphe rendu est gardé sans toucher à l'heure de sa dernière vérification ; jamais d'exception.
+ */
+async function drifted($: $, graph: Graph, f: Feature): Promise<Graph> {
+  // Calculée il y a moins de REFRESH_MS (un agent après l'autre) : pas de nouvel appel git.
+  const at = Date.parse(graph.features[f.id]?.derive?.calcule ?? '')
+  if (Number.isFinite(at) && (await $.clock.now()) - at < REFRESH_MS) return graph
+  const next = await withDrift(ioOf($), graph, f).catch(() => graph)
+  if (next === graph) return graph
+  return keepGraph(next, graphCache.get(graph.projet.cle)?.refreshedAt ?? 0)
+}
+
 /**
  * Le graphe du projet : relu et rafraîchi (hash git) au plus toutes les 30 s, sauf `force`.
  * S'il n'existe pas, la couche mécanique se construit tout de suite avec `build` (moins de 2 s, sans LLM).
@@ -632,19 +659,41 @@ async function served($: $, cle: string, hits: readonly CacheHit[], injected: nu
   await refreshStats($)
 }
 
-/** Un Read réussi pendant le flow : le chemin relatif, sa taille en tokens (ou limit × 12 caractères / 4), qui l'a lu. */
-function noteRead($: $, path: string, limit: unknown, who: string) {
+/** Tokens comptés par ligne d'un Read partiel : 8 à 10 en pratique (§1.2 L9). */
+const LINE_TOK = 9
+
+/**
+ * Un fichier lu pendant le flow : le chemin relatif, sa taille en tokens, qui l'a lu. Read : le fichier entier, ou limit × LINE_TOK ;
+ * Bash (cat, sed -n, head, tail d'un seul fichier) : la taille de la sortie, via 'bash'. Un chemin hors du projet n'est pas compté.
+ */
+function noteRead($: $, path: string, size: { limit?: unknown; tok?: number }, who: string, via?: 'bash') {
   $.clock.after(0, async () => {
     try {
       const fc = await read($, flowCacheA)
       const ref = await flowRefOf($, fc)
       const p = ref ? relTo(ref.racine, path) : undefined
-      if (!fc || !ref || !p) return
-      const tok = typeof limit === 'number' && limit > 0 ? Math.round((limit * 12) / 4) : await fileTokens(ioOf($), ref.racine, p)
-      await update($, flowCacheA, f => (f && f.cle === fc.cle ? { ...f, lus: [...f.lus, { p, tok, par: who }].slice(-500) } : f))
+      if (!fc || !ref || !p || /^(~|\.\.)(\/|$)/.test(p)) return
+      const { limit, tok: known } = size
+      const tok =
+        typeof known === 'number' ? known : typeof limit === 'number' && limit > 0 ? Math.round(limit * LINE_TOK) : await fileTokens(ioOf($), ref.racine, p)
+      const entry = { p, tok, par: who, ...(via ? { via } : {}) }
+      await update($, flowCacheA, f => (f && f.cle === fc.cle ? { ...f, lus: [...f.lus, entry].slice(-500) } : f))
       await refreshStats($)
     } catch {
       // la mesure ne doit jamais gêner l'outil
+    }
+  })
+}
+
+/** La sortie d'un Grep ou d'un Glob pendant le flow : ses tokens s'ajoutent à FlowCache.outils (lectures non attribuables à un fichier). */
+function noteToolOutput($: $, tok: number) {
+  if (!(tok > 0)) return
+  $.clock.after(0, async () => {
+    try {
+      await update($, flowCacheA, f => (f ? { ...f, outils: (f.outils ?? 0) + tok } : f))
+      await refreshStats($)
+    } catch {
+      // idem
     }
   })
 }
@@ -730,17 +779,21 @@ async function cacheTool($: $, e: CacheCall): Promise<string> {
       const q = text(e.requete) || text(e.feature)
       if (!q) return 'revo-flow cache : « requete » manquante (des mots-clés).'
       answer = searchText(graph, q)
+      // Les fichiers listés comptent, à poids réduit, comme évités s'ils ne sont pas lus ensuite (L12).
+      hits = searchHits(graph, q, who)
       break
     }
     case 'feature': {
       const id = text(e.feature) || text(e.requete)
-      const f = findFeature(graph, id)
-      if (!f) {
+      const found = findFeature(graph, id)
+      if (!found) {
         answer = `Pas de fiche « ${id} » dans le cache de ${ref.nom}.\n${searchText(graph, id)}`
         break
       }
-      answer = featureText(graph, f)
-      hits = servedFiles(graph, f, who)
+      const g = await drifted($, graph, found)
+      const f = g.features[found.id] ?? found
+      answer = featureText(g, f)
+      hits = servedFiles(g, f, who)
       feature = f.id
       break
     }
@@ -748,7 +801,9 @@ async function cacheTool($: $, e: CacheCall): Promise<string> {
       const raw = text(e.chemin)
       if (!raw) return 'revo-flow cache : « chemin » manquant (relatif à la racine du projet).'
       const depth = Math.min(2, Math.max(1, Math.round(Number(e.profondeur) || 1)))
-      answer = neighborsText(graph, relTo(ref.racine, raw) ?? raw, depth)
+      const p = relTo(ref.racine, raw) ?? raw
+      answer = neighborsText(graph, p, depth)
+      hits = neighborHits(graph, p, depth, who)
       break
     }
     case 'diff':
@@ -911,6 +966,26 @@ async function learnTool($: $, e: CacheCall, ref: ProjectRef, graph: Graph, live
   ].join('\n')
 }
 
+/** Délai laissé à Haiku pour trancher la zone grise : au-delà, pas de fiche (le lancement ne doit pas attendre). */
+const RERANK_MS = 5_000
+
+/**
+ * La fiche que vise la demande (matchZone) : zone nette, celle de BM25 ; zone grise, celle que Haiku choisit parmi les candidates
+ * (rerankPrompt, parseRerank) ; échec, délai dépassé ou « aucune » : pas de fiche. Jamais d'exception.
+ */
+async function pickFeature($: $, graph: Graph, request: string): Promise<{ id: string; byHaiku: boolean } | undefined> {
+  try {
+    const z = matchZone(graph, request)
+    if (z.zone === 'nette' && z.id) return { id: z.id, byHaiku: false }
+    if (z.zone !== 'grise' || !z.candidats.length) return undefined
+    const r = await $.model.complete({ model: 'haiku', prompt: rerankPrompt(request, z.candidats), maxTokens: 60, timeoutMs: RERANK_MS })
+    const id = r.isAnswered ? parseRerank(r.text, z.candidats) : undefined
+    return id && graph.features[id] ? { id, byHaiku: true } : undefined
+  } catch {
+    return undefined
+  }
+}
+
 /** Au lancement d'un flow : la mesure repart de zéro, puis le brief du cache (avec confirmation si une fiche correspond). */
 async function startFlowCache($: $, flowId: string, request: string): Promise<string | undefined> {
   await update($, flowCacheA, () => null)
@@ -922,15 +997,18 @@ async function startFlowCache($: $, flowId: string, request: string): Promise<st
     await refreshStats($)
     return undefined
   }
-  // La mesure (tokens lus) tourne même sans cache : c'est la baseline.
-  await update($, flowCacheA, () => ({ cle: ref.cle, servis: [], lus: [], injecte: 0 }))
+  // La mesure (tokens lus) tourne même sans cache : c'est la population « sans cache » du journal.
+  await update($, flowCacheA, () => ({ cle: ref.cle, cache: opts.cache, servis: [], lus: [], outils: 0, injecte: 0 }))
   if (!opts.cache) return undefined
-  const graph = await graphOf($, ref, { build: true }).catch(() => null)
+  let graph = await graphOf($, ref, { build: true }).catch(() => null)
   if (!graph) return undefined
-  const m = matchRequest(graph, request)
-  let f = m ? graph.features[m.id] : undefined
+  const picked = await pickFeature($, graph, request)
+  let f = picked ? graph.features[picked.id] : undefined
   if (f) {
-    const q = `Je pense qu’il s’agit de « ${f.titre} » (confiance ${frac(freshness(graph, f).confiance)}) : utiliser la fiche du cache ?`
+    graph = await drifted($, graph, f)
+    f = graph.features[f.id] ?? f
+    const by = picked?.byHaiku ? ' (proposée par Haiku)' : ''
+    const q = `Je pense qu’il s’agit de « ${f.titre} »${by} (confiance ${frac(freshness(graph, f).confiance)}) : utiliser la fiche du cache ?`
     // Sans personne à qui demander (claude -p), la fiche est utilisée ; dialogue fermé : ignorée.
     const answer = await askOr($, q, ['Utiliser', 'Ignorer'], { headless: 'Utiliser', dismissed: 'Ignorer' })
     if (answer !== 'Utiliser') f = undefined
@@ -975,30 +1053,34 @@ async function learnAtEnd($: $, flow: Flow) {
     le: new Date(now).toISOString(),
     confiance: 0.5,
   }
-  keepGraph(await saveGraph(ioOf($), autoFiche(graph, id, files, ctx)), now)
-  endNote = `fiche auto « ${id} »`
+  const r = autoFiche(graph, id, files, ctx)
+  if (r.graph === graph) return
+  keepGraph(await saveGraph(ioOf($), r.graph), now)
+  // La fiche écrite compte comme apprise par ce flow (journal : comparaison avant / après par feature).
+  Object.assign(learned, { flowId: flow.id, features: [r.id] })
+  endNote = r.rattachee ? `fiche auto « ${r.id} » (rattachée)` : `brouillon « ${r.id} »`
 }
 
-/** Le flow est fini : usages et gains dans le graphe, fiche servie complétée des fichiers lus, baseline des flows sans fiche. */
+/**
+ * Le flow est fini : son entrée dans le journal du graphe (cache actif ou non : c'est la mesure), usages et gains des fiches servies,
+ * fiche servie complétée des fichiers lus. Cache désactivé : seulement si le graphe existe déjà (on ne le construit pas pour mesurer).
+ */
 async function closeFlowCache($: $) {
   const fc = await read($, flowCacheA)
   if (!fc) return
-  // Un flow arrêté n'est pas représentatif : ni baseline, ni fiche complétée.
-  const isStopped = (await read($, flowA))?.isStopped === true
-  if (fc.servis.length === 0 && !isStopped) {
-    const sizes = new Map(fc.lus.map(l => [l.p, l.tok] as const))
-    const key = `baseline:${fc.cle}`
-    const prev = (await $.store.get(key)) as { flows?: unknown; lus?: unknown } | undefined
-    const num = (v: unknown) => (typeof v === 'number' ? v : 0)
-    await $.store.set(key, { flows: num(prev?.flows) + 1, lus: num(prev?.lus) + [...sizes.values()].reduce((a, b) => a + b, 0) })
-  }
-  if (!opts.cache) return
+  // Un flow arrêté n'est pas représentatif : ni journal, ni fiche complétée.
+  const flow = await read($, flowA)
+  if (flow?.isStopped === true) return
   const ref = await flowRefOf($, fc)
-  const graph = ref ? await graphOf($, ref) : null
+  if (!ref) return
+  const graph = opts.cache ? await graphOf($, ref) : (graphCache.get(ref.cle)?.graph ?? (await loadGraph(ioOf($), ref).catch(() => null)))
   if (!graph) return
-  let next = recordCacheUsage(graph, fc)
-  if (fc.feature && next.features[fc.feature] && !isStopped) next = completeFiche(next, fc.feature, [...new Set(fc.lus.map(l => l.p))])
-  keepGraph(await saveGraph(ioOf($), next), await $.clock.now())
+  const now = await $.clock.now()
+  const appris = flow && learned.flowId === flow.id ? [...learned.features] : []
+  let next = recordCacheUsage(graph, fc, { le: new Date(now).toISOString(), appris })
+  if (opts.cache && fc.feature && next.features[fc.feature]) next = completeFiche(next, fc.feature, [...new Set(fc.lus.map(l => l.p))])
+  // Sans cache, le graphe n'a pas été revérifié par hash : il ne passe pas pour frais.
+  keepGraph(await saveGraph(ioOf($), next), opts.cache ? now : (graphCache.get(ref.cle)?.refreshedAt ?? 0))
   await refreshStats($)
 }
 
@@ -1012,9 +1094,11 @@ async function agentCacheExtract($: $, a: FlowAgent, prompt: unknown): Promise<{
     const fc = await read($, flowCacheA)
     if (!fc?.feature) return undefined
     const ref = await flowRefOf($, fc)
-    const graph = ref ? await graphOf($, ref) : null
-    const f = graph?.features[fc.feature]
-    if (!graph || !f) return undefined
+    const fresh = ref ? await graphOf($, ref) : null
+    const served = fresh?.features[fc.feature]
+    if (!fresh || !served) return undefined
+    const graph = await drifted($, fresh, served)
+    const f = graph.features[served.id] ?? served
     const agent: AgentInfo = { name: a.name, tasks: a.tasks.map(t => t.title), prompt: typeof prompt === 'string' ? prompt : '' }
     const text = agentExtract(graph, f, agent)
     if (!text) return undefined
@@ -1040,7 +1124,10 @@ const RECAP_MAX = 15
 function cacheRecap(fc: FlowCache | null): string | undefined {
   const graph = fc && opts.cache ? graphCache.get(fc.cle)?.graph : undefined
   if (!fc || !graph) return undefined
-  const ids = Object.keys(graph.features)
+  // Les brouillons (fiches auto non rattachées) restent hors du rappel, comme hors du brief.
+  const ids = Object.values(graph.features)
+    .filter(f => !isDraft(f))
+    .map(f => f.id)
   const known = ids.length > RECAP_MAX ? `${ids.slice(0, RECAP_MAX).join(', ')}… (+${ids.length - RECAP_MAX})` : ids.join(', ')
   return `Cache revo-flow (${graph.projet.nom}) : ${fc.feature ? `fiche servie « ${fc.feature} » ; ` : ''}features connues : ${known || 'aucune'}. Outil ${CACHE_TOOL}.`
 }
@@ -2068,9 +2155,19 @@ export const register: Register = (on, options) => {
       const done = failed ? `✗ ${label}` : label
       const prev = who === 'lead' ? await read($, leadA) : (await read($, flowA))?.agents.find(a => a.key === who)
       await setActivity($, who, { isDoing: false, history: [...(prev?.history ?? []), done].slice(-3) })
-      if (!failed && path) await markFile($, path, who, e.tool_use_id, e.agentId)
+      if (!failed && path) {
+        await markFile($, path, who, e.tool_use_id, e.agentId)
+        // Un fichier du projet vient de changer : le graphe gardé est revérifié au prochain appel, pas dans 30 s (L17).
+        staleGraph((await read($, flowCacheA))?.cle ?? flowRef?.cle)
+      }
       // La mesure du cache : ce qui est réellement lu pendant le flow, hors du chemin de l'outil.
-      if (!failed && tool === 'Read' && typeof input.file_path === 'string') noteRead($, input.file_path, input.limit, who)
+      if (!failed && tool === 'Read' && typeof input.file_path === 'string') noteRead($, input.file_path, { limit: input.limit }, who)
+      if (!failed && (tool === 'Grep' || tool === 'Glob')) noteToolOutput($, tokensOf(ran.text ?? ''))
+      if (!failed && tool === 'Bash' && typeof input.command === 'string') {
+        // Seule une lecture d'un fichier (cat, sed -n, head, tail) compte, à la taille de sa sortie ; toute autre commande est ignorée.
+        const file = bashReadFile(input.command)
+        if (file) noteRead($, file, { tok: tokensOf(ran.text ?? '') }, who, 'bash')
+      }
       // Un agent qui tient un TodoWrite calqué sur sa liste, sans passer par l'outil step : on suit quand même.
       if (!failed && tool === 'TodoWrite' && who !== 'lead') {
         await setAgent($, who, a => {

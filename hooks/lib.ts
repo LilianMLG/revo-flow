@@ -523,6 +523,38 @@ export function projectOf(path: string | undefined): Project | undefined {
 /** Le chemin court d'un fichier : relatif au projet, sinon ses 3 derniers segments. */
 export const shortPath = (path: string) => projectOf(path)?.rel || path.replace(/\\/g, '/').split('/').slice(-3).join('/')
 
+/**
+ * Le fichier lu par une commande Bash de lecture d'un seul fichier (cat, sed -n, head, tail) ; rien pour toute autre
+ * commande (tube, enchaînement, redirection, substitution, plusieurs fichiers, glob) : sa sortie n'est pas attribuable à un fichier.
+ */
+export function bashReadFile(command: string): string | undefined {
+  const c = command.trim()
+  if (!c || /[|;&<>`$\n*?]/.test(c)) return undefined
+  const words = [...c.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map(m => m[1] ?? m[2] ?? m[3] ?? '')
+  const cmd = words[0]
+  const args = words.slice(1)
+  if (cmd !== 'cat' && cmd !== 'sed' && cmd !== 'head' && cmd !== 'tail') return undefined
+  const files: string[] = []
+  let silent = false
+  let script = cmd !== 'sed'
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!
+    if (a === '--') continue
+    if (a.startsWith('-') && a.length > 1) {
+      if (cmd === 'sed') {
+        if (a !== '-n') return undefined
+        silent = true
+      } else if ((a === '-n' || a === '-c') && cmd !== 'cat') i++
+      else if (cmd === 'cat' ? !/^-[nbsAEvT]+$/.test(a) : !/^(-\d+|-[qv]|-[nc]\d+)$/.test(a)) return undefined
+      continue
+    }
+    if (!script) script = true
+    else files.push(a)
+  }
+  if (cmd === 'sed' && !silent) return undefined
+  return script && files.length === 1 ? files[0] : undefined
+}
+
 /** Première phrase d'un texte, ramenée à une ligne. */
 export function firstSentence(text: string, max = 140): string {
   const flat = text

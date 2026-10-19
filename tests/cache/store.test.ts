@@ -3,9 +3,9 @@ import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import type { Feature, Graph } from '../../types/cache'
-import { diffSince, graphFileName, mergeGraphs, normalizePath, parseLsFiles, parseNameStatus, parseStatus, refreshGraph, stripDiffHeader } from '../../hooks/cache/store'
+import { diffSince, graphFileName, mergeGraphs, normalizePath, parseLsFiles, parseNameStatus, parseStatus, refreshGraph, stripDiffHeader, withDrift } from '../../hooks/cache/store'
 import type { Io } from '../../hooks/cache/store'
-import { MECA_FORMAT, hashPath } from '../../hooks/cache/graph'
+import { MECA_FORMAT, freshness, hashPath } from '../../hooks/cache/graph'
 import { OSES, diskKey, native, type Os } from '../helpers/os'
 
 const DOCS = 'C:/Users/x/Documents'
@@ -259,6 +259,26 @@ test('mergeGraphs : la couche mécanique la plus récemment indexée gagne ; usa
   expect(Object.keys(m.fichiers)).toEqual(['a.ts'])
   expect(m.projet.indexe.le).toBe('2026-10-14T11:00:00Z')
   expect(m.features['f']!.usages).toEqual({ servie: 4, evites: 500 })
+})
+
+test('mergeGraphs : journal uni par date (trié, 200 derniers), fichiers lus des usages unis ; graphe ancien sans journal', () => {
+  const e = (le: string, lus = 1) => ({ le, cache: true, lus, outils: 0, injecte: 0, evites: 0 })
+  const mine = graph(1, [feature('f', '2026-10-14T10:00:00Z', { usages: { servie: 1, evites: 5, lus: ['a.ts', 'b.ts'] } })])
+  const disk = graph(2, [feature('f', '2026-10-14T09:00:00Z', { usages: { servie: 2, evites: 1, lus: ['c.ts', 'a.ts'] } })])
+  mine.journal = [e('2026-10-14T10:00:00Z'), e('2026-10-14T12:00:00Z', 2)]
+  disk.journal = [e('2026-10-14T11:00:00Z'), e('2026-10-14T12:00:00Z', 9)]
+  const m = mergeGraphs(mine, disk)
+  expect(m.journal!.map(x => x.le)).toEqual(['2026-10-14T10:00:00Z', '2026-10-14T11:00:00Z', '2026-10-14T12:00:00Z'])
+  expect(m.journal![2]!.lus).toBe(2)
+  expect(m.features['f']!.usages).toEqual({ servie: 2, evites: 5, lus: ['a.ts', 'b.ts', 'c.ts'] })
+  expect(mergeGraphs(graph(1, []), graph(2, [])).journal).toEqual([])
+  const many = graph(1, [])
+  many.journal = Array.from({ length: 150 }, (_, i) => e(`2026-10-14T10:00:${String(i).padStart(3, '0')}Z`))
+  const other = graph(2, [])
+  other.journal = Array.from({ length: 150 }, (_, i) => e(`2026-10-14T11:00:${String(i).padStart(3, '0')}Z`))
+  const big = mergeGraphs(many, other).journal!
+  expect(big).toHaveLength(200)
+  expect(big[199]!.le).toBe('2026-10-14T11:00:149Z')
 })
 
 
@@ -589,4 +609,72 @@ test('refreshGraph : aucun contenu changé mais HEAD a bougé, indexe.commit et 
   const same = await refreshGraph(io, { ...g0, projet: { ...g0.projet, indexe: { ...g0.projet.indexe, branche: 'feature/x' } } })
   expect(same.head).toBe(false)
   expect(same.graph.projet.indexe.commit).toBe('abc1234')
+})
+
+test('refreshGraph : HEAD a bougé, les candidates sont recalculées sur git log ; HEAD inchangé : aucun git log', async () => {
+  let head = 'def5678'
+  const calls: string[][] = []
+  const io = {
+    now: async () => NOW,
+    run: async (argv: string[]) => {
+      const args = argv.slice(4)
+      calls.push(args)
+      const out = (stdout: string) => ({ exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false })
+      if (args[0] === 'ls-files') return out(`100644 ${blob('a4')} 0\tutils/a.ts\0`)
+      if (args[0] === 'status') return out('')
+      if (args[0] === 'rev-parse') return out(`${args.includes('--short') ? head : 'main'}\n`)
+      if (args[0] === 'log') return out('feat(panier): a\nutils/a.ts\n\nfix(panier): b\nutils/a.ts\n')
+      return { ...out(''), exitCode: 1 }
+    },
+  } as unknown as Io
+  const g0 = graph(1, [])
+  g0.fichiers['utils/a.ts'] = { k: 'util', h: h12('a4'), tok: 7 }
+  const r = await refreshGraph(io, g0)
+  expect(r.head).toBe(true)
+  expect(r.graph.candidates).toEqual([{ id: 'panier', commits: 2, fichiers: 1, tok: 7 }])
+  expect(calls.some(c => c[0] === 'log' && c.includes('500') && c.includes('--name-only'))).toBe(true)
+  calls.length = 0
+  head = 'abc1234'
+  const same = await refreshGraph(io, g0)
+  expect(same.head).toBe(false)
+  expect(same.graph).toBe(g0)
+  expect(calls.some(c => c[0] === 'log')).toBe(false)
+})
+
+// ── Dérive d'une fiche ───────────────────────────────────────────────────
+
+test('withDrift : rev-list --count sur les voisins hors fiche, derive écrite, confiance réduite ; échec ou commit disparu : âge seul ; jamais d’exception', async () => {
+  const g0 = graph(1, [
+    feature('f', '2026-08-01T09:00:00Z', { fichiers: [{ p: 'a.ts', role: 'coeur', h: h12('a1') }], appris: { le: '2026-08-01T09:00:00Z', commit: 'abc1234', branche: 'main' } }),
+  ])
+  g0.fichiers = {
+    'a.ts': { k: 'util', h: h12('a1'), tok: 10, out: { importe: ['b.ts'] } },
+    'b.ts': { k: 'util', h: h12('b1'), tok: 10 },
+    'c.ts': { k: 'util', h: h12('c1'), tok: 10, out: { importe: ['a.ts'] } },
+    'a.test.ts': { k: 'test', h: h12('t1'), tok: 10, out: { teste: ['a.ts'] } },
+  }
+  const f = g0.features['f']!
+  const ok = fakeIo(args => (args[0] === 'rev-list' ? { exitCode: 0, stdout: '45\n' } : { exitCode: 1 }))
+  const io = { ...ok.io, now: async () => NOW } as unknown as Io
+  const g1 = await withDrift(io, g0, f)
+  expect(ok.calls).toEqual([{ args: ['rev-list', '--count', 'abc1234..HEAD', '--', 'b.ts', 'c.ts'], cwd: 'C:/Users/x/Documents/Front/app', timeoutMs: 2000 }])
+  expect(g1.features['f']!.derive).toEqual({ commits: 45, calcule: new Date(NOW).toISOString() })
+  expect(g0.features['f']!.derive).toBeUndefined()
+  // 2 tranches de 20 commits (−20 %) et 74 jours (1 mois entier après le premier : −5 %) : 0,9 × 0,8 × 0,95
+  expect(freshness(g1, g1.features['f']!).confiance).toBe(0.68)
+
+  const gone = fakeIo(() => ({ exitCode: 128 }))
+  const g2 = await withDrift({ ...gone.io, now: async () => NOW } as unknown as Io, g0, f)
+  expect(g2.features['f']!.derive).toEqual({ commits: 0, calcule: new Date(NOW).toISOString() })
+  const boom = fakeIo(() => 'throw')
+  expect((await withDrift({ ...boom.io, now: async () => NOW } as unknown as Io, g0, f)).features['f']!.derive!.commits).toBe(0)
+  // sans commit d'apprentissage : aucune commande
+  const none = fakeIo(() => ({ exitCode: 0, stdout: '9' }))
+  const sans = graph(1, [feature('f', '2026-08-01T09:00:00Z', { fichiers: f.fichiers, appris: { le: '2026-08-01T09:00:00Z', commit: '', branche: '' } })])
+  sans.fichiers = g0.fichiers
+  expect((await withDrift({ ...none.io, now: async () => NOW } as unknown as Io, sans, sans.features['f']!)).features['f']!.derive!.commits).toBe(0)
+  expect(none.calls).toEqual([])
+  // fiche inconnue : le même graphe ; horloge en panne : le même graphe
+  expect(await withDrift(io, g0, feature('autre', '2026-08-01T09:00:00Z'))).toBe(g0)
+  expect(await withDrift({ ...ok.io, now: async () => { throw new Error('x') } } as unknown as Io, g0, f)).toBe(g0)
 })

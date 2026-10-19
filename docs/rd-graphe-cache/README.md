@@ -1,6 +1,6 @@
 # R&D : graphe de cache par projet
 
-> **Statut : lots 0 à 3 implémentés en v1.2.0 (2026-10-14) ; lot 4 en partie en v1.3.0 (2026-10-15) : extrait de fiche injecté à chaque agent, actions `rafraichir` et `diff` ; le reste du lot 4 à venir.**
+> **Statut : lots 0 à 3 implémentés en v1.2.0 (2026-10-14) ; lot 4 en partie en v1.3.0 (2026-10-15) : extrait de fiche injecté à chaque agent, actions `rafraichir` et `diff`. v1.4 : carte à froid classée et résumé d'une ligne par fichier. v1.5.0 (2026-10-19) : mesure par journal des flows (la baseline du lot 0 est remplacée), brouillons pour les fiches auto, Haiku en zone grise, décroissance de confiance ; détail piste par piste dans [ameliorations.md](ameliorations.md#statut-2026-10-19-v150). Liens Front ↔ Back et export Markdown : différés.**
 >
 > Étude de faisabilité du 2026-10-14. Trois fiches détaillées :
 > [conception.md](conception.md) (modèle, construction, usage, gains), [api-plugin.md](api-plugin.md)

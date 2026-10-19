@@ -76,8 +76,18 @@ export type Feature = {
   appris: { le: string; commit: string; branche: string }
   /** Fichiers de la fiche dont le hash a changé depuis l'apprentissage (nouveau = '' : supprimé). */
   perime: { p: string; depuis: string; nouveau: string }[]
-  usages: { servie: number; evites: number }
+  /** lus : fichiers lus dans les flows antérieurs où la fiche était servie (≤ 60, les plus récents d'abord), pour le contrefactuel des gains. */
+  usages: { servie: number; evites: number; lus?: string[] }
+  /** Fiche automatique non rattachée (autoFiche) : stats.flows à sa création ; hors brief et hors correspondance, purgée après 10 flows sans usage. */
+  brouillon?: { flow: number }
+  /** Dérive (withDrift, store.ts) : commits sur les voisins à 1 saut hors fiche depuis appris.commit, et date ISO du calcul ; freshness en tire une décroissance. */
+  derive?: { commits: number; calcule: string }
 }
+/**
+ * Un flow terminé (recordUsage) : cache actif ou non, fiche servie, fiches apprises, tokens lus (Read et Bash), sortis des outils
+ * (Grep, Glob, Bash non attribuable à un fichier), injectés et évités.
+ */
+export type JournalEntry = { le: string; cache: boolean; feature?: string; appris?: string[]; lus: number; outils: number; injecte: number; evites: number }
 export type Candidate = { id: string; commits: number; fichiers: number; tok: number; note?: string }
 export type Graph = {
   v: 1
@@ -100,16 +110,26 @@ export type Graph = {
   features: Record<string, Feature>
   candidates: Candidate[]
   stats: { flows: number; servis: number; evites: number; net: number }
+  /** Les 200 derniers flows, le plus récent en dernier ; absent dans un graphe ancien (= []). */
+  journal?: JournalEntry[]
 }
 /** Un fichier de la carte à froid (coldRank) : score 0 à 1 ; pertinent = la demande touche le fichier lui-même (nom, dossiers, exports, sum). */
 export type ColdFile = { p: string; score: number; pertinent: boolean }
-/** Un fichier servi par le cache pendant le flow courant. par = 'brief' | 'feature' | 'voisins' | 'chercher'. */
-export type CacheHit = { p: string; tok: number; feature?: string; frais: boolean; par: string }
+/**
+ * Un fichier servi par le cache pendant le flow courant. par = 'brief' | 'feature' | 'voisins' | 'chercher'.
+ * poids : part de sa taille comptée comme évitée s'il n'est pas lu (1 par défaut ; plus bas pour un fichier seulement listé par chercher ou voisins).
+ */
+export type CacheHit = { p: string; tok: number; feature?: string; frais: boolean; par: string; poids?: number }
 /** Ce que le flow courant a lu et reçu du cache (gardé dans un atom par register.tsx). */
 export type FlowCache = {
   cle: string
+  /** Le cache est actif pour ce flow (sinon la mesure tourne seule : c'est la population « sans cache »). */
+  cache: boolean
   servis: CacheHit[]
-  lus: { p: string; tok: number; par: string }[]
+  /** Fichiers lus ; via 'bash' : lu par cat, sed -n, head ou tail. */
+  lus: { p: string; tok: number; par: string; via?: 'bash' }[]
+  /** Tokens renvoyés par Grep, Glob et les commandes Bash de lecture non attribuables à un fichier. */
+  outils?: number
   /** Tokens injectés par le cache (brief et réponses de l'outil). */
   injecte: number
   feature?: string
@@ -139,6 +159,16 @@ export type CacheStats = {
    */
   flow: { injecte: number; evites: number; net: number; lus: number; completude: number; feature?: string }
   cumul: { flows: number; evites: number; net: number }
+  /**
+   * La mesure tirée du journal : lus = moyenne par flow de (lus + outils). sans = cache désactivé ; sansFiche = cache actif sans fiche servie ;
+   * avecFiche = cache actif avec une fiche ; parFeature = même feature, flows où elle a été apprise sans être servie (avant) puis servie (après), 5 au plus.
+   */
+  mesure: {
+    sans: { flows: number; lus: number }
+    sansFiche: { flows: number; lus: number }
+    avecFiche: { flows: number; lus: number }
+    parFeature: { id: string; avant: { flows: number; lus: number }; apres: { flows: number; lus: number } }[]
+  }
   build?: { feature: string; tokens: number; costUsd: number }
 }
 export type LearnInput = {

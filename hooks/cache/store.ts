@@ -3,8 +3,21 @@
 // register.tsx construit donc un `Io` (ioOf) dont chaque méthode appelle $.fs, $.process, $.env, $.session ou $.clock.
 import type { EngineInterface } from 'claude-code'
 
-import type { Graph, SourceFile } from '../../types/cache'
-import { EXCLUS_DEFAUT, MANIFESTES, MECA_FORMAT, buildGraph, hashPath, isExcluded, isIndexable, projectKey, updateFiles } from './graph'
+import type { Feature, Graph, JournalEntry, SourceFile } from '../../types/cache'
+import {
+  EXCLUS_DEFAUT,
+  JOURNAL_MAX,
+  MANIFESTES,
+  MECA_FORMAT,
+  buildGraph,
+  candidatesFromLog,
+  driftNeighbors,
+  hashPath,
+  isExcluded,
+  isIndexable,
+  projectKey,
+  updateFiles,
+} from './graph'
 
 type $ = EngineInterface
 
@@ -37,6 +50,11 @@ const DIFF_MS = 10_000
 const MAX_DIFF = 200_000
 /** Lignes gardées d'un fichier supprimé (git show). */
 const GONE_LINES = 80
+/** Délai du comptage de la dérive (git rev-list --count) : il tourne au lancement d'un flow, il doit rester bref ; et chemins passés au plus. */
+const DRIFT_MS = 2_000
+const DRIFT_PATHS = 200
+/** L'historique lu pour les candidates (git log). */
+const LOG_ARGS = ['log', '-n', '500', '--pretty=format:%s', '--name-only']
 /** Lectures de fichiers en parallèle. */
 const BATCH = 16
 /** Garde-fou du parcours sans git. */
@@ -181,11 +199,20 @@ type Counters = Record<string, number>
 const statsOf = (g: Graph): Counters => ((g as unknown as { stats?: Counters }).stats ?? {}) as Counters
 const timeOf = (f: unknown): string => (f as { appris?: { le?: string } } | undefined)?.appris?.le ?? ''
 
+/** Le journal des deux versions : union par date de fin (`le`), triée, les 200 derniers. */
+function mergeJournal(a: JournalEntry[] | undefined, b: JournalEntry[] | undefined): JournalEntry[] {
+  const by = new Map<string, JournalEntry>()
+  for (const e of [...(Array.isArray(b) ? b : []), ...(Array.isArray(a) ? a : [])]) if (e && typeof e.le === 'string') by.set(e.le, e)
+  return [...by.values()].sort((x, y) => (x.le < y.le ? -1 : x.le > y.le ? 1 : 0)).slice(-JOURNAL_MAX)
+}
+
 /**
  * Fusionne deux versions du même graphe : `mine` (ce que cette session veut écrire) et `disk` (ce qu'une autre session a écrit entre-temps).
- * - fiches : feature par feature, la plus récente `appris.le` gagne (égalité : `mine`) ; une fiche absente d'un côté est gardée ; `usages` prend le plus grand de chaque compteur ;
+ * - fiches : feature par feature, la plus récente `appris.le` gagne (égalité : `mine`) ; une fiche absente d'un côté est gardée ; `usages` prend le plus grand
+ *   de chaque compteur, et l'union des fichiers lus (`lus`, ceux du gagnant d'abord, 60 au plus) ;
  * - couche mécanique (projet, fichiers, nœuds, candidates) : celle qui a été indexée le plus récemment ;
  * - stats : `disk` + ce que `mine` a ajouté depuis `baseStats` (les compteurs lus au chargement) ; sans base, le plus grand des deux ;
+ * - journal : union par `le`, trié, les 200 derniers ;
  * - rev : le plus grand des deux, plus un.
  */
 export function mergeGraphs(mine: Graph, disk: Graph, baseStats?: Counters): Graph {
@@ -197,11 +224,16 @@ export function mergeGraphs(mine: Graph, disk: Graph, baseStats?: Counters): Gra
       continue
     }
     const [win, lose] = timeOf(f) >= timeOf(d) ? [f, d] : [d, f]
-    const wu = (win as { usages?: Counters }).usages
-    const lu = (lose as { usages?: Counters }).usages
+    const wu = (win as { usages?: Record<string, unknown> }).usages
+    const lu = (lose as { usages?: Record<string, unknown> }).usages
     if (wu || lu) {
-      const usages: Counters = { ...(lu ?? {}), ...(wu ?? {}) }
-      for (const key of Object.keys(usages)) usages[key] = Math.max(wu?.[key] ?? 0, lu?.[key] ?? 0)
+      const usages: Record<string, unknown> = { ...(lu ?? {}), ...(wu ?? {}) }
+      for (const key of Object.keys(usages)) {
+        const w = wu?.[key]
+        const l = lu?.[key]
+        if (Array.isArray(w) || Array.isArray(l)) usages[key] = [...new Set([...(Array.isArray(w) ? w : []), ...(Array.isArray(l) ? l : [])])].slice(0, 60)
+        else usages[key] = Math.max(Number(w) || 0, Number(l) || 0)
+      }
       features[k] = { ...(win as object), usages }
     } else features[k] = win
   }
@@ -225,6 +257,7 @@ export function mergeGraphs(mine: Graph, disk: Graph, baseStats?: Counters): Gra
     candidates: mech.candidates,
     features,
     stats,
+    journal: mergeJournal(mine.journal, disk.journal),
     rev: Math.max(mine.rev ?? 0, disk.rev ?? 0) + 1,
   } as unknown as Graph
 }
@@ -611,7 +644,7 @@ export async function buildMechanical(io: Io, ref: ProjectRef, prev?: Graph | nu
     if (lus[k] !== undefined) manifestes[m] = lus[k]!
   })
   const head = usesGit ? await headInfo(io, racine) : { commit: '', branche: '' }
-  const log = usesGit ? (await git(io, racine, ['log', '-n', '500', '--pretty=format:%s', '--name-only'])).out : ''
+  const log = usesGit ? (await git(io, racine, LOG_ARGS)).out : ''
   return buildGraph({
     cle: ref.cle,
     racine,
@@ -634,6 +667,8 @@ export async function buildMechanical(io: Io, ref: ProjectRef, prev?: Graph | nu
  * détecte les renommages (git diff --name-status -M depuis le commit indexé, sinon un fichier disparu et un nouveau de même hash) et appelle updateFiles.
  * changed : chemins ajoutés, modifiés ou arrivés par renommage ; removed : chemins supprimés ou quittés par un renommage.
  * Aucun contenu changé mais HEAD a bougé (git commit, checkout) : seul `indexe` (commit, branche, date) suit HEAD, et `head` vaut true.
+ * Quand HEAD a bougé (et seulement alors : le cas courant ne coûte aucune commande de plus), les candidates sont recalculées sur git log (L5) ;
+ * un git log en échec garde les anciennes.
  * Rien n'est écrit : l'appelant enregistre avec saveGraph (s'il y a des changements, ou `head` pour garder le commit à jour sur disque).
  */
 export async function refreshGraph(io: Io, graph: Graph): Promise<{ graph: Graph; changed: string[]; removed: string[]; head: boolean }> {
@@ -649,7 +684,8 @@ export async function refreshGraph(io: Io, graph: Graph): Promise<{ graph: Graph
     const head = usesGit ? await headInfo(io, racine) : undefined
     if (!head?.commit || (head.commit === ix?.commit && head.branche === ix?.branche)) return { graph, changed: [], removed: [], head: false }
     const indexe = { ...ix, commit: head.commit, branche: head.branche, le: await nowIso(io) }
-    return { graph: { ...graph, projet: { ...graph.projet, indexe } }, changed: [], removed: [], head: true }
+    const moved: Graph = { ...graph, projet: { ...graph.projet, indexe } }
+    return { graph: await withCandidates(io, racine, moved), changed: [], removed: [], head: true }
   }
 
   // Renommages : l'avis de git d'abord, puis, pour le reste, même hash.
@@ -683,7 +719,40 @@ export async function refreshGraph(io: Io, graph: Graph): Promise<{ graph: Graph
   const head = usesGit ? await headInfo(io, racine) : { commit: graph.projet.indexe?.commit ?? '', branche: graph.projet.indexe?.branche ?? '' }
   const next = updateFiles(graph, sources, [...goneSet], renamed, { commit: head.commit, branche: head.branche, le: await nowIso(io) })
   const moved = head.commit !== graph.projet.indexe?.commit || head.branche !== graph.projet.indexe?.branche
-  return { graph: next, changed, removed: [...goneSet, ...renamed.map(([from]) => from)], head: moved }
+  return { graph: usesGit && moved ? await withCandidates(io, racine, next) : next, changed, removed: [...goneSet, ...renamed.map(([from]) => from)], head: moved }
+}
+
+/** Les candidates recalculées sur `git log -n 500` (candidatesFromLog) ; log en échec ou vide : le graphe tel quel. */
+async function withCandidates(io: Io, racine: string, graph: Graph): Promise<Graph> {
+  const log = await git(io, racine, LOG_ARGS)
+  if (!log.ok || !log.out.trim()) return graph
+  return { ...graph, candidates: candidatesFromLog(log.out, graph) }
+}
+
+// ── Dérive d'une fiche ───────────────────────────────────────────────────
+
+/**
+ * La dérive d'une fiche (§3.9 (d)) : `git rev-list --count <appris.commit>..HEAD -- <voisins à 1 saut hors fiche>` (driftNeighbors, 200 chemins au plus,
+ * délai 2 s : une commande, < 100 ms visé), écrite dans `f.derive` ({ commits, calcule }) du graphe rendu ; freshness en tire la décroissance de confiance.
+ * Commit disparu, sans git, sans voisin ou commande en échec : commits 0 (l'âge seul joue). Fiche absente du graphe : le même graphe. Ne lève jamais.
+ */
+export async function withDrift(io: Io, graph: Graph, f: Feature): Promise<Graph> {
+  try {
+    const cur = graph.features[f?.id ?? '']
+    if (!cur) return graph
+    const commit = cur.appris?.commit ?? ''
+    const voisins = driftNeighbors(graph, cur).slice(0, DRIFT_PATHS)
+    let commits = 0
+    if (/^[0-9a-f]{4,64}$/i.test(commit) && voisins.length) {
+      const r = await git(io, normalizePath(graph.projet.racine), ['rev-list', '--count', `${commit}..HEAD`, '--', ...voisins], undefined, DRIFT_MS)
+      const n = Number(r.out.trim())
+      if (r.ok && Number.isFinite(n) && n > 0) commits = Math.round(n)
+    }
+    const calcule = await nowIso(io)
+    return { ...graph, features: { ...graph.features, [cur.id]: { ...cur, derive: { commits, calcule } } } }
+  } catch {
+    return graph
+  }
 }
 
 // ── Diff depuis l'apprentissage ──────────────────────────────────────────

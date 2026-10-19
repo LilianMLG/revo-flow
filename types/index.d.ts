@@ -118,14 +118,19 @@ export type Context = { percent: number; tokens: number; window: number }
 // Le cache projet, tel que l'état partagé le porte. Le contrat doit se suffire à lui-même (pas d'import) :
 // ces types reprennent à l'identique ceux de types/cache.d.ts (graph.ts), qui restent la référence.
 
-/** Un fichier servi par le cache pendant le flow courant. par = 'brief' | 'feature' | 'voisins' | 'chercher'. */
-export type CacheHit = { p: string; tok: number; feature?: string; frais: boolean; par: string }
+/** Un fichier servi par le cache pendant le flow courant. par = 'brief' | 'feature' | 'voisins' | 'chercher' ; poids : part comptée comme évitée (1 par défaut). */
+export type CacheHit = { p: string; tok: number; feature?: string; frais: boolean; par: string; poids?: number }
 
 /** Ce que le flow courant a lu et reçu du cache. */
 export type FlowCache = {
   cle: string
+  /** Le cache est actif pour ce flow. */
+  cache: boolean
   servis: CacheHit[]
-  lus: { p: string; tok: number; par: string }[]
+  /** Fichiers lus ; via 'bash' : lu par cat, sed -n, head ou tail. */
+  lus: { p: string; tok: number; par: string; via?: 'bash' }[]
+  /** Tokens renvoyés par Grep, Glob et les commandes Bash de lecture non attribuables à un fichier. */
+  outils?: number
   /** Tokens injectés par le cache (brief et réponses de l'outil). */
   injecte: number
   feature?: string
@@ -144,6 +149,13 @@ export type CacheStats = {
   noeuds: { id: string; k: string; titre: string; niveau: 'fraiche' | 'partielle' | 'perimee'; hit?: string; tok: number }[]
   flow: { injecte: number; evites: number; net: number; lus: number; completude: number; feature?: string }
   cumul: { flows: number; evites: number; net: number }
+  /** La mesure tirée du journal des flows : lus = moyenne par flow de (lus + outils). */
+  mesure: {
+    sans: { flows: number; lus: number }
+    sansFiche: { flows: number; lus: number }
+    avecFiche: { flows: number; lus: number }
+    parFeature: { id: string; avant: { flows: number; lus: number }; apres: { flows: number; lus: number } }[]
+  }
   build?: { feature: string; tokens: number; costUsd: number }
 }
 

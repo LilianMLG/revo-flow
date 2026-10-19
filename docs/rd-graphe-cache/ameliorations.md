@@ -1,5 +1,43 @@
 # R&D : améliorer le cache projet, 2026-10-15
 
+## Statut (2026-10-19, v1.5.0)
+
+Où en sont les pistes (§3) et les limites (§1.2). Le reste du document est l'étude du 2026-10-15, laissée telle quelle.
+
+| Piste ou limite | Statut | Détail |
+|---|---|---|
+| L1 `apprendre` partiel | Fait (v1.3) | Un champ absent de l'appel garde sa valeur |
+| L2 stack | Fait (v1.3.2) | `.claude-plugin/plugin.json`, `tsconfig.json`, `pyproject.toml`, `requirements.txt`, `go.mod`, `Cargo.toml` |
+| L3 types de fichiers | En partie (v1.3.2) | `hooks/` reconnu (service, composable) ; dossiers NestJS non traités, avec (g) |
+| L4 candidates sans scope | Différé | C'est (f) |
+| L5 candidates figées | Fait (v1.5.0) | Recalculées par `refreshGraph` quand HEAD bouge (store.ts) |
+| L6 faux nœuds des fixtures | Fait (v1.3.2) | Ni `gql` ni `api` tirés des fichiers de test |
+| L7 à L12 mesure | Fait (v1.5.0) | Par (j), ligne suivante |
+| L13 fichiers non validés | Fait (v1.3.2) | `h = ''` : à vérifier jusqu'au prochain `apprendre` ou `rafraichir` |
+| L14 `learn` remet tous les hash | Fait (v1.5.0) | Seuls les fichiers cités dans `fichiers` prennent le hash courant |
+| L15 fiches auto | Fait (v1.5.0) | Rattachées à la fiche qui partage le plus de fichiers (≥ 2 et ≥ 30 %), sinon brouillon hors brief, hors correspondance et hors rappel, purgé après 10 flows sans usage |
+| L16 confirmation | Écarté | C'est (e) |
+| L17 fenêtre de 30 s | Fait (v1.5.0) | Edit, Write ou NotebookEdit réussi pendant un flow : le graphe gardé est revérifié au prochain appel |
+| L18 `sum` jamais écrit | Fait (v1.4) | Résumé mécanique par fichier, voir (b) |
+| L19 symboles | Différé | Attend les chiffres de (j) |
+| L20 Front ↔ Back, équipe | Différé | C'est (h) et (i) |
+| L21 copie `.tmp` | Écarté | Copie de secours gardée exprès |
+| L22 blobs absents | Fait (v1.3) | Action `diff` avec repli `git diff --no-index` |
+| (j) mesure honnête | Fait (v1.5.0) | Journal des 200 derniers flows dans le graphe (cache actif ou non, fiche servie, fiches apprises, lus, outils, injectés, évités) à la place de la baseline du store ; Read partiel à 9 tokens par ligne ; Grep et Glob comptés dans `outils`, lecture Bash d'un seul fichier (`cat`, `sed -n`, `head`, `tail`) dans `lus` ; contrefactuel prudent (rôle cœur, entrée ou données, ou lu dans un flow antérieur de la fiche) ; `chercher` et `voisins` crédités à poids réduit (0,25, 0,1 au second saut) ; ligne de mesure et comparaison par feature dans le panneau. Flow arrêté : hors journal |
+| (b) résumé par fichier | Fait autrement (v1.4) | Résumé mécanique sans LLM (commentaire de tête, titre d'un .md) au lieu de Haiku ; un résumé de modèle existant est gardé tant que le hash ne change pas |
+| (e) lancement silencieux | Écarté | L'utilisateur garde la question Utiliser / Ignorer (décision 2 du 2026-10-14, confirmée) |
+| (a) carte classée | Fait (v1.4) | Par fichier (PageRank personnalisé par la demande) ; par symbole : différé avec L19 |
+| (c) `diff` | Fait (v1.3, règle des 30 % en v1.5.0) | Action `diff` (v1.3) ; un diff plus gros que 30 % du fichier renvoie à la relecture (v1.5.0) |
+| (m1) Haiku en zone grise | Fait (v1.5.0) | `matchZone` : nette, grise (score ≥ 2 sans fiche qui ressort), absente ; en zone grise, Haiku choisit parmi 25 fiches au plus (5 s) ; sa fiche passe par la même confirmation, marquée « proposée par Haiku » |
+| (f) candidates sans scope | Différé | Attend les chiffres de (j) |
+| (d) décroissance de confiance | Fait (v1.5.0) | `withDrift` avant de servir une fiche (brief, action `feature`, extrait d'agent) : −10 % par tranche de 20 commits sur les voisins hors fiche, −5 % par mois après un mois, plancher 0,3 |
+| (k) extraits par agent | Fait (v1.3) | ≤ 600 tokens par agent |
+| (l) fiches voisines | Fait (v1.5.0) | Une ligne par dépendance (id, titre, fraîcheur) dans la fiche servie |
+| (g) stack et imports élargis | Stack faite (v1.3.2) ; imports différés | Imports Python, Go : attendent les chiffres de (j) |
+| (h) export Markdown | Différé | Attend les chiffres de (j) |
+| (i) liens Front ↔ Back | Différé | Attend les chiffres de (j) |
+| (m2) embeddings | Écarté | Pas d'API de vecteurs, voir §3.14 |
+
 > R&D, 2026-10-15. Aucun fichier de code n'a été modifié. Les constats viennent d'une lecture du code de la v1.2.2
 > (commit 8b836a6, numéros de ligne de cette version), du seul graphe présent sur ce poste
 > (`~/.claude/revo-flow/graphs/revo-flow-d91766.json`, le dépôt revo-flow lui-même), du store du plugin
