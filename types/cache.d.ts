@@ -49,6 +49,7 @@ export type GraphNode = {
   c?: string[]
 }
 export type FileRole = 'entree' | 'coeur' | 'donnees' | 'ui' | 'test' | 'peripherique'
+/** h : hash du blob appris ; '' = fichier ajouté sans vérification (autoFiche, completeFiche) : à relire avant de s'y fier. */
 export type FeatureFile = { p: string; role: FileRole; h: string }
 export type Feature = {
   id: string
@@ -104,7 +105,11 @@ export type FlowCache = {
   injecte: number
   feature?: string
 }
-export type Freshness = { niveau: 'fraiche' | 'partielle' | 'perimee'; ratio: number; perimes: string[]; confiance: number }
+/**
+ * perimes : fichiers modifiés, supprimés ou jamais vérifiés (h = '') ; nonVerifies : ceux de perimes jamais vérifiés (ils ne comptent pas dans ratio) ;
+ * vide : la fiche n'a plus aucun fichier, à reconstruire (jamais fraîche, jamais servie par matchRequest).
+ */
+export type Freshness = { niveau: 'fraiche' | 'partielle' | 'perimee'; ratio: number; perimes: string[]; confiance: number; nonVerifies?: string[]; vide?: boolean }
 /** Les données pour le panneau et la bande, calculées par graph.ts computeStats. */
 export type CacheStats = {
   projet: string
@@ -139,6 +144,8 @@ export type LearnInput = {
   deps?: string[]
   corrections?: string[]
 }
+/** Résultat de learn : refus = fiche nouvelle sans aucun fichier valide (graphe inchangé, rien à écrire) ; avertissement = fiche existante restée sans fichier. */
+export type LearnResult = { graph: Graph; rejected: string[]; refus?: string; avertissement?: string }
 export type LearnContext = { source: string; modele?: string; commit: string; branche: string; le: string; confiance?: number }
 export type SourceFile = { p: string; h: string; text: string }
 /** Un fichier de fiche dont le hash courant diffère du hash appris (nouveau = '' : supprimé). */

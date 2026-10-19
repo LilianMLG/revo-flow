@@ -4,7 +4,7 @@
 import type { EngineInterface } from 'claude-code'
 
 import type { Graph, SourceFile } from '../../types/cache'
-import { EXCLUS_DEFAUT, MECA_FORMAT, buildGraph, hashPath, isExcluded, isIndexable, projectKey, updateFiles } from './graph'
+import { EXCLUS_DEFAUT, MANIFESTES, MECA_FORMAT, buildGraph, hashPath, isExcluded, isIndexable, projectKey, updateFiles } from './graph'
 
 type $ = EngineInterface
 
@@ -585,7 +585,8 @@ async function nowIso(io: Io): Promise<string> {
 export const isOutdated = (graph: Graph) => (graph.projet.format ?? 1) < MECA_FORMAT
 
 /**
- * Construit la couche mécanique d'un projet : fichiers retenus (isIndexable : exclusions, extensions ; moins de 4 Mio), package.json, commit, branche, historique git, puis buildGraph.
+ * Construit la couche mécanique d'un projet : fichiers retenus (isIndexable : exclusions, extensions ; moins de 4 Mio), package.json, pubspec.yaml et
+ * manifestes de la racine (MANIFESTES : plugin.json, tsconfig.json, pyproject.toml…), commit, branche, historique git, puis buildGraph.
  * prev conserve les fiches. Sans git, on parcourt le dossier avec io.fs.list (hash = taille-mtime).
  * Lève une Error en français : dossier illisible.
  */
@@ -604,6 +605,11 @@ export async function buildMechanical(io: Io, ref: ProjectRef, prev?: Graph | nu
   const files = await readSources(io, racine, hashes, paths, onProgress)
   const pkg = await readTextSafe(io, `${racine}/package.json`)
   const pubspec = await readTextSafe(io, `${racine}/pubspec.yaml`)
+  const manifestes: Record<string, string> = {}
+  const lus = await Promise.all(MANIFESTES.map(m => readTextSafe(io, `${racine}/${m}`)))
+  MANIFESTES.forEach((m, k) => {
+    if (lus[k] !== undefined) manifestes[m] = lus[k]!
+  })
   const head = usesGit ? await headInfo(io, racine) : { commit: '', branche: '' }
   const log = usesGit ? (await git(io, racine, ['log', '-n', '500', '--pretty=format:%s', '--name-only'])).out : ''
   return buildGraph({
@@ -613,6 +619,7 @@ export async function buildMechanical(io: Io, ref: ProjectRef, prev?: Graph | nu
     files,
     ...(pkg !== undefined ? { pkgJson: pkg } : {}),
     ...(pubspec !== undefined ? { pubspec } : {}),
+    manifestes,
     commit: head.commit,
     branche: head.branche,
     le: await nowIso(io),
@@ -626,9 +633,10 @@ export async function buildMechanical(io: Io, ref: ProjectRef, prev?: Graph | nu
  * Rafraîchissement incrémental : compare les hash du disque à ceux du graphe, ne relit que les fichiers ajoutés ou modifiés,
  * détecte les renommages (git diff --name-status -M depuis le commit indexé, sinon un fichier disparu et un nouveau de même hash) et appelle updateFiles.
  * changed : chemins ajoutés, modifiés ou arrivés par renommage ; removed : chemins supprimés ou quittés par un renommage.
- * Rien n'est écrit : l'appelant enregistre avec saveGraph.
+ * Aucun contenu changé mais HEAD a bougé (git commit, checkout) : seul `indexe` (commit, branche, date) suit HEAD, et `head` vaut true.
+ * Rien n'est écrit : l'appelant enregistre avec saveGraph (s'il y a des changements, ou `head` pour garder le commit à jour sur disque).
  */
-export async function refreshGraph(io: Io, graph: Graph): Promise<{ graph: Graph; changed: string[]; removed: string[] }> {
+export async function refreshGraph(io: Io, graph: Graph): Promise<{ graph: Graph; changed: string[]; removed: string[]; head: boolean }> {
   const racine = normalizePath(graph.projet.racine)
   const exclus = graph.projet.exclus ?? EXCLUS_DEFAUT
   const { hashes, usesGit } = await diskState(io, racine, exclus)
@@ -636,7 +644,13 @@ export async function refreshGraph(io: Io, graph: Graph): Promise<{ graph: Graph
 
   const changed = Object.keys(hashes).filter(p => known[p] === undefined || known[p]!.h !== hashes[p])
   const gone = Object.keys(known).filter(p => hashes[p] === undefined)
-  if (changed.length === 0 && gone.length === 0) return { graph, changed: [], removed: [] }
+  if (changed.length === 0 && gone.length === 0) {
+    const ix = graph.projet.indexe
+    const head = usesGit ? await headInfo(io, racine) : undefined
+    if (!head?.commit || (head.commit === ix?.commit && head.branche === ix?.branche)) return { graph, changed: [], removed: [], head: false }
+    const indexe = { ...ix, commit: head.commit, branche: head.branche, le: await nowIso(io) }
+    return { graph: { ...graph, projet: { ...graph.projet, indexe } }, changed: [], removed: [], head: true }
+  }
 
   // Renommages : l'avis de git d'abord, puis, pour le reste, même hash.
   const added = new Set(changed.filter(p => known[p] === undefined))
@@ -668,7 +682,8 @@ export async function refreshGraph(io: Io, graph: Graph): Promise<{ graph: Graph
   const sources = await readSources(io, racine, hashes, changed)
   const head = usesGit ? await headInfo(io, racine) : { commit: graph.projet.indexe?.commit ?? '', branche: graph.projet.indexe?.branche ?? '' }
   const next = updateFiles(graph, sources, [...goneSet], renamed, { commit: head.commit, branche: head.branche, le: await nowIso(io) })
-  return { graph: next, changed, removed: [...goneSet, ...renamed.map(([from]) => from)] }
+  const moved = head.commit !== graph.projet.indexe?.commit || head.branche !== graph.projet.indexe?.branche
+  return { graph: next, changed, removed: [...goneSet, ...renamed.map(([from]) => from)], head: moved }
 }
 
 // ── Diff depuis l'apprentissage ──────────────────────────────────────────

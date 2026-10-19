@@ -1,6 +1,6 @@
 {
   "name": "revo-flow",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "description": "/revo-flow <demande> : l'orchestrateur lit les specs, fait un plan, répartit les tâches entre des sous-agents (modèle et effort choisis pour chacun) et affiche une barre de progression par agent dans le panneau latéral ; un cache par projet (graphe des fichiers et fiches de features apprises en fin de flow) lui évite de relire le code : /revo-flow cache. Un agent peut en attendre un autre (relancé quand il a fini) et reçoit l'extrait de fiche qui le concerne, qu'il vérifie et rafraîchit.",
   "author": {
     "name": "Lilian Malinge"

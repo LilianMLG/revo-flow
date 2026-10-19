@@ -353,16 +353,16 @@ export function DesktopBand(t: Elements['desktop'], d: ViewData, widthPx: number
   )
 }
 
-/** La largeur du terminal en colonnes (100 si on ne la connaît pas). */
-const termColumns = () => (globalThis as { process?: { stdout?: { columns?: number } } }).process?.stdout?.columns ?? 100
-
-/** Terminal : une ligne sobre — titre, étape de l'orchestrateur, avancement, agents actifs — et dessous le dernier prompt et le contexte. */
-export function TerminalBand(t: Elements['terminal'], d: ViewData) {
+/**
+ * Terminal : une ligne sobre — titre, étape de l'orchestrateur, avancement, agents actifs — et dessous le dernier prompt
+ * et le contexte. `columns` : la largeur de la bande (bodyColumns du rendu ; 100 si on ne la connaît pas).
+ */
+export function TerminalBand(t: Elements['terminal'], d: ViewData, columns = 100) {
   const m = bandModel(d)
   if (!m) return null
   const { Box, Text } = t
   const lt = d.lastTurn
-  const cp = cacheParts(d, termColumns())
+  const cp = cacheParts(d, columns)
   const cut = cp?.saved ? cp.text.indexOf(cp.saved) : -1
   return (
     <Box borderStyle="round" borderColor={PALETTE.border} paddingX={1} flexDirection="column">

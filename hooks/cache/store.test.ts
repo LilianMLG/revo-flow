@@ -3,7 +3,7 @@ import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import type { Feature, Graph } from '../../types/cache'
-import { diffSince, graphFileName, mergeGraphs, normalizePath, parseLsFiles, parseNameStatus, parseStatus, stripDiffHeader } from './store'
+import { diffSince, graphFileName, mergeGraphs, normalizePath, parseLsFiles, parseNameStatus, parseStatus, refreshGraph, stripDiffHeader } from './store'
 import type { Io } from './store'
 import { hashPath } from './graph'
 import { OSES, diskKey, native, type Os } from '../test-os'
@@ -427,6 +427,23 @@ for (const os of OSES) {
       expect(w.files.has(GRAPH_FILE)).toBe(false)
     })
 
+    test('cache build : stack lue dans les manifestes (plugin.json, tsconfig.json), hooks/ d’un plugin en service', async ($, on) => {
+      const w = world(on, {
+        files: {
+          [`${RACINE}/.claude-plugin/plugin.json`]: '{"name":"app"}',
+          [`${RACINE}/tsconfig.json`]: '{}',
+          [`${RACINE}/hooks/register.tsx`]: 'export const a = 1',
+        },
+        repo: { tracked: { '.claude-plugin/plugin.json': 'b1', 'tsconfig.json': 'b2', 'hooks/register.tsx': 'b3' } },
+      })
+      await run($, 'cache build')
+      const g = readGraph(w)
+      expect(g.projet.stack).toBe('Plugin Claude Code, TypeScript')
+      expect(g.projet.format).toBe(3)
+      expect(Object.keys(g.fichiers)).toEqual(['hooks/register.tsx'])
+      expect(g.fichiers['hooks/register.tsx']!.k).toBe('service')
+    })
+
     test('un graphe illisible est recopié en .bak puis reconstruit', async ($, on) => {
       const w = world(on, { files: sources(RACINE), repo: { tracked: TRACKED } })
       w.files.set(GRAPH_FILE, 'pas du json')
@@ -542,4 +559,34 @@ test('diffSince : indisponible (hash non git, git absent, blob appris introuvabl
 test('diffSince : sortie coupée par le moteur, on garde les lignes entières', async () => {
   const { io } = fakeIo(() => ({ exitCode: 0, stdout: '@@ -1,3 +1,3 @@\n-a\n+b\n+c', truncated: true }))
   expect(await diffSince(io, RACINE_DIFF, 'a.ts', OLD, NEW)).toBe('@@ -1,3 +1,3 @@\n-a\n+b')
+})
+
+// ── refreshGraph : indexe.commit suit HEAD ───────────────────────────────
+
+test('refreshGraph : aucun contenu changé mais HEAD a bougé, indexe.commit et branche suivent (head = true) ; HEAD inchangé : même graphe', async () => {
+  let head = 'def5678'
+  const io = {
+    now: async () => NOW,
+    run: async (argv: string[]) => {
+      const args = argv.slice(4)
+      const out = (stdout: string) => ({ exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false })
+      if (args[0] === 'ls-files') return out(`100644 ${blob('a4')} 0\tutils/a.ts\0`)
+      if (args[0] === 'status') return out('')
+      if (args[0] === 'rev-parse') return out(`${args.includes('--short') ? head : 'feature/x'}\n`)
+      return { ...out(''), exitCode: 1 }
+    },
+  } as unknown as Io
+  const g0 = graph(1, [])
+  g0.fichiers['utils/a.ts'] = { k: 'util', h: h12('a4'), tok: 1 }
+  const r = await refreshGraph(io, g0)
+  expect(r.changed).toEqual([])
+  expect(r.removed).toEqual([])
+  expect(r.head).toBe(true)
+  expect(r.graph.projet.indexe).toMatchObject({ commit: 'def5678', branche: 'feature/x', le: new Date(NOW).toISOString(), fichiers: 0 })
+  expect(r.graph.fichiers).toBe(g0.fichiers)
+  expect(g0.projet.indexe.commit).toBe('abc1234')
+  head = 'abc1234'
+  const same = await refreshGraph(io, { ...g0, projet: { ...g0.projet, indexe: { ...g0.projet.indexe, branche: 'feature/x' } } })
+  expect(same.head).toBe(false)
+  expect(same.graph.projet.indexe.commit).toBe('abc1234')
 })

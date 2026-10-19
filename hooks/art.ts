@@ -170,24 +170,23 @@ export function barSvg(stages: readonly BarStage[], o: BarOptions): string {
   const isError = stages.some(s => s.kind === 'failed')
   const pctColor = isError ? PALETTE.redText : PALETTE.text
 
-  // Le groupe de droite, aligné sur le bord : réessayer, %, mascotte, ×n, fermer.
+  // Le groupe de droite, aligné sur le bord : %, mascotte, ×n, fermer. (Pas de « Réessayer » : le SVG n'a pas de
+  // zone cliquable ; la relance passe par le bouton « Relancer » de la carte de l'agent.)
   const closeW = 32
   const countW = 24
   const mascotW = 27
   const pctW = 40
-  const retryW = isError && tier === 'full' ? 96 : 0
   const closeX = W - closeW
   const countX = closeX - 8 - countW + 2
   const mascotX = countX - 8 - mascotW
   const pctRight = mascotX - 12
-  const retryX = pctRight - pctW - 10 - 84
 
   // Le groupe de gauche : pastille et titre.
   const showTitle = tier !== 'tiny'
   const title = clip(o.title, tier === 'full' ? 30 : 12)
   const titleW = showTitle ? Math.min(title.length * 7.4, tier === 'full' ? 232 : 92) : 0
   const x0 = 16 + 8 + (showTitle ? 8 + titleW : 0) + 14
-  const groupX = (retryW > 0 ? retryX : pctRight - pctW + 6) - 12
+  const groupX = pctRight - pctW + 6 - 12
   // Le contexte et le dernier prompt, à gauche du groupe de droite, seulement quand il reste de la place.
   const ctxText = o.context !== undefined && tier !== 'tiny' ? `ctx ${Math.round(o.context)} %` : ''
   const promptText = o.lastPrompt && W >= 900 ? o.lastPrompt : ''
@@ -247,16 +246,12 @@ export function barSvg(stages: readonly BarStage[], o: BarOptions): string {
       ? `<text x="36" y="26.5" font-family="${FONT}" font-size="13" font-weight="700" fill="${PALETTE.text}">${esc(title)}</text>`
       : ''
   }`
-  const retry =
-    retryW > 0
-      ? `<g><rect x="${num(retryX)}" y="9" width="84" height="26" rx="13" fill="${PALETTE.bar}" stroke="${PALETTE.border}"/><text x="${num(retryX + 42)}" y="26" text-anchor="middle" font-family="${FONT}" font-size="12" font-weight="600" fill="${PALETTE.text}">Réessayer</text></g>`
-      : ''
   const pct = `<text x="${num(pctRight)}" y="26.5" text-anchor="end" font-family="${MONO}" font-size="12" font-weight="700" fill="${pctColor}">${Math.round(o.percent)}%</text>`
   const mascot = `<svg x="${num(mascotX)}" y="13" width="27" height="18" viewBox="0 0 9 6" shape-rendering="crispEdges">${mascotBody(o.isDone === true)}</svg>`
   const count = `<text x="${num(countX)}" y="26" font-family="${MONO}" font-size="11" fill="${PALETTE.muted}">×${o.agents}</text>`
   const close = `<path d="M${closeX + 11} 18 l10 8 M${closeX + 21} 18 l-10 8" fill="none" stroke="${PALETTE.muted}" stroke-width="1.5" stroke-linecap="round"/>`
 
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}"><rect x=".5" y=".5" width="${W - 1}" height="${H - 1}" rx="22" fill="${PALETTE.bar}" stroke="${isError ? PALETTE.redBorder : PALETTE.border}"/>${left}${seg}${extra}${retry}${pct}${mascot}${count}${close}<title>${esc(`${o.title} — ${reached}/${n} étapes, ${Math.round(o.percent)} %`)}</title></svg>`
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}"><rect x=".5" y=".5" width="${W - 1}" height="${H - 1}" rx="22" fill="${PALETTE.bar}" stroke="${isError ? PALETTE.redBorder : PALETTE.border}"/>${left}${seg}${extra}${pct}${mascot}${count}${close}<title>${esc(`${o.title} — ${reached}/${n} étapes, ${Math.round(o.percent)} %`)}</title></svg>`
 }
 
 // ── Les cartes d'agent ───────────────────────────────────────────────────

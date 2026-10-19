@@ -79,6 +79,8 @@ export type Flow = {
   isApproved?: boolean
   /** Le plan en markdown sur le disque (~/.claude/revo-flow/plans/<titre>.md), une fois posé. */
   planFile?: string
+  /** Arrêté par l'utilisateur (Tout arrêter) : sa fin n'est ni une conclusion, ni une fiche à apprendre. */
+  isStopped?: boolean
 }
 
 /** L'orchestrateur : le fil principal, sur le modèle de la session. */

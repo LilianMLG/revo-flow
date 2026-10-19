@@ -81,6 +81,7 @@ import {
   slug,
   total,
   weekKey,
+  type AgentCache,
   type PlanInput,
   type Usage,
 } from './lib'
@@ -125,6 +126,8 @@ const opts = { validerPlan: true, conflits: 'avertir' as 'avertir' | 'refuser', 
 const claimed = new Set<string>()
 /** Le tour en cours de l'orchestrateur, pour pouvoir l'interrompre ($.turn.abort ne prend que celui-là). */
 let leadTurnId: string | undefined
+/** Les tours de l'orchestrateur interrompus par stopAll : leur fin appartient à l'ancien flow, pas à celui qui l'a remplacé. */
+const stoppedTurns = new Set<string>()
 /** La validation du plan en attente : les boutons du panneau peuvent y répondre à la place du dialogue. */
 let pendingDecision: ((d: Decision) => void) | undefined
 /** La réponse à la validation du plan ; note = ce que l'utilisateur a tapé à la place d'un choix. */
@@ -237,6 +240,7 @@ async function registerTools($: $) {
     name: 'step',
     description:
       'revo-flow : un sous-agent signale où il en est dans SA liste de tâches (numérotée à partir de 1). Fait avancer sa barre de progression. ' +
+      'en_cours au début de chaque tâche clôt la précédente, et la dernière est close quand il finit : fait est inutile. ' +
       'attente : la tâche dépend du travail d’un autre agent du plan qui n’a pas fini (nomme-le dans « attend ») ; termine ensuite ta réponse en disant ce qui manque, revo-flow te relancera quand il aura fini.',
     inputSchema: {
       type: 'object',
@@ -378,6 +382,19 @@ async function notify($: $, text: string) {
   }
 }
 
+/**
+ * $.ui.ask, avec deux replis distincts quand il rejette : `headless` sans personne à qui demander (-p, SDK),
+ * `dismissed` quand l'utilisateur ferme le dialogue (Échap) ; fermer vaut toujours « ne rien faire ».
+ */
+async function askOr($: $, question: string, options: string[], fallback: { headless: string; dismissed: string }): Promise<string> {
+  try {
+    return await $.ui.ask(question, { options, header: PLUGIN })
+  } catch {
+    const surfaces = await $.session.surfaces().catch(() => [])
+    return surfaces.length === 0 ? fallback.headless : fallback.dismissed
+  }
+}
+
 /** Le flow est fini : phase done, heure de fin, et une notification avec la durée, le coût et les fichiers. */
 async function finishFlow($: $) {
   const flow = await read($, flowA)
@@ -390,7 +407,7 @@ async function finishFlow($: $) {
   await closeFlowCache($).catch(() => undefined)
   const blocked = flow.agents.filter(a => a.status === 'blocked').length
   const note = `${blocked ? ` · ${blocked} agent${blocked > 1 ? 's' : ''} en attente` : ''}${endNote ? ` · ${endNote}` : ''}`
-  await notify($, `« ${flow.title} » terminé · ${fmtDuration(now - flow.startedAt)} · ${euros(cost)} · ${files} fichier${files > 1 ? 's' : ''}${note}`)
+  await notify($, `« ${flow.title} » ${flow.isStopped ? 'arrêté' : 'terminé'} ·${fmtDuration(now - flow.startedAt)} · ${euros(cost)} · ${files} fichier${files > 1 ? 's' : ''}${note}`)
 }
 
 // ── Cache projet ─────────────────────────────────────────────────────────
@@ -488,7 +505,8 @@ async function graphOf($: $, ref: ProjectRef, opt: { build?: boolean; force?: bo
   } else if (graph) {
     const r = await refreshGraph(ioOf($), graph)
     graph = r.graph
-    if (r.changed.length || r.removed.length) graph = await saveGraph(ioOf($), r.graph).catch(() => r.graph)
+    // HEAD qui a bougé sans changement de contenu (un commit) : le commit indexé suit, sur le disque aussi.
+    if (r.changed.length || r.removed.length || r.head) graph = await saveGraph(ioOf($), r.graph).catch(() => r.graph)
   } else if (opt.build) {
     graph = await saveGraph(ioOf($), await buildMechanical(ioOf($), ref))
   }
@@ -617,7 +635,10 @@ async function cacheTool($: $, e: CacheCall): Promise<string> {
   const projet = text(e.projet)
   const ref = await resolveProject(ioOf($), projet || undefined)
   if (!ref) return `revo-flow cache : projet ${projet ? `« ${projet} » ` : 'courant '}introuvable (il faut un dossier suivi par git).`
-  const graph = await graphOf($, ref, { build: true })
+  // Écrire ou comparer des hash demande le graphe à jour : un fichier créé ou modifié par un agent il y a moins de
+  // REFRESH_MS serait sinon inconnu (chemin rejeté) ou déclaré frais à tort.
+  const force = action === 'apprendre' || action === 'rafraichir' || action === 'diff'
+  const graph = await graphOf($, ref, { build: true, force })
   if (!graph) return `revo-flow cache : le graphe de ${ref.nom} n’a pas pu être construit (git requis).`
   const flow = await read($, flowA)
   const live = flow && flow.phase !== 'done' ? flow : null
@@ -793,7 +814,10 @@ async function learnTool($: $, e: CacheCall, ref: ProjectRef, graph: Graph, live
     ...(Array.isArray(e.deps) ? { deps: texts(e.deps) } : {}),
     corrections: texts(e.corrections),
   }
-  const { graph: next, rejected } = learn(graph, input, ctx)
+  const { graph: next, rejected, refus, avertissement } = learn(graph, input, ctx)
+  const rejectedLine = rejected.length ? [`Chemins rejetés, inconnus du projet : ${rejected.join(', ')}`] : []
+  // Une nouvelle fiche sans aucun fichier connu n'est pas écrite : elle ne pourrait jamais devenir périmée.
+  if (refus) return [`revo-flow cache : ${refus}`, ...rejectedLine].join('\n')
   const saved = keepGraph(await saveGraph(ioOf($), next), now)
   if (live) {
     if (learned.flowId !== live.id) Object.assign(learned, { flowId: live.id, features: [] })
@@ -804,7 +828,8 @@ async function learnTool($: $, e: CacheCall, ref: ProjectRef, graph: Graph, live
   const f = saved.features[id]
   return [
     `revo-flow cache : fiche « ${f?.titre ?? id} » apprise (${plural(f?.fichiers.length ?? 0, 'fichier')}).`,
-    ...(rejected.length ? [`Chemins rejetés, inconnus du projet : ${rejected.join(', ')}`] : []),
+    ...(avertissement ? [`⚠ ${avertissement}`] : []),
+    ...rejectedLine,
   ].join('\n')
 }
 
@@ -828,8 +853,8 @@ async function startFlowCache($: $, flowId: string, request: string): Promise<st
   let f = m ? graph.features[m.id] : undefined
   if (f) {
     const q = `Je pense qu’il s’agit de « ${f.titre} » (confiance ${frac(freshness(graph, f).confiance)}) : utiliser la fiche du cache ?`
-    // Sans personne à qui demander (claude -p), la fiche est utilisée.
-    const answer = await $.ui.ask(q, { options: ['Utiliser', 'Ignorer'], header: 'revo-flow' }).catch(() => 'Utiliser')
+    // Sans personne à qui demander (claude -p), la fiche est utilisée ; dialogue fermé : ignorée.
+    const answer = await askOr($, q, ['Utiliser', 'Ignorer'], { headless: 'Utiliser', dismissed: 'Ignorer' })
     if (answer !== 'Utiliser') f = undefined
   }
   const brief = briefText(graph, f)
@@ -879,7 +904,9 @@ async function learnAtEnd($: $, flow: Flow) {
 async function closeFlowCache($: $) {
   const fc = await read($, flowCacheA)
   if (!fc) return
-  if (fc.servis.length === 0) {
+  // Un flow arrêté n'est pas représentatif : ni baseline, ni fiche complétée.
+  const isStopped = (await read($, flowA))?.isStopped === true
+  if (fc.servis.length === 0 && !isStopped) {
     const sizes = new Map(fc.lus.map(l => [l.p, l.tok] as const))
     const key = `baseline:${fc.cle}`
     const prev = (await $.store.get(key)) as { flows?: unknown; lus?: unknown } | undefined
@@ -891,7 +918,7 @@ async function closeFlowCache($: $) {
   const graph = ref ? await graphOf($, ref) : null
   if (!graph) return
   let next = recordCacheUsage(graph, fc)
-  if (fc.feature && next.features[fc.feature]) next = completeFiche(next, fc.feature, [...new Set(fc.lus.map(l => l.p))])
+  if (fc.feature && next.features[fc.feature] && !isStopped) next = completeFiche(next, fc.feature, [...new Set(fc.lus.map(l => l.p))])
   keepGraph(await saveGraph(ioOf($), next), await $.clock.now())
   await refreshStats($)
 }
@@ -919,21 +946,31 @@ async function agentCacheExtract($: $, a: FlowAgent, prompt: unknown): Promise<{
 }
 
 /** Rappel après compaction : la fiche servie et les features connues du projet. */
+/** Le paragraphe du cache d'un sous-agent : les consignes de recherche seulement si le projet a des fiches. */
+async function agentCacheMode($: $): Promise<AgentCache> {
+  if (!opts.cache) return false
+  const fc = await read($, flowCacheA)
+  const graph = fc ? graphCache.get(fc.cle)?.graph : undefined
+  if (!graph) return 'fiches'
+  return Object.keys(graph.features).length ? 'fiches' : 'graphe'
+}
+
+/** Au plus autant de features nommées dans le rappel après compaction (comme la ligne « features connues » du brief). */
+const RECAP_MAX = 15
+
 function cacheRecap(fc: FlowCache | null): string | undefined {
   const graph = fc && opts.cache ? graphCache.get(fc.cle)?.graph : undefined
   if (!fc || !graph) return undefined
   const ids = Object.keys(graph.features)
-  return `Cache revo-flow (${graph.projet.nom}) : ${fc.feature ? `fiche servie « ${fc.feature} » ; ` : ''}features connues : ${ids.join(', ') || 'aucune'}. Outil ${CACHE_TOOL}.`
+  const known = ids.length > RECAP_MAX ? `${ids.slice(0, RECAP_MAX).join(', ')}… (+${ids.length - RECAP_MAX})` : ids.join(', ')
+  return `Cache revo-flow (${graph.projet.nom}) : ${fc.feature ? `fiche servie « ${fc.feature} » ; ` : ''}features connues : ${known || 'aucune'}. Outil ${CACHE_TOOL}.`
 }
 
 // ── Commande cache ───────────────────────────────────────────────────────
 
-/** Confirmation par dialogue ; sans personne à qui demander, `fallback`. */
+/** Confirmation par dialogue ; sans personne à qui demander, `fallback` ; dialogue fermé : non. */
 const confirm = ($: $, question: string, yes: string, no: string, fallback: boolean) =>
-  $.ui.ask(question, { options: [yes, no], header: 'revo-flow' }).then(
-    a => a === yes,
-    () => fallback,
-  )
+  askOr($, question, [yes, no], { headless: fallback ? yes : no, dismissed: no }).then(a => a === yes)
 
 const NO_PROJECT = 'revo-flow cache : pas de projet git ici. /revo-flow cache <projet> pour un autre projet.'
 
@@ -1072,8 +1109,8 @@ async function buildCommand($: $, args: string[]) {
 }
 
 async function spawnBuilder($: $, ref: ProjectRef, targets: { id: string; tok: number }[], usd: number) {
-  // Cache désactivé : l'outil n'a pas été proposé, l'agent en a besoin.
-  if (!opts.cache) await registerCacheTool($).catch(() => undefined)
+  // L'outil n'est déclaré qu'à la demande (premier flow ou build) : l'agent de construction en a besoin.
+  await registerCacheTool($).catch(() => undefined)
   const ids = targets.map(t => t.id)
   const list = targets.map(t => `- ${t.id} (≈ ${Math.round(t.tok / 1000)}k tokens)`).join('\n')
   const task = [
@@ -1157,8 +1194,8 @@ async function viewData($: $): Promise<ViewData> {
 function paneActions($: $): PaneActions {
   return {
     clear: () => update($, entries, () => []),
-    stopAll: () => stopAll($),
-    stopAgent: key => stopAgent($, key),
+    stopAll: () => confirmStop($),
+    stopAgent: key => confirmStop($, key),
     retryAgent: key => retryAgent($, key),
     approvePlan: () => approvePlan($),
     cancelPlan: () => cancelPlan($),
@@ -1174,6 +1211,11 @@ function contextOf(c: SessionContextUsage): Context | null {
 }
 
 const ENDED = new Set(['completed', 'failed', 'killed'])
+/**
+ * Tenu par Claude Code sans tourner : waiting (un travail de fond à lui, qui peut le réveiller) ou idle. Après la fin
+ * de son tour, son rapport est rendu : il a fini pour le flow (rouvert par turn.start s'il se réveille).
+ */
+const HELD = new Set(['waiting', 'idle'])
 
 /** Comment finit le tour d'un agent : fini, en échec, ou en attente d'un autre agent. */
 type Outcome = 'done' | 'failed' | 'blocked'
@@ -1254,7 +1296,8 @@ const toReview = ($: $) => setFlow($, f => (f.phase === 'running' && allFinished
 
 /**
  * L'état réel des sous-agents, lu auprès de Claude Code : la fin d'un tour ne veut pas dire que l'agent a fini
- * (un agent en arrière-plan termine des tours et continue). Seuls completed, failed ou killed le terminent.
+ * (un agent en arrière-plan termine des tours et continue). completed, failed ou killed le terminent, et aussi
+ * waiting ou idle une fois son tour fini (sinon un agent qui attend son propre travail de fond reste « actif »).
  */
 async function syncAgents($: $) {
   await syncBuilders($).catch(() => undefined)
@@ -1265,11 +1308,11 @@ async function syncAgents($: $) {
   for (const a of running) {
     const info = list.find(x => x.id === a.agentId)
     // Sorti de la liste : on ne le tient pour fini que si son dernier tour s'est terminé.
-    const isEnded = info ? ENDED.has(info.status) : a.hasEndedTurn === true
+    const isEnded = info ? ENDED.has(info.status) || (HELD.has(info.status) && a.hasEndedTurn === true) : a.hasEndedTurn === true
     if (!isEnded) continue
     // L'état à jour (une attente a pu être signalée pendant la lecture de la liste).
     const cur = (await read($, flowA))?.agents.find(x => x.key === a.key) ?? a
-    const isFailed = (info !== undefined && info.status !== 'completed') || cur.tasks.some(t => t.status === 'failed')
+    const isFailed = (info !== undefined && (info.status === 'failed' || info.status === 'killed')) || cur.tasks.some(t => t.status === 'failed')
     // Un agent qui a signalé une attente et n'a pas fini ses tâches attend : ni fini, ni en échec.
     const outcome: Outcome = isFailed ? 'failed' : cur.waitingFor && remainingTasks(cur).length > 0 ? 'blocked' : 'done'
     if (!(await endAgent($, a.key, outcome))) continue
@@ -1295,12 +1338,32 @@ async function stopAgent($: $, key: string, isQuiet = false) {
   await toReview($)
 }
 
-/** Arrête tous les agents en cours, puis interrompt le tour de l'orchestrateur s'il tourne. */
+/**
+ * Arrête tous les agents en cours, sans suites (personne n'est relancé pour un agent arrêté), puis interrompt le tour
+ * de l'orchestrateur s'il tourne. Le flow est marqué arrêté : sa fin ne vaut ni conclusion ni fiche apprise.
+ */
 async function stopAll($: $) {
-  for (const a of (await read($, flowA))?.agents ?? []) if (a.status === 'running') await stopAgent($, a.key)
+  await setFlow($, f => ({ ...f, isStopped: true }))
+  for (const a of (await read($, flowA))?.agents ?? []) if (a.status === 'running') await stopAgent($, a.key, true)
   const turnId = leadTurnId
   leadTurnId = undefined
-  if (turnId) await $.turn.abort({ turnId }).catch(() => undefined)
+  if (turnId) {
+    stoppedTurns.add(turnId)
+    await $.turn.abort({ turnId }).catch(() => undefined)
+  }
+}
+
+/** Boutons « Arrêter » et « Tout arrêter » du panneau : rien ne s'arrête sans confirmation (Échap : rien). */
+async function confirmStop($: $, key?: string) {
+  const flow = await read($, flowA)
+  const running = flow?.agents.filter(a => a.status === 'running' && (key === undefined || a.key === key)) ?? []
+  if (key !== undefined && running.length === 0) return
+  const spent = flow ? (await read($, leadA)).costUsd + flow.agents.reduce((n, a) => n + a.costUsd, 0) : 0
+  const what = key !== undefined ? `l’agent « ${running[0]!.name} »` : running.length ? `${running.length} agent${running.length > 1 ? 's' : ''} et l’orchestrateur` : 'l’orchestrateur'
+  const answer = await askOr($, `Arrêter ${what} ? (${euros(spent)} déjà dépensés)`, ['Arrêter', 'Continuer'], { headless: 'Arrêter', dismissed: 'Continuer' })
+  if (answer !== 'Arrêter') return
+  if (key !== undefined) await stopAgent($, key)
+  else await stopAll($)
 }
 
 /** Bouton « Relancer » (agent en échec ou en attente) : un agent encore actif est d'abord arrêté, sans suites. */
@@ -1369,8 +1432,8 @@ async function cancelPlan($: $) {
 
 /**
  * Demande à l'utilisateur de valider le plan. Le dialogue ou un bouton du panneau répond, le premier des deux.
- * Sans personne à qui demander (-p) ou dialogue fermé, le plan part : la validation ne doit jamais bloquer le flow.
- * Un texte libre (« Other ») vaut refus, transmis au modèle.
+ * Sans personne à qui demander (-p), le plan part : la validation ne doit jamais bloquer le flow. Dialogue fermé
+ * (Échap) : annulé, aucun agent ne part sans accord. Un texte libre (« Other ») vaut refus, transmis au modèle.
  */
 function decide($: $, plan: PlanInput): Promise<Decision> {
   return new Promise(resolve => {
@@ -1385,9 +1448,8 @@ function decide($: $, plan: PlanInput): Promise<Decision> {
     const question = planQuestion(plan)
     pendingDecision = settle
     pendingPreview = { question, markdown: planMarkdown(plan) }
-    $.ui.ask(question, { options: ['Lancer', 'Annuler'], header: PLUGIN }).then(
-      answer => settle(answer === 'Lancer' ? { isLaunched: true } : answer === 'Annuler' ? { isLaunched: false } : { isLaunched: false, note: answer }),
-      () => settle({ isLaunched: true }),
+    void askOr($, question, ['Lancer', 'Annuler'], { headless: 'Lancer', dismissed: 'Annuler' }).then(answer =>
+      settle(answer === 'Lancer' ? { isLaunched: true } : answer === 'Annuler' ? { isLaunched: false } : { isLaunched: false, note: answer }),
     )
   })
 }
@@ -1450,10 +1512,12 @@ export const register: Register = (on, options) => {
       // par prompt.submit, qui attend de toute façon que la session soit libre.
       immediate: true,
     })
-    // Les outils ne sont déclarés qu'au premier /revo-flow ; après un rechargement en plein flow, on les redéclare.
-    if (await read($, flowA)) await registerTools($)
-    // L'outil cache, lui, est là dès le début : l'orchestrateur, ses agents et l'agent de construction s'en servent.
-    if (opts.cache) await registerCacheTool($).catch(() => undefined)
+    // Les outils (cache compris) ne sont déclarés qu'au premier /revo-flow ou `cache build` : sans le mod, aucune
+    // description d'outil dans les requêtes. Après un rechargement en plein flow, on les redéclare.
+    if (await read($, flowA)) {
+      await registerTools($)
+      if (opts.cache) await registerCacheTool($).catch(() => undefined)
+    }
     await registerIndexer($)
     await migrate($)
     await purge($)
@@ -1475,10 +1539,12 @@ export const register: Register = (on, options) => {
     if (word === 'stop') {
       let isStopped = false
       if (flow?.agents.some(a => a.status === 'running')) {
-        // Sans personne à qui demander, on arrête tout : c'est ce que « stop » veut dire.
-        const answer = await $.ui
-          .ask('Des agents revo-flow tournent encore. Les arrêter ?', { options: ['Tout arrêter', 'Garder les agents'], header: 'revo-flow' })
-          .catch(() => 'Tout arrêter')
+        // Sans personne à qui demander, on arrête tout : c'est ce que « stop » veut dire. Dialogue fermé : rien ne change.
+        const answer = await askOr($, 'Des agents revo-flow tournent encore. Les arrêter ?', ['Tout arrêter', 'Garder les agents'], {
+          headless: 'Tout arrêter',
+          dismissed: '',
+        })
+        if (!answer) return { text: 'revo-flow : stop annulé, le flow continue.' }
         isStopped = answer !== 'Garder les agents'
       } else isStopped = flow !== null && leadTurnId !== undefined
       if (isStopped) await stopAll($)
@@ -1511,6 +1577,18 @@ export const register: Register = (on, options) => {
       }
     }
 
+    // Un flow encore en cours n'est jamais remplacé sans accord : ses agents ne seraient plus suivis.
+    if (flow && flow.phase !== 'done') {
+      const busy = flow.agents.filter(a => a.status === 'running').length
+      const answer = await askOr(
+        $,
+        `Le flow « ${flow.title} » n’est pas fini${busy ? ` (${busy} agent${busy > 1 ? 's' : ''} au travail)` : ''}. Le remplacer par cette demande ?`,
+        ['Remplacer', 'Garder le flow en cours'],
+        { headless: 'Remplacer', dismissed: 'Garder le flow en cours' },
+      )
+      if (answer !== 'Remplacer') return { text: `revo-flow : demande non lancée, « ${flow.title} » continue. /revo-flow stop pour l’arrêter.` }
+      if (busy) await stopAll($)
+    }
     watchAgents($)
     // Une nouvelle demande : le panneau s'ouvre sur « En attente du plan d'exécution » ; les agents n'y entrent qu'avec le plan.
     await registerTools($)
@@ -1555,7 +1633,14 @@ export const register: Register = (on, options) => {
       const at = await $.clock.now()
       await update($, lastTurnA, () => ({ at, durationMs: 0, tokens: EMPTY, modelId: '', costUsd: 0, isLive: true }))
     }
-    if (await read($, flowA)) await update($, isBusy, () => true)
+    const flow = await read($, flowA)
+    if (flow) await update($, isBusy, () => true)
+    // Un agent tenu pour fini (waiting après son tour) que son travail de fond réveille : il reprend, le flow aussi.
+    const woken = e.agentId && flow && flow.phase !== 'done' ? flow.agents.find(a => a.agentId === e.agentId && a.status === 'done') : undefined
+    if (woken) {
+      await setAgent($, woken.key, ({ endedAt: _end, ...x }) => ({ ...x, status: 'running', hasEndedTurn: false }))
+      await setFlow($, f => (f.phase === 'review' ? { ...f, phase: 'running' } : f))
+    }
     return next(e)
   })
 
@@ -1581,7 +1666,10 @@ export const register: Register = (on, options) => {
     }
     const flow = await read($, flowA)
     if (!flow) {
-      if (!e.agentId) await update($, isBusy, () => false)
+      if (!e.agentId) {
+        stoppedTurns.delete(e.turnId)
+        await update($, isBusy, () => false)
+      }
       return next(e)
     }
     if (e.agentId) {
@@ -1593,6 +1681,8 @@ export const register: Register = (on, options) => {
       return next(e)
     }
     await update($, isBusy, () => false)
+    // Le tour d'un flow arrêté puis remplacé : le nouveau flow n'a rien à en tirer.
+    if (stoppedTurns.delete(e.turnId) && !flow.isStopped) return next(e)
     // Interrompu avant même le plan : il n'y a rien à suivre, le flow est abandonné.
     if (e.reason === 'aborted' && flow.phase === 'planning') {
       await update($, flowA, () => null)
@@ -1603,9 +1693,9 @@ export const register: Register = (on, options) => {
     await syncAgents($)
     // L'orchestrateur a fini son tour après que tous les agents ont fini : c'était sa conclusion.
     const now = await read($, flowA)
-    if (now && (now.phase === 'review' || now.phase === 'running') && allFinished(now)) {
-      // Sans « apprendre » pendant le flow, une fiche minimale automatique (le filet), puis la fin.
-      await learnAtEnd($, now).catch(() => undefined)
+    if (now && (now.phase === 'review' || now.phase === 'running') && (allFinished(now) || now.isStopped)) {
+      // Sans « apprendre » pendant le flow, une fiche minimale automatique (le filet), puis la fin ; pas pour un flow arrêté.
+      if (!now.isStopped) await learnAtEnd($, now).catch(() => undefined)
       await finishFlow($)
     }
     return next(e)
@@ -1687,7 +1777,7 @@ export const register: Register = (on, options) => {
     const others = flow.agents.filter(x => x.key !== a.key).map(x => x.name)
     // L'extrait de la fiche servie qui concerne cet agent, après ses consignes.
     const extract = await agentCacheExtract($, a, e.prompt)
-    const prompt = `${e.prompt}\n\n${agentBrief(a, opts.cache, others)}${extract ? `\n\n${extract.text}` : ''}`
+    const prompt = `${e.prompt}\n\n${agentBrief(a, await agentCacheMode($), others)}${extract ? `\n\n${extract.text}` : ''}`
     const r = await next({ ...e, model: MODELS[a.model].id, prompt })
     if (r.deny !== undefined || !r.agentId) {
       claimed.delete(a.key)
@@ -1892,7 +1982,7 @@ export const register: Register = (on, options) => {
       return DesktopBand($.ui.resolve(e) as unknown as Elements['desktop'], d, pixels(e.props.bodyColumns)) ?? next(e)
     }
     if (e.surface === 'mobile') return MobileBand($.ui.resolve(e) as unknown as Elements['mobile'], d, pixels(e.props.bodyColumns)) ?? next(e)
-    if (e.surface === 'terminal') return TerminalBand($.ui.resolve(e) as unknown as Elements['terminal'], d) ?? next(e)
+    if (e.surface === 'terminal') return TerminalBand($.ui.resolve(e) as unknown as Elements['terminal'], d, e.props.bodyColumns || 100) ?? next(e)
     return next(e)
   })
 

@@ -34,6 +34,7 @@ import {
   tokensOf,
   updateFiles,
   MECA_FORMAT,
+  MANIFESTES,
 } from './graph'
 import type { Feature, FlowCache, Graph, LearnContext, SourceFile } from '../../types/cache'
 
@@ -396,8 +397,9 @@ test('learn : chemins rejetés, hash enregistrés, confiance, corrections', () =
     },
     LEARN,
   )
-  expect(rejected).toEqual(['nope/x.ts', '/inexistante', 'ailleurs.ts'])
+  expect(rejected).toEqual(['nope/x.ts', 'ailleurs.ts'])
   const f = graph.features['double-session']!
+  expect(f.entrees).toEqual(['/inexistante'])
   expect(f.fichiers).toEqual([
     { p: 'stores/booking/Booking.ts', role: 'donnees', h: 'h-stores/booking/Booking.ts' },
     { p: 'services/offer.ts', role: 'donnees', h: 'h-services/offer.ts' },
@@ -417,7 +419,7 @@ test('autoFiche et completeFiche : fiche minimale, puis fichiers lus hors fiche 
   expect(f.confiance).toBe(0.5)
   expect(f.resume).toBe('')
   expect(f.entrees).toEqual(['r:/booking/offer'])
-  expect(f.fichiers).toEqual([{ p: 'pages/booking/offer.vue', role: 'entree', h: 'h-pages/booking/offer.vue' }])
+  expect(f.fichiers).toEqual([{ p: 'pages/booking/offer.vue', role: 'entree', h: '' }])
   expect(autoFiche(g0, 'vide', [{ p: 'nope.ts' }], LEARN)).toBe(g0)
   const g2 = completeFiche(g1, 'paiement', ['utils/price.ts', 'pages/booking/offer.vue', 'nope.ts'])
   expect(g2.features.paiement!.fichiers.map(x => `${x.p}:${x.role}`)).toEqual(['pages/booking/offer.vue:entree', 'utils/price.ts:peripherique'])
@@ -903,4 +905,151 @@ test('diffText : un seul gros hunk coupé par lignes, budget partagé entre les 
   const many = Array.from({ length: 30 }, (_, i) => ({ p: `f${i}.ts`, depuis: 'a', diff: huge }))
   const t3 = diffText(g, f, undefined, many)
   expect(tokensOf(t3)).toBeLessThanOrEqual(2500)
+})
+
+// ── Correctifs v1.3.2 ────────────────────────────────────────────────────
+
+test('learn : une fiche nouvelle sans fichier valide est refusée ; une fiche existante restée sans fichier n’est ni fraîche ni servie', () => {
+  const g0 = withFeatures()
+  const r = learn(g0, { feature: 'transitions-ecrans', resume: 'Transitions', fichiers: [{ p: 'lib/nope.dart' }] }, LEARN)
+  expect(r.refus).toContain('aucun fichier valide')
+  expect(r.graph).toBe(g0)
+  expect(r.graph.features['transitions-ecrans']).toBeUndefined()
+  expect(r.rejected).toEqual(['lib/nope.dart'])
+  expect(learn(g0, { feature: 'sans-rien', resume: 'x' }, LEARN).refus).toBeDefined()
+
+  // Fiche existante dont le seul fichier disparaît : écrite avec un avertissement, puis vide
+  const g1 = updateFiles(g0, [], ['composables/useCart.ts'], [], LATER)
+  const r2 = learn(g1, { feature: 'panier', resume: 'Le panier' }, LEARN)
+  expect(r2.refus).toBeUndefined()
+  expect(r2.avertissement).toContain('à reconstruire')
+  const f = r2.graph.features.panier!
+  expect(f.fichiers).toEqual([])
+  const fr = freshness(r2.graph, f)
+  expect(fr).toMatchObject({ niveau: 'perimee', vide: true, confiance: 0 })
+  expect(matchRequest(r2.graph, 'ajouter un bouton dans le panier')).toBeUndefined()
+  expect(featureText(r2.graph, f)).toContain('Fiche sans aucun fichier du projet : à reconstruire')
+  expect(featureText(r2.graph, f)).not.toContain('Fichiers (0')
+  expect(briefText(r2.graph, undefined)).toContain('panier ✕ vide')
+  expect(computeStats(r2.graph, null, 'demo')!.fraiches).toBe(1)
+})
+
+test('learn : les entrées sont du texte (commandes, outils, routes), jamais rejetées comme chemins', () => {
+  const { graph, rejected } = learn(
+    nuxt3(),
+    {
+      feature: 'flow',
+      fichiers: [{ p: 'pages/booking/offer.vue' }],
+      entrees: ['/revo-flow <demande>', '/revo-flow stop', 'outil plan', '/booking/offer', 'services/offer.ts', 'mutation createOrder'],
+    },
+    LEARN,
+  )
+  expect(rejected).toEqual([])
+  expect(graph.features.flow!.entrees).toEqual(['/revo-flow <demande>', '/revo-flow stop', 'outil plan', 'r:/booking/offer', 'services/offer.ts', 'mutation createOrder'])
+  expect(featureText(graph, graph.features.flow!)).toContain('Entrées : /revo-flow <demande>, /revo-flow stop, outil plan, /booking/offer')
+})
+
+test('briefText et agentExtract : les pièges passent avant la liste des fichiers et survivent à la coupe', () => {
+  const many: Record<string, string> = {}
+  for (let i = 0; i < 40; i++) many[`utils/fichier-au-nom-assez-long-${i}.ts`] = `export const v${i} = ${i}`
+  const g0 = buildGraph({ cle: 'front/demo', racine: 'C:/x', nom: 'demo', files: files(many), ...CTX })
+  const { graph } = learn(
+    g0,
+    {
+      feature: 'gros',
+      resume: 'Une grosse fiche.',
+      fichiers: Object.keys(many).map(p => ({ p })),
+      pieges: [{ txt: 'Piège capital : le prix est en centimes', p: 'utils/fichier-au-nom-assez-long-3.ts' }],
+    },
+    LEARN,
+  )
+  const f = graph.features.gros!
+  const b = briefText(graph, f, 400)
+  expect(tokensOf(b)).toBeLessThanOrEqual(400)
+  expect(b).toContain('Piège capital')
+  expect(b).toContain('… (tronqué)')
+  expect(b.indexOf('Pièges :')).toBeLessThan(b.indexOf('Fichiers ('))
+  const t = agentExtract(graph, f, ag('Corrige tout'), 120)
+  expect(tokensOf(t)).toBeLessThanOrEqual(120)
+  expect(t).toContain('Piège capital')
+})
+
+test('buildGraph : un fichier de test ne crée ni opération GraphQL, ni endpoint, ni externe', () => {
+  const fixture = [
+    "const N3 = { 'graphql/x.ts': `export const q = gql`",
+    '  query Accommodations { id }',
+    '`,',
+    "  'services/y.ts': `import type { Offer } from '~/generated/gql-types/graphql'",
+    "const r = await fetch('/complementary-products/test-only')`,",
+    '}',
+  ].join('\n')
+  const src = { ...N3, 'hooks/cache/graph.test.ts': fixture }
+  const g = buildGraph({ cle: 'front/demo', racine: 'C:/x', nom: 'demo', files: files(src), pkgJson: NUXT3_PKG, ...CTX })
+  expect(g.fichiers['hooks/cache/graph.test.ts']!.k).toBe('test')
+  expect(g.noeuds['q:Accommodations']).toBeUndefined()
+  expect(g.noeuds['a:GET /complementary-products/test-only']).toBeUndefined()
+  expect(g.fichiers['hooks/cache/graph.test.ts']!.out).toBeUndefined()
+  // Les nœuds du vrai code restent
+  expect(g.noeuds['q:allOffers']!.def).toBe('graphql/offers.ts')
+  expect(g.noeuds['x:generated/gql-types']).toBeDefined()
+  const u = updateFiles(g, [{ p: 'hooks/cache/graph.test.ts', h: 'h2', text: fixture }], [], [], LATER)
+  expect(u.noeuds['q:Accommodations']).toBeUndefined()
+})
+
+test('autoFiche et completeFiche : fichiers non vérifiés (h vide), à relire, jamais comptés frais', () => {
+  const g0 = withFeatures()
+  const g1 = completeFiche(g0, 'panier', ['utils/price.ts'])
+  const f = g1.features.panier!
+  expect(f.fichiers.find(x => x.p === 'utils/price.ts')!.h).toBe('')
+  const fr = freshness(g1, f)
+  expect(fr.niveau).toBe('partielle')
+  expect(fr.ratio).toBe(0)
+  expect(fr.perimes).toEqual(['utils/price.ts'])
+  expect(fr.nonVerifies).toEqual(['utils/price.ts'])
+  expect(fr.confiance).toBe(0.9)
+  const t = featureText(g1, f)
+  expect(t).toContain('⚠ 1 fichier non vérifié')
+  expect(t).toContain('Jamais vérifiés (ajoutés automatiquement) : utils/price.ts')
+  expect(t).not.toContain("Modifiés depuis l'apprentissage")
+  expect(t).toMatch(/- utils\/price\.ts · peripherique · \d+ ⚠ non vérifié/)
+  expect(servedFiles(g1, f, 'brief').find(h => h.p === 'utils/price.ts')!.frais).toBe(false)
+  expect(perimeOf(g1, f)).toEqual([{ p: 'utils/price.ts', depuis: '', nouveau: g1.fichiers['utils/price.ts']!.h }])
+  expect(diffText(g1, f, undefined, [{ p: 'utils/price.ts', depuis: '', diff: undefined }])).toContain('jamais vérifié')
+  // Une relecture confirme le fichier : la fiche redevient fraîche
+  const g2 = refreshFiles(g1, 'panier', ['utils/price.ts'], LATER).graph
+  expect(freshness(g2, g2.features.panier!).niveau).toBe('fraiche')
+  // Fiche automatique neuve : tous ses fichiers sont à relire, confiance intacte
+  const g3 = autoFiche(g0, 'auto', [{ p: 'utils/price.ts' }, { p: 'services/offer.ts' }], LEARN)
+  expect(freshness(g3, g3.features.auto!)).toMatchObject({ niveau: 'partielle', ratio: 0, confiance: 0.5 })
+})
+
+test('detectStack par manifestes, kindOf hooks/, brief sans « Stack : inconnue », MECA_FORMAT 3', () => {
+  expect(MECA_FORMAT).toBe(3)
+  expect(MANIFESTES).toContain('.claude-plugin/plugin.json')
+  expect(detectStack(undefined, [], undefined, { '.claude-plugin/plugin.json': '{}', 'tsconfig.json': '{}' })).toBe('Plugin Claude Code, TypeScript')
+  expect(detectStack(undefined, [], undefined, { 'tsconfig.json': '{}' })).toBe('TypeScript')
+  expect(detectStack(undefined, [], undefined, { 'pyproject.toml': '' })).toBe('Python')
+  expect(detectStack(undefined, [], undefined, { 'requirements.txt': 'x' })).toBe('Python')
+  expect(detectStack(undefined, [], undefined, { 'go.mod': 'module x' })).toBe('Go')
+  expect(detectStack(undefined, [], undefined, { 'Cargo.toml': '' })).toBe('Rust')
+  expect(detectStack(NUXT3_PKG, [], undefined, { 'tsconfig.json': '{}' })).toBe('Nuxt 3, Pinia, Apollo, Vuetify, TypeScript, vitest')
+  expect(detectStack(undefined, [])).toBe('inconnue')
+  expect(kindOf('hooks/register.tsx', 'Plugin Claude Code, TypeScript')).toBe('service')
+  expect(kindOf('hooks/cache/graph.ts', 'Plugin Claude Code')).toBe('service')
+  expect(kindOf('src/hooks/useCart.ts', 'React')).toBe('composable')
+  const plugin = buildGraph({
+    cle: 'revo-flow-abcdef',
+    racine: 'C:/x/revo-flow',
+    nom: 'revo-flow',
+    files: files({ 'hooks/register.tsx': 'export const a = 1', 'types/cache.d.ts': 'export type A = 1' }),
+    manifestes: { '.claude-plugin/plugin.json': '{}', 'tsconfig.json': '{}' },
+    ...CTX,
+  })
+  expect(plugin.projet.stack).toBe('Plugin Claude Code, TypeScript')
+  expect(plugin.fichiers['hooks/register.tsx']!.k).toBe('service')
+  expect(briefText(plugin, undefined)).toContain('Stack : Plugin Claude Code, TypeScript')
+  const inconnu = buildGraph({ cle: 'x-abcdef', racine: 'C:/x', nom: 'x', files: files({ 'a/b.ts': 'export const b = 1' }), ...CTX })
+  expect(inconnu.projet.stack).toBe('inconnue')
+  expect(briefText(inconnu, undefined)).not.toContain('Stack')
+  expect(briefText({ ...inconnu, projet: { ...inconnu.projet, conventions: 'Code en français' } }, undefined)).toContain('Conventions : Code en français')
 })

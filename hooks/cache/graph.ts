@@ -20,6 +20,7 @@ import type {
   GraphNode,
   LearnContext,
   LearnInput,
+  LearnResult,
   NodeKind,
   PerimeEntry,
   RefreshContext,
@@ -68,7 +69,7 @@ export const EXCLUS_DEFAUT: string[] = [
 export const SOURCE_EXT = /\.(vue|ts|tsx|js|jsx|mjs|cjs|dart|graphql|gql|md)$/i
 
 /** Version du format de la couche mécanique : un graphe d'une autre version est reconstruit en entier (fiches gardées). */
-export const MECA_FORMAT = 2
+export const MECA_FORMAT = 3
 
 /** Chemin relatif, séparateur /, sans ./ de tête. */
 const norm = (p: string) => p.replace(/\\/g, '/').replace(/^(\.\/)+/, '')
@@ -150,8 +151,11 @@ const DART_DIR_KIND: Record<string, NodeKind> = {
   entities: 'type',
 }
 
-/** Le type d'un fichier, d'après son chemin. */
-export function kindOf(p: string): NodeKind {
+/** La stack est-elle celle d'un plugin Claude Code (detectStack a lu .claude-plugin/plugin.json) ? */
+const isPluginStack = (stack: string | undefined) => (stack ?? '').includes('Plugin Claude Code')
+
+/** Le type d'un fichier, d'après son chemin ; `stack` départage hooks/ : code du plugin (service) ou hooks React/Vue (composable). */
+export function kindOf(p: string, stack?: string): NodeKind {
   const l = norm(p).toLowerCase()
   if (l.endsWith('.md')) return 'doc'
   if (/(^|\/)(tests?|__tests__|e2e|specs?|integration_test)\//.test(l) || /\.(spec|test|e2e)\.[cm]?[jt]sx?$/.test(l) || l.endsWith('_test.dart')) return 'test'
@@ -167,6 +171,7 @@ export function kindOf(p: string): NodeKind {
   }
   if (segs.length === 1) return /config|rc\.|^\./.test(l) ? 'config' : 'autre'
   const top = SRC_DIRS.has(segs[0]!) && segs.length > 2 ? segs[1]! : segs[0]!
+  if (top === 'hooks') return isPluginStack(stack) ? 'service' : 'composable'
   return DIR_KIND[top] ?? 'autre'
 }
 
@@ -255,8 +260,14 @@ function dartStack(pubspec: string): string[] {
   return out
 }
 
-/** « Nuxt 3, Pinia, Apollo, Vuetify, vitest » d'après package.json et la liste des fichiers ; « Flutter, Riverpod » d'après pubspec.yaml. */
-export function detectStack(pkgJson: string | undefined, files: string[], pubspec?: string): string {
+/** Les fichiers de la racine qui trahissent une stack sans package.json ni pubspec.yaml ; lus par buildMechanical (store.ts). */
+export const MANIFESTES = ['.claude-plugin/plugin.json', 'tsconfig.json', 'pyproject.toml', 'requirements.txt', 'go.mod', 'Cargo.toml'] as const
+
+/**
+ * « Nuxt 3, Pinia, Apollo, Vuetify, vitest » d'après package.json et la liste des fichiers ; « Flutter, Riverpod » d'après pubspec.yaml ;
+ * « Plugin Claude Code, TypeScript », « Python », « Go », « Rust » d'après les manifestes présents (chemin → texte). 'inconnue' sinon.
+ */
+export function detectStack(pkgJson: string | undefined, files: string[], pubspec?: string, manifestes: Record<string, string> = {}): string {
   let deps: Record<string, string> = {}
   try {
     const j = JSON.parse(pkgJson ?? '{}') as { dependencies?: Record<string, string>; devDependencies?: Record<string, string> }
@@ -297,6 +308,14 @@ export function detectStack(pkgJson: string | undefined, files: string[], pubspe
   if (has('jest')) out.push('Jest')
   if (has('@playwright/test') || has('playwright')) out.push('Playwright')
   if (has('cypress')) out.push('Cypress')
+  const m = (n: string) => typeof manifestes[n] === 'string'
+  const langs: string[] = []
+  if (m('.claude-plugin/plugin.json')) langs.push('Plugin Claude Code')
+  if (m('pyproject.toml') || m('requirements.txt')) langs.push('Python')
+  if (m('go.mod')) langs.push('Go')
+  if (m('Cargo.toml')) langs.push('Rust')
+  if (m('tsconfig.json') && !out.includes('TypeScript')) out.push('TypeScript')
+  out.unshift(...langs)
   if (pubspec !== undefined) out.unshift(...dartStack(pubspec))
   return out.length ? out.join(', ') : 'inconnue'
 }
@@ -608,6 +627,9 @@ function parseFile(p: string, text: string, ctx: Ctx): Parsed {
   }
   if (!/\.(vue|[cm]?[jt]sx?)$/i.test(p)) return { out: toEdges(e), nodes, guards }
 
+  // Un test écrit souvent du code source dans des chaînes (fixtures) : ni opérations gql, ni endpoints, ni externes tirés de son texte.
+  const isTest = self.k === 'test'
+
   // Imports explicites ; une constante gql importée donne « appelle » vers l'opération
   const locals = new Set<string>()
   for (const m of text.matchAll(IMPORT_RE)) {
@@ -617,6 +639,7 @@ function parseFile(p: string, text: string, ctx: Ctx): Parsed {
     const t = resolveSpec(p, spec, ctx)
     if (!t || t === p) continue
     if (t.startsWith('x:')) {
+      if (isTest) continue
       nodes[t] = { k: 'externe' }
       addEdge(e, 'importe', t)
       continue
@@ -628,7 +651,7 @@ function parseFile(p: string, text: string, ctx: Ctx): Parsed {
   }
 
   // Opérations gql écrites dans le fichier lui-même (hors graphql/) : il les appelle
-  if (self.k !== 'gql') for (const d of scanDefs(p, text).ops) addEdge(e, 'appelle', `q:${d.op}`)
+  if (self.k !== 'gql' && !isTest) for (const d of scanDefs(p, text).ops) addEdge(e, 'appelle', `q:${d.op}`)
 
   // Auto-imports Nuxt 3 : composables/, utils/, stores/ appelés sans import
   if (ctx.auto) {
@@ -673,7 +696,7 @@ function parseFile(p: string, text: string, ctx: Ctx): Parsed {
   }
 
   // URL littérales fetch / axios / $fetch → a:METHODE /chemin
-  for (const m of text.matchAll(API_RE)) {
+  for (const m of isTest ? [] : text.matchAll(API_RE)) {
     const path = apiPath(m[3]!)
     if (!path) continue
     const end = (m.index ?? 0) + m[0].length
@@ -801,6 +824,8 @@ export function buildGraph(input: {
   files: SourceFile[]
   pkgJson?: string
   pubspec?: string
+  /** Manifestes de la racine (MANIFESTES) présents : chemin → texte. */
+  manifestes?: Record<string, string>
   commit: string
   branche: string
   le: string
@@ -810,7 +835,7 @@ export function buildGraph(input: {
 }): Graph {
   const prev = input.prev ?? undefined
   const exclus = input.exclus ?? prev?.projet.exclus ?? EXCLUS_DEFAUT
-  const stack = detectStack(input.pkgJson, input.files.map(f => f.p), input.pubspec)
+  const stack = detectStack(input.pkgJson, input.files.map(f => f.p), input.pubspec, input.manifestes)
   const dart = dartPackageOf(input.pubspec)
   const files = input.files.map(f => ({ ...f, p: norm(f.p) })).filter(f => isIndexable(f.p, exclus))
   const g: Graph = {
@@ -835,12 +860,12 @@ export function buildGraph(input: {
   }
   for (const f of files) {
     const d = scanDefs(f.p, f.text)
-    const n: FileNode = { k: kindOf(f.p), h: f.h, tok: tokensOf(f.text) }
+    const n: FileNode = { k: kindOf(f.p, stack), h: f.h, tok: tokensOf(f.text) }
     if (d.exp.length) n.exp = d.exp
     const old = prev?.fichiers[f.p]
     if (old?.sum && sameHash(old.h, f.h)) n.sum = old.sum
     g.fichiers[f.p] = n
-    addOps(g, f.p, d.ops)
+    if (n.k !== 'test') addOps(g, f.p, d.ops)
   }
   const ctx = makeCtx(g.fichiers, g.noeuds, stack, exclus, dart)
   const guards = new Map<string, string[]>()
@@ -882,7 +907,7 @@ export function updateFiles(
     ren.set(from, to)
     const n = g.fichiers[from]
     delete g.fichiers[from]
-    if (n && !changedSet.has(to)) g.fichiers[to] = { ...n, k: kindOf(to) }
+    if (n && !changedSet.has(to)) g.fichiers[to] = { ...n, k: kindOf(to, g.projet.stack) }
   }
   if (ren.size) {
     const sub = (t: string) => ren.get(t) ?? t
@@ -906,12 +931,12 @@ export function updateFiles(
   for (const f of files) {
     const d = scanDefs(f.p, f.text)
     const old = g.fichiers[f.p]
-    const n: FileNode = { k: kindOf(f.p), h: f.h, tok: tokensOf(f.text), vu: ctx.le }
+    const n: FileNode = { k: kindOf(f.p, g.projet.stack), h: f.h, tok: tokensOf(f.text), vu: ctx.le }
     if (d.exp.length) n.exp = d.exp
     if (old?.sum && sameHash(old.h, f.h)) n.sum = old.sum
     if (old?.out?.garde) n.out = { garde: old.out.garde }
     g.fichiers[f.p] = n
-    addOps(g, f.p, d.ops)
+    if (n.k !== 'test') addOps(g, f.p, d.ops)
   }
   const c = makeCtx(g.fichiers, g.noeuds, g.projet.stack, g.projet.exclus, g.projet.dart)
   const guards = new Map<string, string[]>()
@@ -979,13 +1004,17 @@ const round2 = (x: number) => Math.round(x * 100) / 100
 /**
  * Fraîcheur d'une fiche d'après les hash actuels : ratio = part des tokens de la fiche modifiés depuis l'apprentissage
  * (un fichier supprimé compte pour la taille moyenne des autres). < 50 % : partielle ; ≥ 50 % : périmée.
+ * Un fichier jamais vérifié (h = '') est à relire (dans perimes et nonVerifies) sans compter dans le ratio : la fiche est au mieux partielle.
+ * Une fiche sans aucun fichier est périmée, confiance 0, `vide` : à reconstruire.
  */
 export function freshness(graph: Graph, f: Feature): Freshness {
+  if (!f.fichiers.length) return { niveau: 'perimee', ratio: 1, perimes: [], confiance: 0, vide: true }
   let total = 0
   let changed = 0
   let present = 0
   let gone = 0
   const perimes: string[] = []
+  const nonVerifies: string[] = []
   for (const ff of f.fichiers) {
     const cur = graph.fichiers[ff.p]
     if (!cur) {
@@ -995,16 +1024,19 @@ export function freshness(graph: Graph, f: Feature): Freshness {
     }
     present++
     total += cur.tok
-    if (!sameHash(cur.h, ff.h)) {
+    if (!ff.h) {
+      perimes.push(ff.p)
+      nonVerifies.push(ff.p)
+    } else if (!sameHash(cur.h, ff.h)) {
       perimes.push(ff.p)
       changed += cur.tok
     }
   }
   const avg = present ? total / present : 1000
   const all = total + gone * avg
-  const ratio = all > 0 ? (changed + gone * avg) / all : perimes.length ? 1 : 0
+  const ratio = all > 0 ? (changed + gone * avg) / all : perimes.length > nonVerifies.length ? 1 : 0
   const niveau: Freshness['niveau'] = perimes.length === 0 ? 'fraiche' : ratio < 0.5 ? 'partielle' : 'perimee'
-  return { niveau, ratio: round2(ratio), perimes, confiance: round2(f.confiance * (1 - ratio)) }
+  return { niveau, ratio: round2(ratio), perimes, confiance: round2(f.confiance * (1 - ratio)), ...(nonVerifies.length ? { nonVerifies } : {}) }
 }
 
 // ── Recherche (BM25 simplifié) ───────────────────────────────────────────
@@ -1115,9 +1147,9 @@ export function search(graph: Graph, query: string): { features: { id: string; s
 export const MATCH_MIN = 6
 export const MATCH_RATIO = 1.5
 
-/** La feature que vise la demande, seulement si elle ressort nettement (seuil absolu et avance sur la deuxième). */
+/** La feature que vise la demande, seulement si elle ressort nettement (seuil absolu et avance sur la deuxième) ; une fiche sans fichier n'est jamais servie. */
 export function matchRequest(graph: Graph, request: string): { id: string; score: number } | undefined {
-  const [best, second] = scoreAll(graph, request).filter(x => x.feature)
+  const [best, second] = scoreAll(graph, request).filter(x => x.feature && graph.features[x.key]?.fichiers.length)
   if (!best || best.score < MATCH_MIN || (second && best.score < MATCH_RATIO * second.score)) return undefined
   return { id: best.key, score: best.score }
 }
@@ -1222,10 +1254,12 @@ function defaultConfidence(source: string): number {
 const byRole = (a: FeatureFile, b: FeatureFile) => ROLES.indexOf(a.role) - ROLES.indexOf(b.role)
 
 /**
- * Écrit ou complète une fiche. Les chemins inconnus de la couche mécanique sont rejetés (et renvoyés) ;
- * les hash de tous les fichiers de la fiche sont remis à jour et `perime` est vidé.
+ * Écrit ou complète une fiche. Les chemins de fichiers et de pièges inconnus de la couche mécanique sont rejetés (et renvoyés) ;
+ * les entrées (routes, commandes, mutations…) sont du texte : gardées telles quelles, ramenées à la clé du graphe quand elles en désignent une.
+ * Les hash de tous les fichiers de la fiche sont remis à jour et `perime` est vidé.
+ * Une fiche nouvelle sans aucun fichier valide est refusée (`refus`, graphe inchangé) ; une fiche existante restée sans fichier est écrite avec un `avertissement`.
  */
-export function learn(graph: Graph, input: LearnInput, ctx: LearnContext): { graph: Graph; rejected: string[] } {
+export function learn(graph: Graph, input: LearnInput, ctx: LearnContext): LearnResult {
   const id = slug(clip(input.feature, 80))
   if (!id) return { graph, rejected: ['feature (identifiant manquant)'] }
   const old = graph.features[id]
@@ -1251,9 +1285,7 @@ export function learn(graph: Graph, input: LearnInput, ctx: LearnContext): { gra
     entrees = []
     for (const e of input.entrees) {
       const t = clip(e, 200)
-      const k = graph.noeuds[t] ? t : graph.noeuds[`r:${t}`] ? `r:${t}` : known(t)
-      if (k) entrees.push(k)
-      else rejected.push(t)
+      if (t) entrees.push(graph.noeuds[t] ? t : graph.noeuds[`r:${t}`] ? `r:${t}` : (known(t) ?? t))
     }
   }
 
@@ -1292,10 +1324,23 @@ export function learn(graph: Graph, input: LearnInput, ctx: LearnContext): { gra
     perime: [],
     usages: old?.usages ?? { servie: 0, evites: 0 },
   }
+  if (!feature.fichiers.length) {
+    if (!old)
+      return {
+        graph,
+        rejected,
+        refus: `fiche « ${id} » refusée : aucun fichier valide (chemins relatifs à la racine du projet, fichiers indexés). Rien n'a été écrit.`,
+      }
+    const next = { ...graph, features: { ...graph.features, [id]: feature } }
+    return { graph: next, rejected, avertissement: `la fiche « ${id} » n'a plus aucun fichier valide : elle est à reconstruire et ne sera plus servie.` }
+  }
   return { graph: { ...graph, features: { ...graph.features, [id]: feature } }, rejected }
 }
 
-/** Fiche minimale « flow-auto » (fichiers et hash, sans résumé, confiance 0,5) ; une fiche existante est seulement complétée. */
+/**
+ * Fiche minimale « flow-auto » (fichiers sans résumé, confiance 0,5) ; une fiche existante est seulement complétée.
+ * Personne n'a vérifié ces fichiers pour la fiche : ils sont enregistrés non vérifiés (h = '') et comptent comme à relire.
+ */
 export function autoFiche(graph: Graph, id: string, files: { p: string; role?: string }[], ctx: LearnContext): Graph {
   const key = slug(id)
   if (!key) return graph
@@ -1308,7 +1353,7 @@ export function autoFiche(graph: Graph, id: string, files: { p: string; role?: s
   for (const x of valid) {
     if (fichiers.some(f => f.p === x.k)) continue
     const n = graph.fichiers[x.k]!
-    fichiers.push({ p: x.k, role: roleOf(x.role, n.k) ?? guessRole(n.k), h: n.h })
+    fichiers.push({ p: x.k, role: roleOf(x.role, n.k) ?? guessRole(n.k), h: '' })
   }
   if (old) return { ...graph, features: { ...graph.features, [key]: { ...old, fichiers: fichiers.slice(0, 60) } } }
   const rev = reverseIndex(graph)
@@ -1333,7 +1378,7 @@ export function autoFiche(graph: Graph, id: string, files: { p: string; role?: s
   return { ...graph, features: { ...graph.features, [key]: feature } }
 }
 
-/** Ajoute à la fiche, en « peripherique », les fichiers lus pendant le flow qui n'y figuraient pas. */
+/** Ajoute à la fiche, en « peripherique » et non vérifiés (h = ''), les fichiers lus pendant le flow qui n'y figuraient pas. */
 export function completeFiche(graph: Graph, id: string, lus: string[]): Graph {
   const f = graph.features[id]
   if (!f) return graph
@@ -1342,7 +1387,7 @@ export function completeFiche(graph: Graph, id: string, lus: string[]): Graph {
     const k = resolveKey(graph, p)
     const n = k ? graph.fichiers[k] : undefined
     if (!k || !n || fichiers.length >= 60 || fichiers.some(x => x.p === k)) continue
-    fichiers.push({ p: k, role: 'peripherique', h: n.h })
+    fichiers.push({ p: k, role: 'peripherique', h: '' })
   }
   if (fichiers.length === f.fichiers.length) return graph
   return { ...graph, features: { ...graph.features, [id]: { ...f, fichiers } } }
@@ -1538,12 +1583,19 @@ function sourceLabel(s: string): string {
 
 /** ✓ fraîche, ⚠N partielle, ✕N très périmée : pour les listes. */
 function freshMark(fr: Freshness): string {
+  if (fr.vide) return '✕ vide'
   return fr.niveau === 'fraiche' ? '✓' : fr.niveau === 'partielle' ? `⚠${fr.perimes.length}` : `✕${fr.perimes.length}`
 }
 
 function freshWord(fr: Freshness): string {
+  if (fr.vide) return '✕ à reconstruire (aucun fichier)'
   if (fr.niveau === 'fraiche') return '✓ fraîche'
-  if (fr.niveau === 'partielle') return `⚠ ${plural(fr.perimes.length, 'fichier modifié', 'fichiers modifiés')}`
+  if (fr.niveau === 'partielle') {
+    const nv = fr.nonVerifies?.length ?? 0
+    const mod = fr.perimes.length - nv
+    const parts = [...(mod ? [plural(mod, 'fichier modifié', 'fichiers modifiés')] : []), ...(nv ? [plural(nv, 'fichier non vérifié', 'fichiers non vérifiés')] : [])]
+    return `⚠ ${parts.join(', ')}`
+  }
   return `✕ très périmée (${pct(fr.ratio)} modifié)`
 }
 
@@ -1576,16 +1628,28 @@ const CONSIGNE_PARTIELLE =
 /** Que faire d'une fiche très périmée. */
 const CONSIGNE_PERIMEE = 'Relis les fichiers (ou action diff) puis action apprendre pour la réécrire.'
 
-/** Le corps d'une fiche selon sa fraîcheur (§3.3) : flux masqué au-delà de 50 % de tokens modifiés. */
+/** Une ligne de fichier de fiche : chemin, rôle, taille, puis ✕ supprimé, ⚠ non vérifié ou `modifie`. */
+function fileLine(graph: Graph, ff: FeatureFile, changed: Set<string>, unchecked: Set<string>, modifie: string): string {
+  const n = graph.fichiers[ff.p]
+  const mark = !n ? ' ✕ supprimé' : unchecked.has(ff.p) ? ' ⚠ non vérifié' : changed.has(ff.p) ? modifie : ''
+  return `- ${ff.p} · ${ff.role}${n ? ` · ${fmt(n.tok)}` : ''}${mark}`
+}
+
+/** Le corps d'une fiche selon sa fraîcheur (§3.3) : flux masqué au-delà de 50 % de tokens modifiés ; pièges avant les fichiers. */
 function featureBody(graph: Graph, f: Feature, fr: Freshness): string[] {
   const L: string[] = []
   const changed = new Set(fr.perimes)
-  if (fr.niveau === 'perimee') {
+  const unchecked = new Set(fr.nonVerifies ?? [])
+  if (fr.vide) {
+    L.push("⚠ Fiche sans aucun fichier du projet : à reconstruire (action apprendre avec ses fichiers) ; résumé et flux masqués, rien n'est servi.")
+  } else if (fr.niveau === 'perimee') {
     L.push(`⚠ Fiche très périmée (${pct(fr.ratio)} des tokens modifiés depuis l'apprentissage) : résumé et flux masqués, tout est à revérifier dans le code.`)
     L.push(CONSIGNE_PERIMEE)
   } else {
     if (fr.niveau === 'partielle') {
-      L.push(`⚠ Modifiés depuis l'apprentissage : ${fr.perimes.join(', ')} : relis ces fichiers avant de te fier au flux.`)
+      const mod = fr.perimes.filter(p => !unchecked.has(p))
+      if (mod.length) L.push(`⚠ Modifiés depuis l'apprentissage : ${mod.join(', ')} : relis ces fichiers avant de te fier au flux.`)
+      if (unchecked.size) L.push(`⚠ Jamais vérifiés (ajoutés automatiquement) : ${[...unchecked].join(', ')} : relis-les avant de t'y fier.`)
       L.push(CONSIGNE_PARTIELLE)
     }
     L.push(f.resume ? `Résumé : ${f.resume}` : 'Fiche automatique : pas de résumé, seulement les fichiers vus pendant un flow.')
@@ -1595,18 +1659,17 @@ function featureBody(graph: Graph, f: Feature, fr: Freshness): string[] {
     }
   }
   if (f.entrees.length) L.push(`Entrées : ${f.entrees.map(e => e.replace(/^r:/, '')).join(', ')}`)
-  L.push(`Fichiers (${f.fichiers.length}, rôle · taille) :`)
-  for (const ff of f.fichiers.slice(0, 30)) {
-    const n = graph.fichiers[ff.p]
-    const mark = !n ? ' ✕ supprimé' : changed.has(ff.p) ? ' ⚠ modifié' : ''
-    L.push(`- ${ff.p} · ${ff.role}${n ? ` · ${fmt(n.tok)}` : ''}${mark}`)
-  }
-  if (f.fichiers.length > 30) L.push(`… et ${f.fichiers.length - 30} autres`)
+  // Pièges et dépendances avant la liste des fichiers : capLines coupe par la fin, ils doivent survivre à la coupe.
   if (f.pieges.length) {
     L.push(fr.niveau === 'perimee' ? 'Pièges (à revérifier) :' : 'Pièges :')
     for (const x of f.pieges) L.push(`- ${x.txt}${x.p ? ` (${x.p})` : ''}`)
   }
   if (f.deps.length) L.push(`Dépend de : ${f.deps.join(', ')}`)
+  if (f.fichiers.length) {
+    L.push(`Fichiers (${f.fichiers.length}, rôle · taille) :`)
+    for (const ff of f.fichiers.slice(0, 30)) L.push(fileLine(graph, ff, changed, unchecked, ' ⚠ modifié'))
+    if (f.fichiers.length > 30) L.push(`… et ${f.fichiers.length - 30} autres`)
+  }
   return L
 }
 
@@ -1633,9 +1696,12 @@ function featuresLine(graph: Graph): string {
 /** Le brief injecté au lancement (≤ max tokens, 1 200 par défaut) ; sans feature : 2 lignes + la liste des features. */
 export function briefText(graph: Graph, feature: Feature | undefined, max = 1200): string {
   const p = graph.projet
+  // Stack inconnue : pas de ligne (du bruit pour le modèle) ; les conventions restent.
+  const known = p.stack && p.stack !== 'inconnue'
+  const stack = known ? `Stack : ${p.stack}${p.conventions ? `. ${p.conventions}` : ''}` : p.conventions ? `Conventions : ${p.conventions}` : undefined
   const head = [
     `# Cache revo-flow — ${p.cle} (indexé ${p.indexe.commit.slice(0, 8)}${p.indexe.branche ? ` sur ${p.indexe.branche}` : ''}, ${p.indexe.fichiers} fichiers, ≈ ${fmt(p.indexe.tok)} tokens)`,
-    `Stack : ${p.stack}${p.conventions ? `. ${p.conventions}` : ''}`,
+    ...(stack ? [stack] : []),
     featuresLine(graph),
   ]
   const tail = [
@@ -1697,8 +1763,8 @@ export function extractFiles(graph: Graph, f: Feature, agent: AgentInfo): string
 }
 
 /**
- * L'extrait de fiche ajouté au prompt d'un sous-agent (≤ max tokens, 600 par défaut) : en-tête, fichiers qui concernent sa mission (taille, ⚠ modifié, ✕ supprimé),
- * pièges rattachés à ces fichiers (et 3 pièges sans fichier), résumé si la fiche n'est pas très périmée et s'il reste du budget, ligne d'outil.
+ * L'extrait de fiche ajouté au prompt d'un sous-agent (≤ max tokens, 600 par défaut) : en-tête, pièges rattachés à ses fichiers (et 3 pièges sans fichier),
+ * fichiers qui concernent sa mission (taille, ⚠ modifié, ⚠ non vérifié, ✕ supprimé), résumé si la fiche n'est pas très périmée et s'il reste du budget, ligne d'outil.
  */
 export function agentExtract(graph: Graph, f: Feature, agent: AgentInfo, max = 600): string {
   const fr = freshness(graph, f)
@@ -1706,18 +1772,15 @@ export function agentExtract(graph: Graph, f: Feature, agent: AgentInfo, max = 6
   const set = new Set(paths)
   const changed = new Set(fr.perimes)
   const name = f.titre && f.titre !== f.id ? `${f.id} : ${f.titre}` : f.id
+  const unchecked = new Set(fr.nonVerifies ?? [])
   const L = [`# Cache revo-flow — fiche « ${name} » (${freshWord(fr)}, confiance ${conf(fr.confiance)})`]
-  for (const ff of f.fichiers) {
-    if (!set.has(ff.p)) continue
-    const n = graph.fichiers[ff.p]
-    const mark = !n ? ' ✕ supprimé' : changed.has(ff.p) ? " ⚠ modifié depuis l'apprentissage" : ''
-    L.push(`- ${ff.p} · ${ff.role}${n ? ` · ${fmt(n.tok)}` : ''}${mark}`)
-  }
+  // Pièges avant les fichiers : capLines coupe par la fin.
   const pieges = [...f.pieges.filter(x => x.p && set.has(x.p)), ...f.pieges.filter(x => !x.p).slice(0, 3)]
   if (pieges.length) {
     L.push('Pièges :')
     for (const x of pieges) L.push(`- ${x.txt}${x.p ? ` (${x.p})` : ''}`)
   }
+  for (const ff of f.fichiers) if (set.has(ff.p)) L.push(fileLine(graph, ff, changed, unchecked, " ⚠ modifié depuis l'apprentissage"))
   const tail = [
     'Outil mcp__revo-flow__cache : feature « ' + f.id + ' » pour la fiche entière, voisins (chemin), diff (fichier modifié), rafraichir ou apprendre après relecture d’un fichier ⚠.',
   ]
@@ -1809,7 +1872,8 @@ export function diffText(graph: Graph, f: Feature | undefined, p: string | undef
       const lines = typeof d?.diff === 'string' ? d.diff.split(/\r?\n/).filter((l, k, arr) => l !== '' || k < arr.length - 1).map(diffLine) : undefined
       const name = clip(d?.p, 200) || '?'
       const block: string[] = []
-      if (lines === undefined) block.push(`### ${name}`, 'diff indisponible (blob absent) : relis le fichier.')
+      if (lines === undefined && d?.depuis === '') block.push(`### ${name}`, 'jamais vérifié (ajouté automatiquement à la fiche) : relis le fichier, puis action rafraichir.')
+      else if (lines === undefined) block.push(`### ${name}`, 'diff indisponible (blob absent) : relis le fichier.')
       else if (!lines.length) block.push(`### ${name}`, 'aucune différence.')
       else {
         const { plus, minus } = diffCounts(lines)
