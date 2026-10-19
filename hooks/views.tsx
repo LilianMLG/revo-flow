@@ -1,3 +1,4 @@
+/** Les vues du mod : panneau et bande, en terminal, desktop et mobile. */
 import type { Elements } from 'claude-code'
 
 import type { CacheStats } from '../types/cache'

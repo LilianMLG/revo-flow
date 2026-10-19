@@ -1,3 +1,4 @@
+/** L'état partagé du mod : flow, agents, tâches, orchestrateur et tokens. */
 export type ModelKey = 'haiku' | 'sonnet' | 'opus'
 export type Effort = 'low' | 'medium' | 'high' | 'xhigh'
 export type TaskKind = 'analyse' | 'codage' | 'test' | 'review' | 'doc' | 'deploy'
@@ -29,6 +30,11 @@ export type FlowAgent = Activity & {
   tasks: FlowTask[]
   /** Connu une fois l'agent lancé. */
   agentId?: string
+  /**
+   * L'id de son dernier lancement, gardé quand il quitte son lancement (attente, relance) : l'orchestrateur peut le
+   * reprendre avec SendMessage, contexte compris, et revo-flow le reconnaît à son premier tour.
+   */
+  lastAgentId?: string
   /** Le modèle réellement utilisé (identifiant complet). */
   modelId?: string
   /** blocked : son tour est fini, mais il attend le travail d'un autre agent (waitingFor) ; revo-flow le relance ensuite. */

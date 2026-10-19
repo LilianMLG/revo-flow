@@ -7,6 +7,7 @@ import type {
   CacheHit,
   CacheStats,
   Candidate,
+  ColdFile,
   DiffEntry,
   EdgeKind,
   Edges,
@@ -68,8 +69,8 @@ export const EXCLUS_DEFAUT: string[] = [
 /** Les extensions indexées : code (dont Dart), gabarits GraphQL et docs. */
 export const SOURCE_EXT = /\.(vue|ts|tsx|js|jsx|mjs|cjs|dart|graphql|gql|md)$/i
 
-/** Version du format de la couche mécanique : un graphe d'une autre version est reconstruit en entier (fiches gardées). */
-export const MECA_FORMAT = 3
+/** Version du format de la couche mécanique : un graphe d'une autre version est reconstruit en entier (fiches gardées). 4 : sum mécanique. */
+export const MECA_FORMAT = 4
 
 /** Chemin relatif, séparateur /, sans ./ de tête. */
 const norm = (p: string) => p.replace(/\\/g, '/').replace(/^(\.\/)+/, '')
@@ -382,6 +383,211 @@ function scanDefs(p: string, text: string): Defs {
       }
   }
   return { exp: [...exp], ops }
+}
+
+// ── L'indexeur : résumé mécanique (sum) ──────────────────────────────────
+
+/** Longueur maximale d'un résumé de fichier (caractères). */
+export const SUM_MAX = 120
+
+/** Directives d'outils, licences et marqueurs de fichier généré : ils ne résument pas un fichier. */
+const NOT_SUM =
+  /^(eslint|prettier|tslint|jshint|istanbul|c8\b|biome-ignore|deno-|@ts-|@jsx|@vitest|@vite|@flow|@license|@preserve|@format|globals?\b|ignore_for_file|ignore:|coverage:|copyright|©|\(c\)|spdx|#?(end)?region\b|todo\b|fixme\b|<reference\b|(auto-?)?generated\b|do not (edit|modify)|ne pas modifier)/i
+
+/** Coupe à SUM_MAX caractères sur une fin de mot, avec « … ». */
+function clipSum(s: string): string {
+  if (s.length <= SUM_MAX) return s
+  const cut = s.slice(0, SUM_MAX - 1)
+  const sp = cut.lastIndexOf(' ')
+  return `${(sp > SUM_MAX / 2 ? cut.slice(0, sp) : cut).replace(/[\s,;:.(«—–-]+$/u, '')}…`
+}
+
+/** Le texte d'un commentaire sans ses marques (/**, *, //, ///) ; les tags JSDoc (@param…) et ce qui les suit sont retirés. */
+function commentText(raw: string): string {
+  const out: string[] = []
+  const lines = raw
+    .replace(/^\s*\/\*+!?/, '')
+    .replace(/\*+\/\s*$/, '')
+    .split(/\r?\n/)
+  for (const l of lines) {
+    const t = l.replace(/^\s*(?:\/\/+!?|\*+)\s?/, '').trimEnd()
+    if (/^\s*@\w/.test(t)) break
+    // Une directive (eslint-disable…) en tête de bloc n'empêche pas la description qui la suit.
+    if (!out.some(x => x.trim()) && NOT_SUM.test(t.trim())) continue
+    out.push(t)
+  }
+  return out.join('\n')
+}
+
+/** La première phrase du premier paragraphe d'un commentaire, nettoyée et coupée à SUM_MAX ; rien si ce n'est pas une phrase utile (directive, code). */
+function sentenceOf(text: string): string | undefined {
+  let s = (text.trim().split(/\n\s*\n/)[0] ?? '')
+    .replace(/\{@link(?:code|plain)?\s+([^}|\s]+)(?:[|\s]+([^}]*))?\}/g, (_, a: string, b?: string) => b?.trim() || a)
+    .replace(/[─━═]+/g, ' ')
+    .replace(/^[\s#=*-]+/, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!s || NOT_SUM.test(s)) return undefined
+  for (const m of s.matchAll(/[.!?…](?=\s|$)/g)) {
+    const word = /(\S+)$/.exec(s.slice(0, m.index))?.[1] ?? ''
+    // « p. ex. », « cf. », « e.g. » : pas une fin de phrase
+    if (m[0] === '.' && (/^\p{L}$/u.test(word) || /^(ex|cf|vs|e\.g|i\.e|p\.ex)$/i.test(word))) continue
+    s = s.slice(0, (m.index ?? 0) + 1)
+    break
+  }
+  s = s.replace(/\s*[:;,]$/, '').trim()
+  if (s.length < 8 || !/\p{L}{3}/u.test(s) || /^[\w$.]+\s*[(=]|[;{]$/.test(s)) return undefined
+  return clipSum(s)
+}
+
+/** Les commentaires en tête de fichier (après BOM, shebang, « use strict » et lignes vides), dans l'ordre : blocs /* *\/ ou suites de lignes //. */
+function headComments(text: string): string[] {
+  const s = text.replace(/^﻿/, '').replace(/^#![^\n]*\n/, '')
+  const out: string[] = []
+  let i = 0
+  while (out.length < 10) {
+    i += /^\s*(?:(['"])use [\w ]+\1;?\s*)*/.exec(s.slice(i))![0].length
+    if (s.startsWith('/*', i)) {
+      const end = s.indexOf('*/', i + 2)
+      if (end < 0) break
+      out.push(s.slice(i, end + 2))
+      i = end + 2
+    } else if (s.startsWith('//', i)) {
+      const m = /^(?:[ \t]*\/\/[^\n]*(?:\n|$))+/.exec(s.slice(i))![0]
+      out.push(m)
+      i += m.length
+    } else break
+  }
+  return out
+}
+
+/** Le commentaire collé au-dessus d'une déclaration qui commence en début de ligne à `at` (annotations @x sautées), ou rien. */
+function commentBefore(text: string, at: number): string | undefined {
+  const lines = text.slice(0, at).split('\n')
+  lines.pop()
+  let j = lines.length - 1
+  while (j >= 0 && /^\s*@\w/.test(lines[j]!)) j--
+  if (j < 0) return undefined
+  const last = lines[j]!.trimEnd()
+  if (last.endsWith('*/')) {
+    let k = j
+    while (k >= 0 && !lines[k]!.includes('/*')) k--
+    return k < 0 ? undefined : lines.slice(k, j + 1).join('\n')
+  }
+  if (!/^\s*\/\//.test(last)) return undefined
+  let k = j
+  while (k > 0 && /^\s*\/\//.test(lines[k - 1]!)) k--
+  return lines.slice(k, j + 1).join('\n')
+}
+
+const TS_EXPORT_AT = /^[ \t]*export\s+(?!\{|\*|type\s*\{)/gm
+/** Au-delà de ce nombre de déclarations publiques, pas de résumé tiré de la première d'entre elles. */
+const DECL_SUM_MAX = 5
+
+/** Les positions des déclarations publiques d'un fichier, dans l'ordre (exports TS/JS ; déclarations Dart de premier niveau hors _privées). */
+function declPositions(p: string, text: string): number[] {
+  if (/\.dart$/i.test(p)) {
+    const at: number[] = []
+    for (const re of [DART_TYPE_DECL, DART_VAR_DECL, DART_FUN_DECL]) for (const m of text.matchAll(re)) if (!m[1]!.startsWith('_') && m[1] !== 'on') at.push(m.index ?? 0)
+    return at.sort((a, b) => a - b)
+  }
+  return [...text.matchAll(TS_EXPORT_AT)].map(m => m.index ?? 0)
+}
+
+/**
+ * Le résumé mécanique d'un fichier (0 token), pour `sum` : la première phrase de son commentaire de tête (JSDoc, //, /// en Dart ; directives et licences
+ * sautées), sinon celle du commentaire de la première déclaration publique qui en a un ; pour un .md, son premier titre. Rien pour un test.
+ * ≤ SUM_MAX caractères, coupé sur une fin de mot. Python n'est pas indexé (SOURCE_EXT) : pas de docstring.
+ */
+export function headSummary(p: string, text: string, k: NodeKind): string | undefined {
+  try {
+    if (k === 'test') return undefined
+    if (/\.md$/i.test(p)) {
+      const body = text.replace(/^﻿/, '').replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '')
+      const m = /^#{1,6}[ \t]+(.+?)[ \t#]*$/m.exec(body) ?? /^(\S.*)\r?\n(?:=+|-+)[ \t]*$/m.exec(body)
+      const t = m?.[1]
+        ?.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+        .replace(/\*\*|__/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+      return t ? clipSum(t) : undefined
+    }
+    if (!/\.(vue|[cm]?[jt]sx?|dart)$/i.test(p)) return undefined
+    let src = text
+    if (/\.vue$/i.test(p)) {
+      const html = /^\s*<!--([\s\S]*?)-->/.exec(text)
+      const s = html ? sentenceOf(html[1]!) : undefined
+      if (s) return s
+      src = /<script\b[^>]*>([\s\S]*?)<\/script>/i.exec(text)?.[1] ?? ''
+    }
+    for (const c of headComments(src)) {
+      const s = sentenceOf(commentText(c))
+      if (s) return s
+    }
+    // Le commentaire d'une déclaration ne résume le fichier que s'il en déclare peu (un module de 60 utilitaires n'est pas sa première fonction).
+    const decls = declPositions(p, src)
+    if (decls.length > DECL_SUM_MAX) return undefined
+    for (const at of decls) {
+      const c = commentBefore(src, at)
+      const s = c ? sentenceOf(commentText(c)) : undefined
+      if (s) return s
+    }
+    return undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Nombre de mots-clés gardés par fichier. */
+export const MOTS_MAX = 30
+/** Mots trop courants dans les commentaires et le code pour distinguer un fichier. */
+const MOTS_STOP = new Set(
+  (
+    'tout toute tous toutes rien comme avant apre deja encore aussi alor donc mai car pui chaque meme autre entre ici sinon seulement jamais toujours ' +
+    'tant lui eux celui celle ceux cela ca peut quel quelle fois sert renvoie rend retourne vrai faux const let var function return true false null ' +
+    'undefined string number boolean void async await new this type export import default get set'
+  ).split(' '),
+)
+const COMMENT_RE = /\/\*[\s\S]*?\*\/|(?<![:'"`\\\w])\/\/[^\n]*|<!--[\s\S]*?-->/g
+const DECL_NAME_RE =
+  /\b(?:function\*?|class|interface|type|enum)\s+([A-Za-z_$][\w$]*)|\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=\n]+)?=\s*(?:async\s*)?(?:\([^()]*\)\s*(?::[^=\n]+)?=>|function\b|[A-Za-z_$][\w$]*\s*=>)/g
+
+/**
+ * Les mots-clés d'un fichier de code (0 token, jamais injectés) : les MOTS_MAX termes les plus fréquents de ses commentaires et des noms
+ * de ses déclarations (exportées ou non). Ils servent à la carte à froid (coldRank), pas à la recherche des fiches. Rien pour un test ou un doc.
+ */
+export function keywordsOf(p: string, text: string, k: NodeKind): string[] | undefined {
+  try {
+    if (k === 'test' || k === 'doc' || !/\.(vue|[cm]?[jt]sx?|dart)$/i.test(p)) return undefined
+    const count = new Map<string, number>()
+    const add = (s: string) => {
+      for (const t of terms(s)) if (t.length > 2 && !/^\d+$/.test(t) && !MOTS_STOP.has(t)) count.set(t, (count.get(t) ?? 0) + 1)
+    }
+    for (const m of text.matchAll(COMMENT_RE)) add(m[0].replace(/^\/\*+|\*+\/$|^\/\/+|^<!--|-->$/g, ' '))
+    if (/\.dart$/i.test(p)) {
+      for (const re of [DART_TYPE_DECL, DART_VAR_DECL, DART_FUN_DECL]) for (const m of text.matchAll(re)) add(m[1]!)
+    } else for (const m of text.matchAll(DECL_NAME_RE)) add(m[1] ?? m[2] ?? '')
+    const out = [...count]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .slice(0, MOTS_MAX)
+      .map(([t]) => t)
+    return out.length ? out : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Le `sum` et les `mots` d'un fichier réindexé : le sum d'un modèle (sumLlm) tant que le hash n'a pas changé, sinon le résumé mécanique. */
+function withSum(n: FileNode, old: FileNode | undefined, f: SourceFile): void {
+  if (old?.sum && old.sumLlm && sameHash(old.h, f.h)) {
+    n.sum = old.sum
+    n.sumLlm = true
+  } else {
+    const s = headSummary(f.p, f.text, n.k)
+    if (s) n.sum = s
+  }
+  const mots = keywordsOf(f.p, f.text, n.k)
+  if (mots) n.mots = mots
 }
 
 // ── L'indexeur : le contexte de résolution ───────────────────────────────
@@ -862,8 +1068,7 @@ export function buildGraph(input: {
     const d = scanDefs(f.p, f.text)
     const n: FileNode = { k: kindOf(f.p, stack), h: f.h, tok: tokensOf(f.text) }
     if (d.exp.length) n.exp = d.exp
-    const old = prev?.fichiers[f.p]
-    if (old?.sum && sameHash(old.h, f.h)) n.sum = old.sum
+    withSum(n, prev?.fichiers[f.p], f)
     g.fichiers[f.p] = n
     if (n.k !== 'test') addOps(g, f.p, d.ops)
   }
@@ -933,7 +1138,7 @@ export function updateFiles(
     const old = g.fichiers[f.p]
     const n: FileNode = { k: kindOf(f.p, g.projet.stack), h: f.h, tok: tokensOf(f.text), vu: ctx.le }
     if (d.exp.length) n.exp = d.exp
-    if (old?.sum && sameHash(old.h, f.h)) n.sum = old.sum
+    withSum(n, old, f)
     if (old?.out?.garde) n.out = { garde: old.out.garde }
     g.fichiers[f.p] = n
     if (n.k !== 'test') addOps(g, f.p, d.ops)
@@ -1693,8 +1898,199 @@ function featuresLine(graph: Graph): string {
   return `Features connues (✓ fraîche, ⚠ modifiée, ✕ très périmée) : ${known}${more}${c ? ` ; ${c}` : ''}`
 }
 
-/** Le brief injecté au lancement (≤ max tokens, 1 200 par défaut) ; sans feature : 2 lignes + la liste des features. */
-export function briefText(graph: Graph, feature: Feature | undefined, max = 1200): string {
+// ── Carte à froid (demande sans fiche) ───────────────────────────────────
+
+/** Les arêtes qui lient deux fichiers de code pour la centralité (« appelle » q:op compte vers le fichier qui déclare l'opération). */
+const CENTRAL_EDGES: EdgeKind[] = ['importe', 'utilise', 'rend', 'appelle']
+/** Un fichier généré, même s'il a échappé aux exclusions. */
+const GENERATED = /(^|\/)(generated|__generated__)\/|\.(g|gen|generated|freezed|mocks|pb)\.(dart|[cm]?[jt]sx?)$|\.min\.js$/i
+/** Moins de fichiers de code que ça : pas de carte (le projet se lit d'un coup d'œil). */
+const COLD_MIN_FILES = 5
+/** Amortissement du PageRank : 0,75 garde la marche près des fichiers pertinents. */
+const PR_DAMPING = 0.75
+const PR_ITERS = 30
+
+/** Mots français courants d'une demande → termes anglais du code (termes déjà passés par `terms` : sans accents, pluriel retiré). */
+const GLOSSAIRE: Record<string, string[]> = {
+  commande: ['order'],
+  panier: ['cart', 'basket'],
+  liste: ['list'],
+  filtre: ['filter'],
+  recherche: ['search'],
+  client: ['customer'],
+  utilisateur: ['user'],
+  paiement: ['payment'],
+  connexion: ['login', 'auth'],
+  produit: ['product'],
+  prix: ['price'],
+  billet: ['ticket'],
+  reservation: ['booking'],
+  tableau: ['table'],
+  formulaire: ['form'],
+  bouton: ['button'],
+  erreur: ['error'],
+  fichier: ['file'],
+  telechargement: ['download'],
+  envoi: ['send'],
+  traduction: ['i18n', 'translation'],
+  calendrier: ['calendar'],
+  jour: ['day'],
+  heure: ['time', 'hour'],
+  seance: ['session'],
+  stock: ['stock'],
+  offre: ['offer'],
+  carte: ['card', 'map'],
+  page: ['page'],
+  ecran: ['screen'],
+  parametre: ['settings', 'param'],
+  notification: ['notification'],
+  attente: ['waiting', 'pending', 'blocked'],
+  relance: ['retry', 'relaunch', 'resume'],
+}
+
+type Carte = { nodes: string[]; adj: number[][]; central: Float64Array }
+const carteCache = new WeakMap<Graph, Carte>()
+
+/** PageRank sur un graphe non orienté, téléportation selon `seed` (somme 1) ; la masse d'un nœud isolé repart selon `seed`. */
+function pagerank(adj: number[][], seed: Float64Array): Float64Array {
+  const n = adj.length
+  let pr = Float64Array.from(seed)
+  for (let it = 0; it < PR_ITERS; it++) {
+    const next = new Float64Array(n)
+    let lost = 0
+    for (let i = 0; i < n; i++) {
+      const d = adj[i]!.length
+      if (!d) {
+        lost += pr[i]!
+        continue
+      }
+      const share = pr[i]! / d
+      for (const j of adj[i]!) next[j]! += share
+    }
+    for (let i = 0; i < n; i++) next[i] = (1 - PR_DAMPING) * seed[i]! + PR_DAMPING * (next[i]! + lost * seed[i]!)
+    pr = next
+  }
+  return pr
+}
+
+/** Les fichiers de code (ni tests, ni docs, ni générés), leurs liens non orientés et leur centralité globale (PageRank uniforme). */
+function carteOf(graph: Graph): Carte {
+  const hit = carteCache.get(graph)
+  if (hit) return hit
+  const nodes = Object.entries(graph.fichiers)
+    .filter(([p, n]) => n.k !== 'test' && n.k !== 'doc' && !GENERATED.test(p))
+    .map(([p]) => p)
+  const at = new Map(nodes.map((p, i) => [p, i]))
+  const links = nodes.map(() => new Set<number>())
+  nodes.forEach((p, i) => {
+    const out = graph.fichiers[p]!.out ?? {}
+    for (const k of CENTRAL_EDGES)
+      for (const t of out[k] ?? []) {
+        const j = at.get(t.startsWith('q:') ? (graph.noeuds[t]?.def ?? '') : t)
+        if (j === undefined || j === i) continue
+        links[i]!.add(j)
+        links[j]!.add(i)
+      }
+  })
+  const adj = links.map(s => [...s])
+  const central = pagerank(adj, new Float64Array(nodes.length).fill(1 / Math.max(1, nodes.length)))
+  const carte = { nodes, adj, central }
+  carteCache.set(graph, carte)
+  return carte
+}
+
+/**
+ * Classe les fichiers de code pour une demande sans fiche : score = 0,6 × pertinence BM25 de la demande (nom, dossiers, exports, sum)
+ * + 0,3 × PageRank personnalisé par les fichiers pertinents + 0,1 × centralité globale, chacun ramené à 0..1.
+ * Aucun fichier pertinent : centralité seule. Ni tests, ni docs, ni fichiers générés ; moins de 5 fichiers de code : [].
+ */
+export function coldRank(graph: Graph, request: string): ColdFile[] {
+  const { nodes, adj, central } = carteOf(graph)
+  if (nodes.length < COLD_MIN_FILES) return []
+  const at = new Map(nodes.map((p, i) => [p, i]))
+  // La demande est souvent en français et le code en anglais : GLOSSAIRE ajoute la traduction des mots courants.
+  const q = [...new Set(terms(String(request ?? '')).flatMap(t => [t, ...(GLOSSAIRE[t] ?? [])]))]
+  const rel = new Float64Array(nodes.length)
+  for (const x of scoreAll(graph, q.join(' '))) {
+    const i = x.feature ? undefined : at.get(x.key)
+    if (i !== undefined) rel[i] = x.score
+  }
+  // Les mots-clés (commentaires, noms internes) : idf calculé sur les seuls fichiers de la carte ; un préfixe commun (≥ 5 lettres) compte pour moitié.
+  if (q.length) {
+    const mots = nodes.map(p => graph.fichiers[p]!.mots ?? [])
+    const df = new Map<string, number>()
+    for (const list of mots) for (const t of list) df.set(t, (df.get(t) ?? 0) + 1)
+    const idf = (t: string) => Math.log(1 + (nodes.length - (df.get(t) ?? 0) + 0.5) / ((df.get(t) ?? 0) + 0.5))
+    mots.forEach((list, i) => {
+      let s = 0
+      for (const t of q) {
+        if (list.includes(t)) {
+          s += idf(t)
+          continue
+        }
+        if (t.length < 5) continue
+        const near = list.find(m => m.length >= 5 && (m.startsWith(t) || t.startsWith(m)))
+        if (near) s += 0.5 * idf(near)
+      }
+      rel[i]! += s
+    })
+  }
+  const maxOf = (a: Float64Array) => a.reduce((m, v) => Math.max(m, v), 0) || 1
+  const relSum = rel.reduce((s, v) => s + v, 0)
+  const maxC = maxOf(central)
+  let score: (i: number) => number = i => central[i]! / maxC
+  if (relSum > 0) {
+    const ppr = pagerank(adj, rel.map(v => v / relSum))
+    const maxR = maxOf(rel)
+    const maxP = maxOf(ppr)
+    score = i => 0.6 * (rel[i]! / maxR) + 0.3 * (ppr[i]! / maxP) + 0.1 * (central[i]! / maxC)
+  }
+  return nodes
+    .map((p, i) => ({ p, score: round2(score(i)), pertinent: rel[i]! > 0 }))
+    .sort((a, b) => b.score - a.score || Number(b.pertinent) - Number(a.pertinent) || a.p.localeCompare(b.p))
+}
+
+/** Titres de la carte à froid, selon qu'un fichier ressort ou non pour la demande. */
+export const COLD_TITLE = '## Fichiers probables pour cette demande (carte, à vérifier)'
+export const COLD_TITLE_CENTRAL = '## Rien ne ressort pour cette demande : fichiers les plus centraux du projet (carte, à vérifier)'
+
+/**
+ * La carte à froid (≤ maxTok tokens, 700 par défaut) : un titre puis 10 à 25 lignes « - chemin · type · ≈ taille · sum », par score décroissant
+ * (au-delà de 10, seulement les scores ≥ 15 % du premier) ; aucun fichier pertinent : les 12 plus centraux sous COLD_TITLE_CENTRAL.
+ * '' si le projet a moins de 5 fichiers de code ou si le budget ne laisse pas une ligne.
+ */
+export function coldMap(graph: Graph, request: string, maxTok = 700): string {
+  try {
+    const ranked = coldRank(graph, request)
+    if (!ranked.length) return ''
+    const any = ranked.some(x => x.pertinent)
+    const max = any ? 25 : 12
+    const top = ranked[0]!.score
+    const ficheOf = new Map<string, string[]>()
+    for (const f of Object.values(graph.features)) for (const x of f.fichiers) ficheOf.set(x.p, [...(ficheOf.get(x.p) ?? []), f.id])
+    const L = [any ? COLD_TITLE : COLD_TITLE_CENTRAL]
+    let used = tokensOf(L[0]!)
+    for (const [i, x] of ranked.entries()) {
+      if (i >= max || (i >= 10 && x.score < 0.15 * top)) break
+      const n = graph.fichiers[x.p]!
+      const fiches = ficheOf.get(x.p)
+      const line = `- ${x.p} · ${n.k} · ≈ ${fmt(n.tok)}${n.sum ? ` · ${n.sum}` : ''}${fiches ? ` · fiche ${fiches.join(', ')}` : ''}`
+      const cost = tokensOf(line) + 1
+      if (used + cost > maxTok) break
+      L.push(line)
+      used += cost
+    }
+    return L.length > 1 ? L.join('\n') : ''
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * Le brief injecté au lancement (≤ max tokens, 1 200 par défaut) ; sans feature : en-tête et liste des features, plus, si `request` est donnée,
+ * la carte à froid (coldMap, ≤ 700 tokens) entre l'en-tête et la queue.
+ */
+export function briefText(graph: Graph, feature: Feature | undefined, max = 1200, request?: string): string {
   const p = graph.projet
   // Stack inconnue : pas de ligne (du bruit pour le modèle) ; les conventions restent.
   const known = p.stack && p.stack !== 'inconnue'
@@ -1708,7 +2104,11 @@ export function briefText(graph: Graph, feature: Feature | undefined, max = 1200
     'Le cache est une carte, pas la vérité : vérifie dans le code tout ce que tu affirmes ou modifies.',
     'Outil mcp__revo-flow__cache : chercher (mots-clés), feature (id), voisins (chemin : ce qu’il utilise, qui l’utilise), diff (feature ou chemin : ce qui a changé depuis l’apprentissage), rafraichir (fiche encore juste après relecture), apprendre (en fin de flow, ou fiche fausse).',
   ]
-  if (!feature) return capLines(head, max, tail)
+  if (!feature) {
+    const room = Math.min(700, max - tokensOf([...head, ...tail].join('\n')) - 4)
+    const map = request && room > 0 ? coldMap(graph, request, room) : ''
+    return capLines(map ? [...head, ...map.split('\n')] : head, max, tail)
+  }
   const fr = freshness(graph, feature)
   return capLines([...head, featureHeader(feature, fr, '## Fiche probable :'), ...featureBody(graph, feature, fr)], max, tail)
 }

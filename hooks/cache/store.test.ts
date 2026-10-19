@@ -5,7 +5,7 @@ import type { On } from 'claude-code'
 import type { Feature, Graph } from '../../types/cache'
 import { diffSince, graphFileName, mergeGraphs, normalizePath, parseLsFiles, parseNameStatus, parseStatus, refreshGraph, stripDiffHeader } from './store'
 import type { Io } from './store'
-import { hashPath } from './graph'
+import { MECA_FORMAT, hashPath } from './graph'
 import { OSES, diskKey, native, type Os } from '../test-os'
 
 const DOCS = 'C:/Users/x/Documents'
@@ -439,7 +439,7 @@ for (const os of OSES) {
       await run($, 'cache build')
       const g = readGraph(w)
       expect(g.projet.stack).toBe('Plugin Claude Code, TypeScript')
-      expect(g.projet.format).toBe(3)
+      expect(g.projet.format).toBe(MECA_FORMAT)
       expect(Object.keys(g.fichiers)).toEqual(['hooks/register.tsx'])
       expect(g.fichiers['hooks/register.tsx']!.k).toBe('service')
     })

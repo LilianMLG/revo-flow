@@ -35,6 +35,10 @@ import {
   updateFiles,
   MECA_FORMAT,
   MANIFESTES,
+  coldMap,
+  coldRank,
+  headSummary,
+  keywordsOf,
 } from './graph'
 import type { Feature, FlowCache, Graph, LearnContext, SourceFile } from '../../types/cache'
 
@@ -1023,8 +1027,8 @@ test('autoFiche et completeFiche : fichiers non vérifiés (h vide), à relire, 
   expect(freshness(g3, g3.features.auto!)).toMatchObject({ niveau: 'partielle', ratio: 0, confiance: 0.5 })
 })
 
-test('detectStack par manifestes, kindOf hooks/, brief sans « Stack : inconnue », MECA_FORMAT 3', () => {
-  expect(MECA_FORMAT).toBe(3)
+test('detectStack par manifestes, kindOf hooks/, brief sans « Stack : inconnue », MECA_FORMAT 4', () => {
+  expect(MECA_FORMAT).toBe(4)
   expect(MANIFESTES).toContain('.claude-plugin/plugin.json')
   expect(detectStack(undefined, [], undefined, { '.claude-plugin/plugin.json': '{}', 'tsconfig.json': '{}' })).toBe('Plugin Claude Code, TypeScript')
   expect(detectStack(undefined, [], undefined, { 'tsconfig.json': '{}' })).toBe('TypeScript')
@@ -1052,4 +1056,83 @@ test('detectStack par manifestes, kindOf hooks/, brief sans « Stack : inconnue 
   expect(inconnu.projet.stack).toBe('inconnue')
   expect(briefText(inconnu, undefined)).not.toContain('Stack')
   expect(briefText({ ...inconnu, projet: { ...inconnu.projet, conventions: 'Code en français' } }, undefined)).toContain('Conventions : Code en français')
+})
+
+// ── Démarrage à froid : sum mécanique et carte ───────────────────────────
+
+test('headSummary : 1re phrase du commentaire de tête (JSDoc, //, Dart ///), titre d’un .md, rien pour un test, coupé à 120', () => {
+  expect(headSummary('a.ts', '/**\n * Le panier : lignes, total et code promo. Le reste suit.\n * @param x rien\n */\nexport const a = 1', 'service')).toBe(
+    'Le panier : lignes, total et code promo.',
+  )
+  expect(headSummary('b.ts', '// eslint-disable-next-line\n// Formate un prix en euros, p. ex. 12,50 €.\nexport const f = 1', 'util')).toBe(
+    'Formate un prix en euros, p. ex. 12,50 €.',
+  )
+  expect(headSummary('lib/c.dart', '/// Écran de réservation des séances.\nclass BookingScreen {}', 'page')).toBe('Écran de réservation des séances.')
+  expect(headSummary('docs/d.md', '---\ntitle: x\n---\n# Guide **du** [cache](x.md)\ntexte', 'doc')).toBe('Guide du cache')
+  expect(headSummary('e.spec.ts', '/** Les tests du panier. */', 'test')).toBeUndefined()
+  // Pas de commentaire de tête : celui de la première déclaration publique d'un petit module.
+  expect(headSummary('f.ts', "import x from 'y'\n\n/** Calcule la remise d'une offre. */\nexport function remise() {}", 'util')).toBe(
+    "Calcule la remise d'une offre.",
+  )
+  const long = headSummary('g.ts', `/** ${'mot '.repeat(60)}fin. */`, 'util')!
+  expect(long.length).toBeLessThanOrEqual(120)
+  expect(long.endsWith('…')).toBe(true)
+  expect(headSummary('h.ts', '/* eslint-disable */\nexport const h = 1', 'util')).toBeUndefined()
+})
+
+test('buildGraph : sum mécanique écrit pour le code, gardé tel quel quand il vient d’un modèle et que le fichier n’a pas changé', () => {
+  const src = { 'services/cart.ts': '/** Le panier et son total. */\nexport const cart = 1' }
+  const g = buildGraph({ cle: 'x-1', racine: 'C:/x', nom: 'x', files: files(src), ...CTX })
+  expect(g.fichiers['services/cart.ts']!.sum).toBe('Le panier et son total.')
+  expect(g.fichiers['services/cart.ts']!.mots).toContain('panier')
+  const llm = { ...g, fichiers: { ...g.fichiers, 'services/cart.ts': { ...g.fichiers['services/cart.ts']!, sum: 'Résumé du modèle', sumLlm: true as const } } }
+  const again = buildGraph({ cle: 'x-1', racine: 'C:/x', nom: 'x', files: files(src), prev: llm, ...CTX })
+  expect(again.fichiers['services/cart.ts']!.sum).toBe('Résumé du modèle')
+  const changed = buildGraph({ cle: 'x-1', racine: 'C:/x', nom: 'x', files: files(src, 'h2'), prev: llm, ...CTX })
+  expect(changed.fichiers['services/cart.ts']!.sum).toBe('Le panier et son total.')
+})
+
+/** Un petit plugin : un cœur central (importé par tous), une relance, un panier, et du bruit (test, doc, généré). */
+const PLUGIN_SRC: Record<string, string> = {
+  'hooks/lib.ts': '/** Les utilitaires partagés : slug, tarifs. */\nexport const slug = 1',
+  'hooks/register.tsx': "/** Le cœur du flow : plan, agents, relance des agents en attente. */\nimport { slug } from './lib'\nexport function relaunch() {}\nfunction blockedNote() {}",
+  'hooks/views.tsx': "/** Le panneau et la bande. */\nimport { slug } from './lib'\nexport const View = 1",
+  'hooks/art.ts': "/** Les SVG des cartes. */\nimport { slug } from './lib'\nexport const svg = 1",
+  'hooks/cart.ts': "/** Le panier du démonstrateur. */\nimport { slug } from './lib'\nexport const cart = 1",
+  'hooks/flow.test.ts': "/** Tests de la relance des agents en attente. */\nimport { relaunch } from './register'",
+  'docs/relance.md': '# Relance des agents en attente',
+  'generated/types.ts': '/** Relance générée. */\nexport type Relance = 1',
+}
+const plugin = () =>
+  buildGraph({ cle: 'p-1', racine: 'C:/p', nom: 'p', files: files(PLUGIN_SRC), manifestes: { '.claude-plugin/plugin.json': '{}' }, ...CTX })
+
+test('coldRank : la demande d’abord (glossaire FR → EN compris), puis la centralité ; ni tests, ni docs, ni générés', () => {
+  const g = plugin()
+  const ranked = coldRank(g, 'améliorer la relance des agents en attente')
+  expect(ranked[0]!.p).toBe('hooks/register.tsx')
+  expect(ranked[0]!.pertinent).toBe(true)
+  expect(ranked.map(x => x.p)).not.toContain('hooks/flow.test.ts')
+  expect(ranked.map(x => x.p)).not.toContain('docs/relance.md')
+  expect(ranked.map(x => x.p)).not.toContain('generated/types.ts')
+  expect(coldRank(g, 'le panier')[0]!.p).toBe('hooks/cart.ts')
+  // Rien de pertinent : la centralité seule, et lib.ts, importé par tous, en tête.
+  const none = coldRank(g, 'zzz')
+  expect(none.every(x => !x.pertinent)).toBe(true)
+  expect(none[0]!.p).toBe('hooks/lib.ts')
+  const tiny = buildGraph({ cle: 't-1', racine: 'C:/t', nom: 't', files: files({ 'a.ts': 'export const a = 1' }), ...CTX })
+  expect(coldRank(tiny, 'a')).toEqual([])
+})
+
+test('coldMap et briefText : carte à froid dans le budget, titre selon la pertinence, rien sans demande', () => {
+  const g = plugin()
+  const map = coldMap(g, 'améliorer la relance des agents en attente')
+  expect(map.split('\n')[0]).toBe('## Fichiers probables pour cette demande (carte, à vérifier)')
+  expect(map).toMatch(/^- hooks\/register\.tsx · service · ≈ .* · Le cœur du flow : plan, agents, relance des agents en attente\.$/m)
+  expect(coldMap(g, 'zzz').split('\n')[0]).toMatch(/^## Rien ne ressort pour cette demande : fichiers les plus centraux/)
+  expect(tokensOf(coldMap(g, 'relance', 40))).toBeLessThanOrEqual(40)
+  const brief = briefText(g, undefined, 1200, 'améliorer la relance des agents en attente')
+  expect(brief).toContain('## Fichiers probables pour cette demande')
+  expect(brief.trimEnd().endsWith('apprendre (en fin de flow, ou fiche fausse).')).toBe(true)
+  expect(tokensOf(brief)).toBeLessThanOrEqual(1200)
+  expect(briefText(g, undefined)).not.toContain('Fichiers probables')
 })

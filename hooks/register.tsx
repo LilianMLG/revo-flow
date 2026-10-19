@@ -1,3 +1,4 @@
+/** Le cœur du mod : commande /revo-flow, outils plan, step et cache, suivi des agents (lancement, attente, relance, arrêt) et rendu du panneau. */
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, PluginOptions, Register, SessionContextUsage } from 'claude-code'
 
@@ -81,7 +82,10 @@ import {
   slug,
   total,
   weekKey,
+  addToJournal,
+  historyText,
   type AgentCache,
+  type JournalEntry,
   type PlanInput,
   type Usage,
 } from './lib'
@@ -126,6 +130,8 @@ const opts = { validerPlan: true, conflits: 'avertir' as 'avertir' | 'refuser', 
 const claimed = new Set<string>()
 /** Le tour en cours de l'orchestrateur, pour pouvoir l'interrompre ($.turn.abort ne prend que celui-là). */
 let leadTurnId: string | undefined
+/** Les éclaireurs (Explore avant le plan) : hors des agents prévus, leurs tokens et leur coût comptent pour l'orchestrateur. */
+const scouts = new Set<string>()
 /** Les tours de l'orchestrateur interrompus par stopAll : leur fin appartient à l'ancien flow, pas à celui qui l'a remplacé. */
 const stoppedTurns = new Set<string>()
 /** La validation du plan en attente : les boutons du panneau peuvent y répondre à la place du dialogue. */
@@ -140,7 +146,48 @@ let isWatching = false
 function watchAgents($: $) {
   if (isWatching) return
   isWatching = true
-  $.clock.every(3000, () => void syncAgents($).catch(() => undefined))
+  $.clock.every(3000, () => void syncAgents($).then(() => tick($)).catch(() => undefined))
+}
+
+/** Un agent au travail sans aucune requête depuis ce délai : prévenu une fois (toast et notification). */
+const IDLE_WARN_MS = 180_000
+/** Les agents déjà signalés inactifs (agentId), pour ne prévenir qu'une fois par silence. */
+const idleWarned = new Set<string>()
+/** La dernière ligne d'état posée, pour ne la réécrire que si elle change. */
+let statusLine: string | undefined
+
+/**
+ * Toutes les 3 s : les durées et « inactif depuis » avancent seules (redessin tant qu'un agent tourne), un agent
+ * silencieux depuis IDLE_WARN_MS est signalé une fois, et la ligne d'état sous le prompt suit le flow.
+ */
+async function tick($: $) {
+  const flow = await read($, flowA)
+  const running = flow?.agents.filter(a => a.status === 'running') ?? []
+  if (running.length) $.ui.invalidate('ui.render')
+  const now = await $.clock.now()
+  for (const a of running) {
+    if (!a.agentId || a.lastActiveAt === undefined) continue
+    if (now - a.lastActiveAt < IDLE_WARN_MS) {
+      idleWarned.delete(a.agentId)
+      continue
+    }
+    if (idleWarned.has(a.agentId)) continue
+    idleWarned.add(a.agentId)
+    $.ui.toast(`revo-flow : « ${a.name} » inactif depuis ${fmtDuration(now - a.lastActiveAt)}`, { timeoutMs: 10_000 })
+    await notify($, `« ${a.name} » inactif depuis ${fmtDuration(now - a.lastActiveAt)} : bloqué ? /revo-flow statut, ou Arrêter dans le panneau`)
+  }
+  const line = flow && flow.phase !== 'done' ? await statusOf($, flow, running.length) : undefined
+  if (line !== statusLine) {
+    statusLine = line
+    $.ui.status(line)
+  }
+}
+
+/** La ligne d'état sous le prompt : « revo-flow · titre · 62 % · 3 actifs · 0,41 € ». */
+async function statusOf($: $, flow: Flow, running: number) {
+  const cost = (await read($, leadA)).costUsd + flow.agents.reduce((n, a) => n + a.costUsd, 0)
+  const step = flow.phase === 'planning' ? 'plan en préparation' : flow.phase === 'dispatch' ? 'plan à valider' : `${flowPercent(flow)} %`
+  return `revo-flow · ${flow.title} · ${step}${running ? ` · ${running} actif${running > 1 ? 's' : ''}` : ''} · ${euros(cost)}`
 }
 
 // ── Flow ─────────────────────────────────────────────────────────────────
@@ -407,7 +454,38 @@ async function finishFlow($: $) {
   await closeFlowCache($).catch(() => undefined)
   const blocked = flow.agents.filter(a => a.status === 'blocked').length
   const note = `${blocked ? ` · ${blocked} agent${blocked > 1 ? 's' : ''} en attente` : ''}${endNote ? ` · ${endNote}` : ''}`
-  await notify($, `« ${flow.title} » ${flow.isStopped ? 'arrêté' : 'terminé'} ·${fmtDuration(now - flow.startedAt)} · ${euros(cost)} · ${files} fichier${files > 1 ? 's' : ''}${note}`)
+  await notify($, `« ${flow.title} » ${flow.isStopped ? 'arrêté' : 'terminé'} · ${fmtDuration(now - flow.startedAt)} · ${euros(cost)} · ${files} fichier${files > 1 ? 's' : ''}${note}`)
+  await journalize($, { ...flow, endedAt: now }, lead, files).catch(() => undefined)
+}
+
+/** Le journal des flows (store du plugin), les plus récents d'abord. */
+const JOURNAL_KEY = 'journal'
+
+/** Ajoute le flow fini au journal : durée, coût et sort de chaque agent, pour /revo-flow historique. */
+async function journalize($: $, flow: Flow, lead: Lead, files: number) {
+  const entry: JournalEntry = {
+    id: flow.id,
+    title: flow.title,
+    project: flow.project,
+    branch: flow.branch,
+    startedAt: flow.startedAt,
+    durationMs: (flow.endedAt ?? flow.startedAt) - flow.startedAt,
+    isStopped: flow.isStopped === true,
+    files,
+    lead: { modelId: lead.modelId, costUsd: lead.costUsd, tokens: total(lead.tokens) },
+    agents: flow.agents.map(a => ({
+      name: a.name,
+      model: a.model,
+      effort: a.effort,
+      status: a.status,
+      costUsd: a.costUsd,
+      tokens: total(a.tokens),
+      attempts: a.attempts ?? 1,
+      durationMs: a.startedAt !== undefined && a.endedAt !== undefined ? a.endedAt - a.startedAt : 0,
+    })),
+  }
+  const prev = await $.store.get(JOURNAL_KEY)
+  await $.store.set(JOURNAL_KEY, addToJournal(prev, entry))
 }
 
 // ── Cache projet ─────────────────────────────────────────────────────────
@@ -857,7 +935,8 @@ async function startFlowCache($: $, flowId: string, request: string): Promise<st
     const answer = await askOr($, q, ['Utiliser', 'Ignorer'], { headless: 'Utiliser', dismissed: 'Ignorer' })
     if (answer !== 'Utiliser') f = undefined
   }
-  const brief = briefText(graph, f)
+  // Sans fiche : la carte à froid (fichiers probables pour la demande, avec leur résumé) plutôt qu'une liste de features seule.
+  const brief = briefText(graph, f, undefined, request)
   const hits = f ? servedFiles(graph, f, 'brief') : []
   await update($, flowCacheA, fc => (fc ? { ...fc, servis: hits, injecte: tokensOf(brief), ...(f ? { feature: f.id } : {}) } : fc))
   await refreshStats($)
@@ -1234,7 +1313,7 @@ async function endAgent($: $, key: string, outcome: Outcome, isQuiet = false): P
     isEnded = true
     if (outcome === 'blocked') {
       const { agentId: _id, ...rest } = x
-      return { ...rest, status: 'blocked', isDoing: false, endedAt: now, tasks: pauseTasks(x.tasks) }
+      return { ...rest, ...(x.agentId ? { lastAgentId: x.agentId } : {}), status: 'blocked', isDoing: false, endedAt: now, tasks: pauseTasks(x.tasks) }
     }
     const { waitingFor: _w, ...rest } = x
     return { ...rest, status: outcome, isDoing: false, endedAt: now, tasks: finishTasks(x.tasks, outcome === 'failed') }
@@ -1268,7 +1347,19 @@ async function afterEnd($: $, key: string, outcome: Outcome) {
   if (!target) return blockedNote($, a, 'hors plan')
   if (target.status === 'done') return relaunch($, key, `« ${target.name} » a déjà fini, « ${a.name} » l’attendait :`)
   if (target.status === 'failed') return blockedNote($, a, 'en échec')
-  if (target.status === 'blocked' && target.waitingFor?.key === key) return blockedNote($, a, 'attente croisée')
+  if (target.status === 'blocked' && waitsFor(flow, target.key, key)) return blockedNote($, a, 'attente croisée')
+}
+
+/** `from` attend-il `key`, directement ou par une chaîne d'agents en attente (A attend B qui attend C qui attend A) ? */
+function waitsFor(flow: Flow, from: string, key: string): boolean {
+  const seen = new Set<string>()
+  let cur = flow.agents.find(x => x.key === from)
+  while (cur && cur.status === 'blocked' && cur.waitingFor?.key && !seen.has(cur.key)) {
+    if (cur.waitingFor.key === key) return true
+    seen.add(cur.key)
+    cur = flow.agents.find(x => x.key === cur!.waitingFor?.key)
+  }
+  return false
 }
 
 /** Personne ne viendra relancer cet agent en attente : l'orchestrateur est prévenu et décide. */
@@ -1282,10 +1373,10 @@ function blockedNote($: $, a: FlowAgent, why: 'en échec' | 'hors plan' | 'atten
       ? `Relance « ${name} » puis « ${a.name} », ou « ${a.name} » avec d’autres consignes`
       : why === 'hors plan'
         ? `« ${name} » n’est pas un agent du plan : relance « ${a.name} » avec ce qui lui manque`
-        : `Ils s’attendent l’un l’autre : relance l’un des deux avec d’autres consignes`
+        : `Ils s’attendent en boucle : relance l’un d’eux avec d’autres consignes`
   void $.prompt
     .submit({
-      text: `revo-flow : l’agent « ${a.name} » attend « ${name} » (${why}) ; reste : ${left}. ${todo}, avec l’outil Agent (description = son nom exact).`,
+      text: `revo-flow : l’agent « ${a.name} » attend « ${name} » (${why}) ; reste : ${left}. ${todo}, avec l’outil Agent (description = son nom exact)${a.lastAgentId ? `, ou avec SendMessage (to: "${a.lastAgentId}") pour « ${a.name} », qui garde alors son contexte` : ''}.`,
       asUser: true,
     })
     .catch(() => undefined)
@@ -1384,8 +1475,10 @@ async function relaunch($: $, key: string, why = '') {
   if (!a) return
   claimed.delete(key)
   const tasks = a.tasks.map(t => (t.status === 'completed' ? t : { ...t, status: 'pending' as const }))
+  const resumeId = a.agentId ?? a.lastAgentId
   await setAgent($, key, ({ agentId: _id, startedAt: _start, endedAt: _end, waitingFor: _w, ...x }) => ({
     ...x,
+    ...(resumeId ? { lastAgentId: resumeId } : {}),
     status: 'waiting',
     attempts: (x.attempts ?? 1) + 1,
     tasks,
@@ -1398,9 +1491,13 @@ async function relaunch($: $, key: string, why = '') {
   const left = remainingTasks({ ...a, tasks })
     .map(t => t.title)
     .join(' ; ')
+  // Avec l'id de son dernier lancement, SendMessage le reprend avec tout son contexte : rien à relire.
+  const how = resumeId
+    ? `reprends l’agent « ${a.name} » avec SendMessage (to: "${resumeId}") pour qu’il garde son contexte, ou relance-le avec l’outil Agent (description = son nom exact),`
+    : `relance l’agent « ${a.name} » avec l’outil Agent (description = son nom exact)`
   void $.prompt
     .submit({
-      text: `revo-flow : ${why ? `${why} ` : ''}relance l’agent « ${a.name} » avec l’outil Agent (description = son nom exact) pour ses tâches restantes : ${left}`,
+      text: `revo-flow : ${why ? `${why} ` : ''}${how} pour ses tâches restantes : ${left}`,
       asUser: true,
     })
     .catch(() => undefined)
@@ -1506,8 +1603,8 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'revo-flow',
       description:
-        'revo-flow <demande> : l’orchestrateur lit les specs, fait le plan, répartit les tâches entre des sous-agents et suit chacun dans le panneau · statut · panneau · stop · cache [projet | build [feature | --top N | --tout] | clear [feature] | mot-clé] : le graphe et les fiches de features du projet',
-      argumentHint: '<demande> | statut | panneau | stop | cache [projet | build [feature|--top N|--tout] | clear [feature] | mot-clé]',
+        'revo-flow <demande> : l’orchestrateur lit les specs, fait le plan, répartit les tâches entre des sous-agents et suit chacun dans le panneau · statut · panneau · stop · historique [n] : les derniers flows, leur coût et le bilan par modèle · cache [projet | build [feature | --top N | --tout] | clear [feature] | mot-clé] : le graphe et les fiches de features du projet',
+      argumentHint: '<demande> | statut | panneau | stop | historique [n] | cache [projet | build [feature|--top N|--tout] | clear [feature] | mot-clé]',
       // statut, panneau, stop et cache répondent tout de suite, même pendant un tour ; une nouvelle demande part
       // par prompt.submit, qui attend de toute façon que la session soit libre.
       immediate: true,
@@ -1536,6 +1633,8 @@ export const register: Register = (on, options) => {
     const flow = await read($, flowA)
 
     if (!args || word === 'statut' || word === 'status') return { text: statusText(flow) }
+    const hist = /^(historique|history)(?:\s+(\d+))?$/.exec(word)
+    if (hist) return { text: historyText(await $.store.get(JOURNAL_KEY), hist[2] ? Math.max(1, Number(hist[2])) : 10) }
     if (word === 'stop') {
       let isStopped = false
       if (flow?.agents.some(a => a.status === 'running')) {
@@ -1641,6 +1740,23 @@ export const register: Register = (on, options) => {
       await setAgent($, woken.key, ({ endedAt: _end, ...x }) => ({ ...x, status: 'running', hasEndedTurn: false }))
       await setFlow($, f => (f.phase === 'review' ? { ...f, phase: 'running' } : f))
     }
+    // Un agent en attente (ou réarmé pour une relance) repris par SendMessage : même id, même contexte, suivi de nouveau.
+    const resumed =
+      e.agentId && flow ? flow.agents.find(a => !a.agentId && a.lastAgentId === e.agentId && (a.status === 'blocked' || a.status === 'waiting')) : undefined
+    if (resumed && e.agentId) {
+      const at = await $.clock.now()
+      claimed.add(resumed.key)
+      await setAgent($, resumed.key, ({ waitingFor: _w, endedAt: _end, ...x }) => ({
+        ...x,
+        agentId: e.agentId!,
+        status: 'running',
+        startedAt: at,
+        lastActiveAt: at,
+        hasEndedTurn: false,
+        attempts: x.status === 'blocked' ? (x.attempts ?? 1) + 1 : (x.attempts ?? 1),
+      }))
+      await setFlow($, ({ endedAt: _end, ...f }) => ({ ...f, phase: f.phase === 'review' || f.phase === 'done' || f.phase === 'dispatch' ? 'running' : f.phase }))
+    }
     return next(e)
   })
 
@@ -1734,6 +1850,9 @@ export const register: Register = (on, options) => {
             tokens: addUsage(l.tokens, u),
             costUsd: l.costUsd + costUsd(step.model, u),
           }))
+        } else if (scouts.has(e.agentId)) {
+          // Un éclaireur : ses tokens et son coût, pas son modèle, vont à l'orchestrateur qui l'a lancé.
+          await update($, leadA, l => ({ ...l, tokens: addUsage(l.tokens, u), costUsd: l.costUsd + costUsd(step.model, u) }))
         } else if (a) {
           const now = await $.clock.now()
           await setAgent($, a.key, x => ({
@@ -1758,11 +1877,30 @@ export const register: Register = (on, options) => {
     if ([e.description, e.name ?? ''].some(s => s.startsWith(BUILDER)) || e.subagentType === `${PLUGIN}:${INDEXER}`) return next(e)
     const flow = await read($, flowA)
     if (!flow || e.fork || e.workflow || e.isTeammate || e.parentAgentId) return next(e)
-    // Pas d'agent avant le plan : l'orchestrateur lit les specs lui-même, pose le plan, puis lance l'équipe.
+    // Pas d'agent avant le plan : l'orchestrateur lit les specs lui-même, pose le plan, puis lance l'équipe. Seule
+    // exception, après accord de l'utilisateur : un éclaireur Explore (lecture seule), moins cher qu'une lecture large
+    // faite par le modèle de la session.
     if (flow.phase === 'planning') {
-      return {
-        deny: `revo-flow : aucun sous-agent avant le plan. Lis les specs toi-même, appelle ${PLAN_TOOL}, puis lance les agents prévus.`,
+      if (e.subagentType !== 'Explore') {
+        return {
+          deny: `revo-flow : aucun sous-agent avant le plan, sauf un éclaireur Explore (lecture seule, après accord de l’utilisateur). Lis les specs toi-même ou lance un Explore, appelle ${PLAN_TOOL}, puis lance les agents prévus.`,
+        }
       }
+      const answer = await askOr(
+        $,
+        `L’orchestrateur veut un éclaireur en lecture seule avant le plan : « ${e.description} »${e.model ? ` (${modelLabel(e.model)})` : ''}. L’autoriser ?`,
+        ['Autoriser', 'Refuser'],
+        { headless: 'Autoriser', dismissed: 'Refuser' },
+      )
+      if (answer !== 'Autoriser') {
+        return { deny: `revo-flow : éclaireur refusé par l’utilisateur. Lis les specs toi-même, puis appelle ${PLAN_TOOL}.` }
+      }
+      const r = await next(e)
+      if (r.deny === undefined && r.agentId) {
+        scouts.add(r.agentId)
+        $.ui.toast(`revo-flow : éclaireur « ${e.description} » lancé`)
+      }
+      return r
     }
     if (flow.phase === 'dispatch' && !flow.isApproved) {
       return { deny: 'revo-flow : le plan attend la validation de l’utilisateur. Attends sa réponse avant de lancer les agents.' }

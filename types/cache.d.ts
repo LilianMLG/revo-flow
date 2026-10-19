@@ -34,8 +34,15 @@ export type FileNode = {
   exp?: string[]
   /** Arêtes sortantes, vers des clés de `fichiers` ou de `noeuds`. */
   out?: Edges
-  /** Une ligne écrite par un modèle, facultative. */
+  /**
+   * Une ligne (≤ 120 caractères) : par défaut le résumé mécanique (headSummary : 1re phrase du commentaire de tête, ou titre d'un .md),
+   * recalculé à chaque indexation du fichier ; écrite par un modèle quand `sumLlm` est vrai.
+   */
   sum?: string
+  /** `sum` vient d'un modèle : gardé tant que le hash ne change pas, jamais remplacé par le résumé mécanique. */
+  sumLlm?: true
+  /** Mots-clés mécaniques (termes les plus fréquents des commentaires et des noms de déclarations), pour la carte à froid ; jamais injectés. */
+  mots?: string[]
   /** Date du dernier calcul, quand il diffère de projet.indexe.le. */
   vu?: string
 }
@@ -94,6 +101,8 @@ export type Graph = {
   candidates: Candidate[]
   stats: { flows: number; servis: number; evites: number; net: number }
 }
+/** Un fichier de la carte à froid (coldRank) : score 0 à 1 ; pertinent = la demande touche le fichier lui-même (nom, dossiers, exports, sum). */
+export type ColdFile = { p: string; score: number; pertinent: boolean }
 /** Un fichier servi par le cache pendant le flow courant. par = 'brief' | 'feature' | 'voisins' | 'chercher'. */
 export type CacheHit = { p: string; tok: number; feature?: string; frais: boolean; par: string }
 /** Ce que le flow courant a lu et reçu du cache (gardé dans un atom par register.tsx). */

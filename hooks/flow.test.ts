@@ -142,6 +142,17 @@ function world(on: On, os: Os = WINDOWS) {
     toasts.push((e as unknown as { text: string }).text)
     return { value: undefined } as never
   })
+  // La ligne d'état sous le prompt (undefined : retirée) et les redessins demandés.
+  const statuses: (string | undefined)[] = []
+  let redraws = 0
+  on('ui.status', (_$, e) => {
+    statuses.push(e.text)
+    return { value: undefined } as never
+  })
+  on('ui.invalidate', () => {
+    redraws++
+    return { value: undefined } as never
+  })
   on('turn.abort', (_$, e) => {
     aborted.push(e.turnId)
     return { value: undefined } as never
@@ -170,7 +181,28 @@ function world(on: On, os: Os = WINDOWS) {
   on('turn.complete', () => ({ text: '' }))
   // Ce que l'engine dessinerait sans le mod : une boîte vide.
   on('ui.render', (hook$, e) => h(hook$.ui.resolve(e).Box as never, {}) as never)
-  return { clock, sent, opened, prompts, status, ctl, asked, notified, stopped, toasts, aborted, registered, disk, states, tracked, gitDiff, runs, surfaces }
+  return {
+    clock,
+    sent,
+    opened,
+    prompts,
+    status,
+    ctl,
+    asked,
+    notified,
+    stopped,
+    toasts,
+    aborted,
+    registered,
+    disk,
+    states,
+    tracked,
+    gitDiff,
+    runs,
+    surfaces,
+    statuses,
+    redraws: () => redraws,
+  }
 }
 
 /** La réponse « dialogue fermé » : ui.ask rejette. */
@@ -610,7 +642,7 @@ test('attente : l’agent qui attend un autre n’est pas en échec, puis il est
   // (b) « API promo » finit : « Front panier » est réarmé (waiting, 2e tentative) et l'orchestrateur doit le relancer.
   await endTurn($, w, api, 'completed')
   expect(w.sent.map(x => x.text).join('\n')).toMatch(
-    /revo-flow : « API promo » a fini, « Front panier » l’attendait : relance l’agent « Front panier » avec l’outil Agent .*: Ajouter le champ ; Tester/,
+    /revo-flow : « API promo » a fini, « Front panier » l’attendait : reprends l’agent « Front panier » avec SendMessage \(to: "a-front"\) .*ou relance-le avec l’outil Agent .*: Ajouter le champ ; Tester/,
   )
   fp = agentIn(w, 'front-panier')
   expect(fp.status).toBe('waiting')
@@ -739,6 +771,101 @@ test('nouveau /revo-flow pendant un flow : remplacé seulement avec accord', asy
   expect(w.stopped.sort()).toEqual(['a-api', 'a-front'])
   expect((w.states.flow as Flow).phase).toBe('planning')
   expect((w.states.flow as Flow).request).toBe('autre chose à faire')
+})
+
+test('relance par SendMessage : l’agent en attente repris sous son id est suivi de nouveau, sans nouvel Agent', async ($, on) => {
+  const w = world(on)
+  const { front, api } = await twoRunning($, w)
+  await $.tool.call({ tool: STEP, agentId: front, tache: 2, statut: 'attente', attend: 'API promo' } as never)
+  await endTurn($, w, front, 'completed')
+  expect(agentIn(w, 'front-panier').lastAgentId).toBe(front)
+  await endTurn($, w, api, 'completed')
+  expect(agentIn(w, 'front-panier').status).toBe('waiting')
+  // L'orchestrateur suit la consigne : SendMessage réveille l'agent sous le même id.
+  w.status[front] = 'running'
+  await $.turn.start({ turnId: 'sm', agentId: front } as never)
+  const fp = agentIn(w, 'front-panier')
+  expect(fp.status).toBe('running')
+  expect(fp.agentId).toBe(front)
+  expect(fp.attempts).toBe(2)
+  expect(fp.tasks.map(t => t.status)).toEqual(['completed', 'pending', 'pending'])
+  expect((w.states.flow as Flow).phase).toBe('running')
+  await endTurn($, w, front, 'completed')
+  expect(agentIn(w, 'front-panier').status).toBe('done')
+})
+
+test('éclaireur : un Explore avant le plan part après accord, compté pour l’orchestrateur ; refusé sinon', async ($, on) => {
+  const w = world(on)
+  on('turn.step', async function* (_$, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: STEP_USAGE } as never
+  })
+  await launch($, w)
+  const general = await spawn($, 'Lire tout le code')
+  expect(general.deny).toMatch(/aucun sous-agent avant le plan, sauf un éclaireur Explore/)
+  const explore = (description: string) =>
+    $.agent.spawn({ prompt: 'Cartographie', description, subagentType: 'Explore', model: 'haiku', provider: { kind: 'model' } } as never)
+  w.ctl.answer = 'Refuser'
+  expect((await explore('Carte du panier')).deny).toMatch(/éclaireur refusé par l’utilisateur/)
+  w.ctl.answer = 'Autoriser'
+  const ok = await explore('Carte du panier')
+  expect(ok.deny).toBeUndefined()
+  expect(w.asked.join('\n')).toMatch(/un éclaireur en lecture seule avant le plan : « Carte du panier »/)
+  expect((w.states.flow as Flow).agents).toEqual([])
+  // Ses tokens vont à l'orchestrateur, sans changer le modèle affiché de celui-ci.
+  for await (const _ of $.turn.step({ turnId: 's', index: 0, model: 'claude-haiku-5-5', messageCount: 1, agentId: ok.agentId! })) void _
+  const lead = w.states.lead as { costUsd: number; modelId: string }
+  expect(lead.costUsd).toBeGreaterThan(0)
+  expect(lead.modelId).toBe('claude-opus-5-5')
+})
+
+test('historique : chaque flow fini entre au journal, /revo-flow historique le résume par modèle', async ($, on) => {
+  const w = world(on)
+  expect(await run($, 'historique')).toMatch(/aucun flow dans l’historique/)
+  const { front, api } = await twoRunning($, w)
+  await endTurn($, w, front, 'completed')
+  await endTurn($, w, api, 'killed')
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' } as never)
+  await w.clock.settle()
+  const h = await run($, 'historique')
+  expect(h).toMatch(/revo-flow · historique : 1 flow/)
+  expect(h).toMatch(/Code promo panier \(ui-vel\) · .* · 2 agents · 1 en échec/)
+  expect(h).toMatch(/Sonnet 5\.5 : 1 agent, .* 0 % d’échecs/)
+  expect(h).toMatch(/Opus 5\.5 : 1 agent, .* 100 % d’échecs/)
+})
+
+test('suivi : redessin tant qu’un agent tourne, inactif signalé une fois après 3 min, ligne d’état du flow', async ($, on) => {
+  const w = world(on)
+  const { front } = await twoRunning($, w)
+  await $.tool.call({ tool: STEP, agentId: front, tache: 1, statut: 'en_cours' } as never)
+  const before = w.redraws()
+  await w.clock.advance(3000)
+  await w.clock.settle()
+  expect(w.redraws()).toBeGreaterThan(before)
+  expect(w.statuses.at(-1)).toMatch(/^revo-flow · Code promo panier · \d+ % · 2 actifs · /)
+  await w.clock.advance(181_000)
+  await w.clock.settle()
+  await w.clock.advance(3000)
+  await w.clock.settle()
+  expect(w.toasts.filter(t => /« Front panier » inactif depuis/.test(t))).toHaveLength(1)
+  expect(w.notified.join('\n')).toMatch(/« Front panier » inactif depuis .* bloqué \?/)
+})
+
+test('attente en boucle à trois agents : l’orchestrateur est prévenu', async ($, on) => {
+  const w = world(on)
+  await launch($, w)
+  const three = { ...PLAN, agents: [...PLAN.agents, { nom: 'Tests', modele: 'haiku', effort: 'low', taches: ['Écrire les tests'] }] }
+  await $.tool.call({ tool: 'mcp__revo-flow__plan', ...three } as never)
+  const front = (await spawn($, 'Front panier')).agentId!
+  const api = (await spawn($, 'API promo')).agentId!
+  const tests = (await spawn($, 'Tests')).agentId!
+  await $.tool.call({ tool: STEP, agentId: front, tache: 1, statut: 'attente', attend: 'API promo' } as never)
+  await endTurn($, w, front, 'completed')
+  await $.tool.call({ tool: STEP, agentId: api, tache: 1, statut: 'attente', attend: 'Tests' } as never)
+  await endTurn($, w, api, 'completed')
+  expect(w.sent.map(x => x.text).join('\n')).not.toMatch(/en boucle/)
+  await $.tool.call({ tool: STEP, agentId: tests, tache: 1, statut: 'attente', attend: 'Front panier' } as never)
+  await endTurn($, w, tests, 'completed')
+  expect(w.sent.map(x => x.text).join('\n')).toMatch(/l’agent « Tests » attend « Front panier » \(attente croisée\).*en boucle/)
 })
 
 test('attente : l’agent attendu a déjà fini, step répond de continuer sans attente', async ($, on) => {

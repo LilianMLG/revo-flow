@@ -1,3 +1,4 @@
+/** La logique pure du flow : plan, appariement des agents, tâches et progression, consignes, tokens et coûts, journal. */
 import type { Effort, Flow, FlowAgent, FlowTask, ModelKey, Phase, TaskKind, TaskStatus, Tally } from '../types'
 
 export const PLUGIN = 'revo-flow'
@@ -260,7 +261,7 @@ export const allFinished = (flow: Flow) =>
 export function leadBrief(withCache: boolean): string {
   const cache = (s: string) => (withCache ? s : '')
   return `# revo-flow — tu es l'orchestrateur de cette demande
-1. Plan : ${cache(`commence par le cache revo-flow ci-dessous s'il y en a un, une carte, pas la vérité : vérifie dans le code ce que tu affirmes ou changes. S'il connaît la feature, ne lis que les fichiers à modifier et ceux modifiés depuis l'apprentissage. Puis `)}lis toi-même la demande et les specs utiles, seulement le nécessaire, sans rien modifier ni lancer de sous-agent (refusé avant le plan).
+1. Plan : ${cache(`commence par le cache revo-flow ci-dessous s'il y en a un, une carte, pas la vérité : vérifie dans le code ce que tu affirmes ou changes. S'il connaît la feature, ne lis que les fichiers à modifier et ceux modifiés depuis l'apprentissage. Puis `)}lis toi-même la demande et les specs utiles, seulement le nécessaire, sans rien modifier. Pas de sous-agent avant le plan, sauf un éclaireur Explore (lecture seule, haiku ou sonnet) quand la lecture est large : revo-flow demande l'accord de l'utilisateur.
 2. Équipe : appelle UNE fois l'outil ${PLAN_TOOL} : titre, résumé, et 1 à 6 sous-agents, pas plus que le travail ne le demande. Pour chacun : nom court et unique, rôle, type (general-purpose par défaut, Explore pour de la lecture seule), modèle le plus fiable pour SES tâches (haiku : mécanique et localisé ; sonnet : la plupart des features et correctifs ; opus : transverse, ambigu, délicat, sécurité), effort (low à xhigh), et 2 à 10 tâches courtes à l'infinitif avec leur type. Découpe pour qu'ils avancent en parallèle sans modifier les mêmes fichiers.
 3. Exécution : lance chaque agent avec l'outil Agent (description = son nom exact), dans un même message quand ils sont indépendants ; prompt = sa mission et le contexte utile (fichiers, conventions, contraintes, ce que font les autres). revo-flow ajoute lui-même son modèle, son effort, sa liste de tâches${cache(` et l'extrait de fiche du cache qui le concerne : ajoute seulement ce qui manque (pièges transverses, décisions)`)} ; ne les recopie pas.
 4. Fin : quand tous ont fini, vérifie l'ensemble (tests et lint ciblés) et corrige si besoin${cache(`. Puis, pour chaque feature touchée, ${CACHE_TOOL} action « apprendre » (feature, titre, alias, resume, flux, entrees, fichiers et rôles, pièges, corrections de ce que le cache disait de faux) ; pour une fiche seulement périmée et toujours juste, action « rafraichir » (feature, fichiers relus)`)}. Conclus par une synthèse courte.
@@ -571,4 +572,86 @@ export function describeCall(tool: string, input: Record<string, unknown>): stri
 export function draftTitle(request: string): string {
   const flat = request.replace(/\s+/g, ' ').trim()
   return flat.length > 60 ? `${flat.slice(0, 59)}…` : flat
+}
+
+// ── Journal des flows ────────────────────────────────────────────────────
+
+/** Un flow fini, tel que /revo-flow historique le relit : de quoi choisir les modèles sur des chiffres réels. */
+export type JournalEntry = {
+  id: string
+  title: string
+  project: string
+  branch: string
+  startedAt: number
+  durationMs: number
+  isStopped: boolean
+  files: number
+  lead: { modelId: string; costUsd: number; tokens: number }
+  agents: {
+    name: string
+    model: ModelKey
+    effort: Effort
+    status: FlowAgent['status']
+    costUsd: number
+    tokens: number
+    attempts: number
+    durationMs: number
+  }[]
+}
+
+/** Au plus autant de flows gardés dans le journal. */
+export const JOURNAL_MAX = 100
+
+const isEntry = (v: unknown): v is JournalEntry =>
+  typeof v === 'object' && v !== null && typeof (v as JournalEntry).id === 'string' && Array.isArray((v as JournalEntry).agents)
+
+/** Le journal avec ce flow en tête (un flow déjà présent est remplacé), plafonné à JOURNAL_MAX. */
+export function addToJournal(prev: unknown, entry: JournalEntry): JournalEntry[] {
+  const list = Array.isArray(prev) ? prev.filter(isEntry).filter(e => e.id !== entry.id) : []
+  return [entry, ...list].slice(0, JOURNAL_MAX)
+}
+
+/** Le coût d'un flow : l'orchestrateur et ses agents. */
+const entryCost = (e: JournalEntry) => e.lead.costUsd + e.agents.reduce((n, a) => n + a.costUsd, 0)
+
+/**
+ * /revo-flow historique : les `n` derniers flows (date, titre, durée, coût, agents), puis par modèle le coût moyen
+ * d'un agent, son taux d'échec et ses relances, sur tout le journal.
+ */
+export function historyText(raw: unknown, n = 10): string {
+  const all = Array.isArray(raw) ? raw.filter(isEntry) : []
+  if (!all.length) return 'revo-flow : aucun flow dans l’historique pour l’instant (il se remplit à la fin de chaque flow).'
+  const rows = all.slice(0, n).map(e => {
+    const d = new Date(e.startedAt)
+    const p = (x: number) => String(x).padStart(2, '0')
+    const failed = e.agents.filter(a => a.status === 'failed').length
+    const relaunched = e.agents.reduce((k, a) => k + Math.max(0, a.attempts - 1), 0)
+    const extra = [
+      e.isStopped ? 'arrêté' : '',
+      failed ? `${failed} en échec` : '',
+      relaunched ? `${relaunched} relance${relaunched > 1 ? 's' : ''}` : '',
+    ].filter(Boolean)
+    return `  ${dayKey(d)} ${p(d.getHours())}:${p(d.getMinutes())}  ${e.title} (${e.project}) · ${fmtDuration(e.durationMs)} · ${euros(entryCost(e))} · ${e.agents.length} agent${e.agents.length > 1 ? 's' : ''}${extra.length ? ` · ${extra.join(', ')}` : ''}`
+  })
+  const byModel = new Map<string, { n: number; cost: number; failed: number; relaunch: number }>()
+  for (const a of all.flatMap(e => e.agents)) {
+    const m = byModel.get(a.model) ?? { n: 0, cost: 0, failed: 0, relaunch: 0 }
+    m.n++
+    m.cost += a.costUsd
+    if (a.status === 'failed') m.failed++
+    m.relaunch += Math.max(0, a.attempts - 1)
+    byModel.set(a.model, m)
+  }
+  const models = [...byModel.entries()].map(
+    ([k, m]) =>
+      `  ${MODELS[k as ModelKey]?.label ?? k} : ${m.n} agent${m.n > 1 ? 's' : ''}, ${euros(m.cost / m.n)} en moyenne, ${Math.round((m.failed / m.n) * 100)} % d’échecs, ${m.relaunch} relance${m.relaunch > 1 ? 's' : ''}`,
+  )
+  const cost = all.reduce((k, e) => k + entryCost(e), 0)
+  return [
+    `revo-flow · historique : ${all.length} flow${all.length > 1 ? 's' : ''}, ${euros(cost)} au total (${euros(cost / all.length)} par flow)`,
+    ...rows,
+    ...(all.length > n ? [`  … et ${all.length - n} plus anciens (/revo-flow historique ${Math.min(all.length, JOURNAL_MAX)})`] : []),
+    'Par modèle (agents) :',
+    ...models,
+  ].join('\n')
 }
