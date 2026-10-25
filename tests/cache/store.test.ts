@@ -678,3 +678,56 @@ test('withDrift : rev-list --count sur les voisins hors fiche, derive écrite, c
   expect(await withDrift(io, g0, feature('autre', '2026-08-01T09:00:00Z'))).toBe(g0)
   expect(await withDrift({ ...ok.io, now: async () => { throw new Error('x') } } as unknown as Io, g0, f)).toBe(g0)
 })
+
+// ── v2 : projet.verif et journal.verif dans la fusion ────────────────────
+
+const VERIF = (le: string, id = 'lint'): NonNullable<Graph['projet']['verif']> => ({
+  commandes: [{ id, outil: 'lint', argv: ['npx', 'eslint', '{fichiers}'], portee: 'fichiers', format: 'eslint-json', source: 'deduit' }],
+  manifestes: { 'package.json': 'abc' },
+  confirme: { le, par: 'utilisateur' },
+  instables: [],
+  pieges: [],
+  bases: [],
+})
+
+for (const os of OSES) {
+  describe(`mergeGraphs et verif (${os.nom})`, () => {
+    const withRoot = (g: Graph, verif?: Graph['projet']['verif']) => {
+      g.projet.racine = native(os, 'Documents', 'Front', 'app')
+      if (verif) g.projet.verif = verif
+      return g
+    }
+
+    test('une session sans verif n’écrase pas celui de l’autre, dans les deux sens, même si sa couche mécanique est plus récente', () => {
+      const mine = withRoot(graph(1, [], ZERO, '2026-10-14T10:00:00Z'))
+      const disk = withRoot(graph(2, [], ZERO, '2026-10-14T08:00:00Z'), VERIF('2026-10-14T08:00:00Z'))
+      expect(mergeGraphs(mine, disk).projet.verif?.commandes[0]!.id).toBe('lint')
+      expect(mergeGraphs(disk, mine).projet.verif?.commandes[0]!.id).toBe('lint')
+      expect(mergeGraphs(mine, withRoot(graph(2, []))).projet.verif).toBeUndefined()
+    })
+
+    test('deux verif : le plus récent gagne, par confirme.le ou par la dernière base ; égalité : mine', () => {
+      const vieux = VERIF('2026-10-14T08:00:00Z', 'vieux')
+      const recent = VERIF('2026-10-14T09:00:00Z', 'recent')
+      const mine = withRoot(graph(1, []), vieux)
+      const disk = withRoot(graph(2, []), recent)
+      expect(mergeGraphs(mine, disk).projet.verif?.commandes[0]!.id).toBe('recent')
+      expect(mergeGraphs(disk, mine).projet.verif?.commandes[0]!.id).toBe('recent')
+      // une base plus récente que la confirmation de l'autre
+      const avecBase = { ...vieux, bases: [{ commit: 'c1', le: '2026-10-14T11:00:00Z', commandes: ['lint'], signatures: [] }] }
+      expect(mergeGraphs(withRoot(graph(1, []), avecBase), disk).projet.verif?.commandes[0]!.id).toBe('vieux')
+      const egal = VERIF('2026-10-14T09:00:00Z', 'egal')
+      expect(mergeGraphs(withRoot(graph(1, []), egal), disk).projet.verif?.commandes[0]!.id).toBe('egal')
+    })
+
+    test('les verif du journal des deux côtés sont gardés', () => {
+      const mine = withRoot(graph(1, []))
+      const disk = withRoot(graph(2, []))
+      const v = { etat: 'verifie', tentatives: 1, premierRouge: false, nouvelles: 0, preexistantes: 2, dureeMs: 900, triches: 0 } as const
+      mine.journal = [{ le: '2026-10-14T10:00:00Z', cache: true, lus: 0, outils: 0, injecte: 0, evites: 0, verif: v }]
+      disk.journal = [{ le: '2026-10-14T09:00:00Z', cache: true, lus: 0, outils: 0, injecte: 0, evites: 0, verif: { ...v, etat: 'observe', nouvelles: 3 } }]
+      const j = mergeGraphs(mine, disk).journal!
+      expect(j.map(e => e.verif?.etat)).toEqual(['observe', 'verifie'])
+    })
+  })
+}

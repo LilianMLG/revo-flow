@@ -157,6 +157,117 @@ export type CacheStats = {
     parFeature: { id: string; avant: { flows: number; lus: number }; apres: { flows: number; lus: number } }[]
   }
   build?: { feature: string; tokens: number; costUsd: number }
+  /**
+   * Indicateurs de vérification tirés du journal (absent si aucun flow vérifié). echappement : part (0 à 1) des flows observés rouges ;
+   * premierRouge : part des flows dont la première porte est rouge ; attrapees : erreurs nouvelles des flows vérifiés ;
+   * acceptes : flows finis rouges sur décision de l'utilisateur ; dureeMoyMs : durée moyenne de la porte.
+   */
+  verif?: { flows: number; echappement: number; premierRouge: number; attrapees: number; acceptes: number; dureeMoyMs: number }
+}
+
+// La vérification d'un flow (v2, docs/rd-v2/conception.md). Reprise à l'identique de types/verif.d.ts, qui reste la référence.
+
+export type VerifMode = 'bloquer' | 'observer' | 'off'
+export type VerifOutil = 'lint' | 'typage' | 'tests' | 'format' | 'generation'
+/** fichiers : reçoit les fichiers du flow ; lies : les tests liés aux fichiers du flow ; projet : tout le projet, une fois par porte. */
+export type VerifPortee = 'fichiers' | 'lies' | 'projet'
+export type VerifSource = 'ci' | 'script' | 'deduit' | 'orchestrateur'
+export type VerifFormat = 'eslint-json' | 'tsc' | 'vitest-json' | 'jest-json' | 'biome' | 'dart-machine' | 'flutter-json' | 'texte'
+/** Une commande de vérification. argv sans shell, '{fichiers}' remplacé par les fichiers de la portée (relatifs au cwd) ; le préfixe Windows est ajouté à l'exécution. */
+export type VerifCommande = {
+  id: string
+  outil: VerifOutil
+  argv: string[]
+  portee: VerifPortee
+  format: VerifFormat
+  source: VerifSource
+  /** Motif glob : la commande ne tourne que si un fichier du flow y correspond (ex. '**\/*.graphql' pour le codegen). */
+  declencheur?: string
+  /** Moyenne glissante des durées, en ms. */
+  dureeMs?: number
+  /** Motifs de tests exclus (tests qui demandent un service). */
+  exclus?: string[]
+  /** D'où vient la commande, pour la question : « .gitlab-ci.yml », « script lint », « biome.json »… */
+  origine?: string
+}
+export type VerifBase = { commit: string; le: string; commandes: string[]; signatures: string[] }
+/** Rangé dans graph.projet.verif. */
+export type ProjetVerif = {
+  commandes: VerifCommande[]
+  /** Chemin relatif → hash git des manifestes lus (package.json, pubspec.yaml, CI…) : un hash changé redemande la confirmation. */
+  manifestes: Record<string, string>
+  /** Confirmé par l'utilisateur, ou utilisé sans question (headless, en observateur). */
+  confirme?: { le: string; par: 'utilisateur' | 'headless' }
+  instables: string[]
+  pieges: string[]
+  bases: VerifBase[]
+}
+export type VerifEtatCommande = {
+  id: string
+  outil: VerifOutil
+  etat: 'en_cours' | 'ok' | 'ko' | 'erreur' | 'saute'
+  dureeMs: number
+  nouvelles: number
+  preexistantes: number
+  instables: number
+  /** Fichiers passés à la commande (ou tests liés). */
+  fichiers: number
+  /** Chemin absolu du .txt de la sortie complète. */
+  sortie?: string
+  note?: string
+}
+/** Un critère d'acceptation du plan (lot 2) : C1 à C8, vérifiable. */
+export type Critere = { id: string; texte: string }
+export type CritereVerdict = { id: string; verdict: 'ok' | 'ko' | 'non-verifiable'; preuve: string }
+export type Triche = { motif: string; fichier: string; extrait?: string; bloquant: boolean }
+/** Un fichier de test gelé à la fin du testeur : chemin relatif à la racine, hash git, auteur (clé de l'agent). */
+export type TestGele = { p: string; h: string; par: string }
+/** Le champ verif du journal (graphe et store). */
+export type VerifJournal = {
+  etat: 'verifie' | 'non-verifie' | 'observe' | 'off' | 'erreur'
+  tentatives: number
+  /** Rouge à la première porte. */
+  premierRouge: boolean
+  nouvelles: number
+  preexistantes: number
+  dureeMs: number
+  triches: number
+  /** Terminé rouge sur décision de l'utilisateur. */
+  accepte?: boolean
+  criteres?: { total: number; ok: number }
+}
+/** Ce que le panneau et la bande montrent (atom `verif` de register.tsx). */
+export type VerifView = {
+  projet: string
+  mode: VerifMode
+  etat: 'off' | 'a-confirmer' | 'base' | 'attente' | 'en_cours' | 'vert' | 'rouge' | 'erreur'
+  tentative: number
+  max: number
+  commandes: VerifEtatCommande[]
+  /** Base de référence : en cours, prête, absente. */
+  base: 'en_cours' | 'prete' | 'absente'
+  geles: { p: string; modifie?: string }[]
+  triches: Triche[]
+  criteres?: { total: number; ok: number; verdicts: CritereVerdict[] }
+  /** Question en attente de l'utilisateur, en une phrase. */
+  enAttente?: string
+  /** Chemin du .txt de la dernière sortie complète (bouton Détail). */
+  detail?: string
+}
+
+/**
+ * Ce qui doit survivre à un rechargement du mod pendant un flow vérifié (register.tsx) : le gel des tests (qui reste fermé),
+ * les critères, le compte des tentatives. La base de référence en cours, elle, est perdue (base absente, erreurs « nouvelle ? »).
+ */
+export type VerifFlow = {
+  flowId: string
+  mode: VerifMode
+  commit: string
+  gel: TestGele[]
+  criteres: Critere[]
+  blocks: number
+  portes: number
+  accepte?: boolean
 }
 
 declare module 'claude-code' {
@@ -178,6 +289,10 @@ declare module 'claude-code' {
       flowCache: FlowCache | null
       /** La section « Cache » du panneau est dépliée. */
       cacheOpen: boolean
+      /** La vérification du flow courant (v2) telle que le panneau et la bande l'affichent ; null hors flow. */
+      verif: VerifView | null
+      /** L'état de la porte du flow courant qui survit à un rechargement du mod (gel, critères, tentatives). */
+      verifFlow: VerifFlow | null
     }
   }
 }

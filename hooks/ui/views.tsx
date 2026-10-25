@@ -2,6 +2,7 @@
 import type { Elements } from 'claude-code'
 
 import type { CacheStats } from '../../types/cache'
+import type { VerifEtatCommande, VerifView } from '../../types/verif'
 import type { Context, Entry, Flow, FlowAgent, FlowTask, Lead, LastTurn, Limit, Tally, Tokens } from '../../types'
 import {
   AGENT_COLORS,
@@ -20,8 +21,11 @@ import {
   statusPillSvg,
   usageRowSvg,
   usageSvg,
+  verifNoteSvg,
+  verifRowSvg,
   type BarStage,
   type MascotKind,
+  type VerifTone,
 } from './art'
 import {
   LIMIT_LABEL,
@@ -59,6 +63,8 @@ export type ViewData = {
   cache: CacheStats | null
   /** La section Cache du panneau est dépliée. */
   cacheOpen: boolean
+  /** La vérification du flow (porte de fin) ; null sans projet vérifié. */
+  verif: VerifView | null
 }
 
 /** Ce que les boutons du panneau déclenchent : branchés par register.tsx. */
@@ -72,6 +78,10 @@ export type PaneActions = {
   /** Ouvre le plan en .md dans l'application par défaut du système. */
   openPlan(): unknown
   toggleCache(): unknown
+  /** Ouvre le .txt de la dernière sortie complète de la vérification (bouton Détail). */
+  openVerif(): unknown
+  /** Relance la vérification (bouton Relancer). */
+  rerunVerif(): unknown
 }
 
 const MODEL_COLOR = { haiku: PALETTE.haiku, sonnet: PALETTE.sonnet, opus: PALETTE.opus } as const
@@ -126,6 +136,120 @@ const turnCost = (t: LastTurn) => (t.costUsd === 0 && !modelKey(t.modelId) ? '�
 const promptText = (t: LastTurn) => `${fmt(t.tokens.input)} ↑ · ${fmt(t.tokens.output)} ↓ · ${fmt(cacheOf(t.tokens))} cache API · ${turnCost(t)}`
 const planCount = (a: FlowAgent) => `${a.tasks.length} tâche${a.tasks.length > 1 ? 's' : ''}`
 const planModel = (a: FlowAgent) => `${modelLabel(a.modelId || MODELS[a.model].id)} · ${a.effort}`
+
+// ── La vérification : le texte et les chiffres partagés ──────────────────
+
+/** Rien à montrer quand il n'y a pas de vérification, ou qu'elle est coupée sans résultat. */
+export function verifShown(v: VerifView | null | undefined): v is VerifView {
+  if (!v) return false
+  if (v.mode === 'off' || v.etat === 'off') return v.commandes.length > 0
+  return true
+}
+
+const VERIF_MARK: Record<VerifEtatCommande['etat'], { mark: string; tone: VerifTone }> = {
+  en_cours: { mark: '…', tone: 'dim' },
+  ok: { mark: '✓', tone: 'ok' },
+  ko: { mark: '✗', tone: 'ko' },
+  erreur: { mark: '⚠', tone: 'warn' },
+  saute: { mark: '–', tone: 'dim' },
+}
+
+/** « 12 fichiers », « 2 nouvelles · 5 préexistantes » : le résultat d'une commande, sans la durée. */
+function verifCommandDetail(c: VerifEtatCommande): string {
+  if (c.etat === 'en_cours') return 'en cours…'
+  if (c.etat === 'erreur') return c.note ?? 'la commande a planté'
+  if (c.etat === 'saute') return c.note ?? 'sautée'
+  const errs = [
+    ...(c.nouvelles > 0 ? [`${c.nouvelles} ${c.nouvelles > 1 ? 'nouvelles' : 'nouvelle'}`] : []),
+    ...(c.preexistantes > 0 ? [`${c.preexistantes} ${c.preexistantes > 1 ? 'préexistantes' : 'préexistante'}`] : []),
+  ]
+  if (errs.length > 0) return errs.join(' · ')
+  if (c.etat === 'ko') return c.note ?? 'échec'
+  return c.fichiers > 0 ? plural(c.fichiers, 'fichier') : (c.note ?? 'aucun fichier')
+}
+
+/** Une ligne de commande, en morceaux (pour la colorer) : pastille, id, résultat, durée et instables. */
+export function verifCommandRow(c: VerifEtatCommande): { mark: string; tone: VerifTone; id: string; detail: string; duration: string; flaky: string } {
+  const m = VERIF_MARK[c.etat]
+  return {
+    mark: m.mark,
+    tone: m.tone,
+    id: c.id,
+    detail: verifCommandDetail(c),
+    duration: c.etat === 'saute' || (c.etat === 'en_cours' && c.dureeMs <= 0) ? '' : fmtDuration(c.dureeMs),
+    flaky: c.instables > 0 ? `${c.instables} instable${c.instables > 1 ? 's' : ''}` : '',
+  }
+}
+
+/** La même ligne en texte : « ✗ typecheck  2 nouvelles · 5 préexistantes  48 s  1 instable ». */
+export function verifCommandText(c: VerifEtatCommande): string {
+  const r = verifCommandRow(c)
+  return [`${r.mark} ${r.id}`, r.detail, r.duration, r.flaky].filter(Boolean).join('  ')
+}
+
+/** « Vérification · reservation-tool · tentative 2/3 » (la tentative seulement une fois la porte lancée). */
+export function verifHeader(v: VerifView): string {
+  return `Vérification · ${v.projet}${v.tentative > 0 && v.max > 0 ? ` · tentative ${v.tentative}/${v.max}` : ''}`
+}
+
+/** « Critères 3/4 ✓ · vérificateur : « ko » sur C4 (preuve : …) » ; undefined sans critères. */
+export function verifCriteriaText(v: VerifView): string | undefined {
+  const c = v.criteres
+  if (!c) return undefined
+  const ko = c.verdicts.filter(x => x.verdict === 'ko')
+  const unknown = c.verdicts.filter(x => x.verdict === 'non-verifiable')
+  const parts = [`Critères ${c.ok}/${c.total} ✓`]
+  if (ko.length > 0) parts.push(`vérificateur : « ko » sur ${ko.map(x => x.id).join(', ')}${ko.length === 1 && ko[0]!.preuve ? ` (preuve : ${ko[0]!.preuve})` : ''}`)
+  if (unknown.length > 0) parts.push(`non vérifiable : ${unknown.map(x => x.id).join(', ')}`)
+  return parts.join(' · ')
+}
+
+/** Les remarques sous les commandes, une par ligne : base, tests gelés, triches, critères, question en attente. */
+export function verifNotes(v: VerifView): { mark: string; tone: VerifTone; text: string }[] {
+  const notes: { mark: string; tone: VerifTone; text: string }[] = []
+  if (v.base === 'en_cours') notes.push({ mark: '…', tone: 'dim', text: 'base de référence en cours (lint et typage du projet)' })
+  else if (v.base === 'absente' && v.commandes.length > 0) notes.push({ mark: '⚠', tone: 'warn', text: 'pas de base de référence : les erreurs comptent comme nouvelles' })
+  for (const g of v.geles.filter(x => x.modifie)) notes.push({ mark: '⚠', tone: 'warn', text: `test gelé ${g.p} modifié par ${g.modifie}` })
+  for (const t of v.triches) notes.push({ mark: t.bloquant ? '✗' : '⚠', tone: t.bloquant ? 'ko' : 'warn', text: `${t.bloquant ? 'triche' : 'à surveiller'} : ${t.motif} (${t.fichier})` })
+  const crit = verifCriteriaText(v)
+  if (crit) notes.push({ mark: v.criteres && v.criteres.verdicts.some(x => x.verdict === 'ko') ? '✗' : '✓', tone: v.criteres && v.criteres.verdicts.some(x => x.verdict === 'ko') ? 'ko' : 'ok', text: crit })
+  if (v.enAttente) notes.push({ mark: '?', tone: 'warn', text: `en attente de votre réponse : ${v.enAttente}` })
+  return notes
+}
+
+/**
+ * Le segment de bande : `vérif ✓ 3/3`, `vérif ✗ typecheck (2)` (nouvelles erreurs), `vérif …` pendant l'exécution ;
+ * undefined quand il n'y a rien à dire (coupée, pas encore lancée).
+ */
+export function verifLine(v: VerifView | null | undefined): string | undefined {
+  if (!v || !verifShown(v)) return undefined
+  if (v.etat === 'a-confirmer') return 'vérif ? à confirmer'
+  if (v.etat === 'en_cours') return 'vérif …'
+  if (v.etat === 'erreur') return 'vérif ⚠ erreur'
+  if (v.etat === 'vert') {
+    const run = v.commandes.filter(c => c.etat !== 'saute')
+    return `vérif ✓ ${run.filter(c => c.etat === 'ok').length}/${run.length}`
+  }
+  if (v.etat === 'rouge') {
+    const ko = v.commandes.find(c => c.etat === 'ko' || c.etat === 'erreur')
+    if (ko) return `vérif ✗ ${ko.id}${ko.nouvelles > 0 ? ` (${ko.nouvelles})` : ''}`
+    const cheat = v.triches.find(t => t.bloquant)
+    if (cheat) return 'vérif ✗ triche'
+    const kos = v.criteres?.verdicts.filter(x => x.verdict === 'ko').length ?? 0
+    return kos > 0 ? `vérif ✗ critères (${kos})` : 'vérif ✗'
+  }
+  return undefined
+}
+
+/** La couleur du segment : vert, rouge, orange (attention) ou discret. */
+export function verifTone(v: VerifView | null | undefined): VerifTone {
+  if (!v) return 'dim'
+  if (v.etat === 'vert') return 'ok'
+  if (v.etat === 'rouge') return 'ko'
+  if (v.etat === 'erreur' || v.etat === 'a-confirmer') return 'warn'
+  return 'dim'
+}
+const VERIF_TEXT_COLOR = { ok: PALETTE.live, ko: PALETTE.redText, warn: PALETTE.orange, dim: undefined } as const
 
 // ── Le cache du projet : le texte et les chiffres partagés ───────────────
 
@@ -353,6 +477,7 @@ export function DesktopBand(t: Elements['desktop'], d: ViewData, widthPx: number
   const { Box, Svg } = t
   const width = Math.max(340, Math.min(1100, widthPx - 24))
   const cp = cacheParts(d, width / 7.6)
+  const vl = verifLine(d.verif)
   return (
     <Box key="bar" flexDirection="column">
       <Svg
@@ -363,9 +488,10 @@ export function DesktopBand(t: Elements['desktop'], d: ViewData, widthPx: number
           agents: m.agents,
           isDone: m.isDone,
           ...(d.context ? { context: d.context.percent } : {}),
+          ...(vl ? { verif: { text: vl, tone: verifTone(d.verif) } } : {}),
           ...(d.lastTurn ? { lastPrompt: `${d.lastTurn.isLive ? '…' : ''}${fmt(d.lastTurn.tokens.input)}↑ ${fmt(d.lastTurn.tokens.output)}↓ · ${turnCost(d.lastTurn)}` } : {}),
         })}
-        alt={`revo-flow ${m.flow.title} : ${stageAlt(m.stages)}, ${m.percent} %, ${m.agents} agent${m.agents > 1 ? 's' : ''} actif${m.agents > 1 ? 's' : ''}${d.context ? `, contexte ${Math.round(d.context.percent)} %` : ''}`}
+        alt={`revo-flow ${m.flow.title} : ${stageAlt(m.stages)}, ${m.percent} %, ${m.agents} agent${m.agents > 1 ? 's' : ''} actif${m.agents > 1 ? 's' : ''}${d.context ? `, contexte ${Math.round(d.context.percent)} %` : ''}${vl ? `, ${vl}` : ''}`}
         width={width}
         isInteractive
       />
@@ -391,6 +517,7 @@ export function TerminalBand(t: Elements['terminal'], d: ViewData, columns = 100
   const { Box, Text } = t
   const lt = d.lastTurn
   const cp = cacheParts(d, columns)
+  const vl = verifLine(d.verif)
   const cut = cp?.saved ? cp.text.indexOf(cp.saved) : -1
   return (
     <Box borderStyle="round" borderColor={PALETTE.border} paddingX={1} flexDirection="column">
@@ -402,6 +529,7 @@ export function TerminalBand(t: Elements['terminal'], d: ViewData, columns = 100
         <Text color={PALETTE.silver}>{bar(m.percent, 10)}</Text>
         <Text bold>{` ${m.percent}%`}</Text>
         {m.agents > 0 && <Text color={PALETTE.live}>{`  ● ${m.agents} actif${m.agents > 1 ? 's' : ''}`}</Text>}
+        {vl ? <Text color={VERIF_TEXT_COLOR[verifTone(d.verif)]} dimColor={verifTone(d.verif) === 'dim'}>{`  ${vl}`}</Text> : null}
       </Text>
       {(lt || d.context) && (
         <Box justifyContent="space-between">
@@ -662,6 +790,35 @@ export function DesktopPane(t: Elements['desktop'], d: ViewData, actions: PaneAc
           </Box>
         )}
 
+        {verifShown(d.verif) && (() => {
+          const v = d.verif!
+          const right = v.tentative > 0 && v.max > 0 ? `tentative ${v.tentative}/${v.max}` : ''
+          const notes = verifNotes(v)
+          return (
+            <Box key="verif" flexDirection="column" gap={1} width="100%">
+              <Svg source={sectionSvg(`VÉRIFICATION · ${v.projet}`, right, inner)} alt={verifHeader(v)} width={inner} />
+              {v.commandes.map(c => {
+                const r = verifCommandRow(c)
+                return (
+                  <Svg
+                    key={c.id}
+                    source={verifRowSvg({ ...r, width: inner })}
+                    alt={verifCommandText(c)}
+                    width={inner}
+                  />
+                )
+              })}
+              {notes.map((n, i) => (
+                <Svg key={`n${i}`} source={verifNoteSvg({ ...n, width: inner })} alt={n.text} width={inner} />
+              ))}
+              <Box flexDirection="row" justifyContent="flex-end" gap={2} width="100%">
+                {v.detail && <Button key="verif-detail" plain label="Détail" onPress={() => actions.openVerif()} />}
+                {v.mode !== 'off' && <Button key="verif-rerun" plain label="Relancer" onPress={() => actions.rerunVerif()} />}
+              </Box>
+            </Box>
+          )
+        })()}
+
         {d.cache && cacheKnown(d.cache) && (() => {
           const c = d.cache!
           const nodes = cacheNodes(c)
@@ -915,6 +1072,36 @@ export function TerminalPane(t: Elements['terminal'], d: ViewData, actions: Pane
     )
   }
 
+  const verifSection = (v: VerifView) => (
+    <Box key="verif" flexDirection="column">
+      <Box justifyContent="space-between">
+        <Text bold wrap="truncate-end">{verifHeader(v)}</Text>
+        <Box gap={2} flexShrink={0}>
+          {v.detail && <Button key="verif-detail" plain label="Détail" onPress={() => actions.openVerif()} />}
+          {v.mode !== 'off' && <Button key="verif-rerun" plain label="Relancer" onPress={() => actions.rerunVerif()} />}
+        </Box>
+      </Box>
+      {v.commandes.map(c => {
+        const r = verifCommandRow(c)
+        return (
+          <Text key={c.id} wrap="truncate-end">
+            <Text color={VERIF_TEXT_COLOR[r.tone]} dimColor={r.tone === 'dim'}>{`  ${r.mark} `}</Text>
+            <Text>{r.id}</Text>
+            <Text color={r.tone === 'ko' ? PALETTE.redText : undefined} dimColor={r.tone !== 'ko'}>{`  ${r.detail}`}</Text>
+            {r.duration ? <Text dimColor>{`  ${r.duration}`}</Text> : null}
+            {r.flaky ? <Text color={PALETTE.orange}>{`  ${r.flaky}`}</Text> : null}
+          </Text>
+        )
+      })}
+      {verifNotes(v).map((n, i) => (
+        <Text key={`n${i}`} wrap="truncate-end">
+          <Text color={VERIF_TEXT_COLOR[n.tone]} dimColor={n.tone === 'dim'}>{`  ${n.mark} `}</Text>
+          <Text color={n.tone === 'ko' || n.tone === 'warn' ? VERIF_TEXT_COLOR[n.tone] : undefined} dimColor={n.tone === 'dim'}>{n.text}</Text>
+        </Text>
+      ))}
+    </Box>
+  )
+
   return (
     <Box flexDirection="column" gap={1} paddingX={1}>
       <Box flexDirection="column">
@@ -987,6 +1174,8 @@ export function TerminalPane(t: Elements['terminal'], d: ViewData, actions: Pane
             })}
         </Box>
       )}
+
+      {verifShown(d.verif) && verifSection(d.verif)}
 
       {d.cache && cacheKnown(d.cache) && cacheSection(d.cache)}
 

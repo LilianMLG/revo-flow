@@ -206,11 +206,28 @@ function mergeJournal(a: JournalEntry[] | undefined, b: JournalEntry[] | undefin
   return [...by.values()].sort((x, y) => (x.le < y.le ? -1 : x.le > y.le ? 1 : 0)).slice(-JOURNAL_MAX)
 }
 
+type VerifLike = { confirme?: { le?: string }; bases?: { le?: string }[] }
+
+/** Date de dernière écriture de projet.verif : la plus récente de `confirme.le` et des bases de référence. */
+function verifTime(v: VerifLike | undefined): string {
+  let t = v?.confirme?.le ?? ''
+  for (const b of v?.bases ?? []) if (typeof b?.le === 'string' && b.le > t) t = b.le
+  return t
+}
+
+/** projet.verif des deux versions : l'absent cède, sinon la plus récente (égalité : `mine`). */
+function newerVerif(mine: VerifLike | undefined, disk: VerifLike | undefined): VerifLike | undefined {
+  if (!mine) return disk
+  if (!disk) return mine
+  return verifTime(mine) >= verifTime(disk) ? mine : disk
+}
+
 /**
  * Fusionne deux versions du même graphe : `mine` (ce que cette session veut écrire) et `disk` (ce qu'une autre session a écrit entre-temps).
  * - fiches : feature par feature, la plus récente `appris.le` gagne (égalité : `mine`) ; une fiche absente d'un côté est gardée ; `usages` prend le plus grand
  *   de chaque compteur, et l'union des fichiers lus (`lus`, ceux du gagnant d'abord, 60 au plus) ;
  * - couche mécanique (projet, fichiers, nœuds, candidates) : celle qui a été indexée le plus récemment ;
+ * - projet.verif : celui dont `confirme.le` ou la dernière base est le plus récent (l'absent cède) ;
  * - stats : `disk` + ce que `mine` a ajouté depuis `baseStats` (les compteurs lus au chargement) ; sans base, le plus grand des deux ;
  * - journal : union par `le`, trié, les 200 derniers ;
  * - rev : le plus grand des deux, plus un.
@@ -249,9 +266,12 @@ export function mergeGraphs(mine: Graph, disk: Graph, baseStats?: Counters): Gra
 
   const mineIsNewer = (mine.projet.indexe?.le ?? '') >= (disk.projet.indexe?.le ?? '')
   const mech = mineIsNewer ? mine : disk
+  // v2 : projet.verif ne suit pas la couche mécanique (une session qui ne l'a pas touché ne doit pas écraser l'autre) : le plus récent gagne
+  const verif = newerVerif((mine.projet as { verif?: VerifLike }).verif, (disk.projet as { verif?: VerifLike }).verif)
+  const { verif: _drop, ...projetSansVerif } = mech.projet as Graph['projet'] & { verif?: unknown }
   return {
     ...mine,
-    projet: mech.projet,
+    projet: { ...projetSansVerif, ...(verif ? { verif } : {}) },
     fichiers: mech.fichiers,
     noeuds: mech.noeuds,
     candidates: mech.candidates,

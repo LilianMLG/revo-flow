@@ -1,5 +1,18 @@
 # R&D v2 : le flow vérifié
 
+> **Statut (2026-10-25) : lots 1a, 1b et 2 implémentés en v2.0.0 ; lots 1c, 3 et 4 non commencés.**
+>
+> Décisions prises le 2026-10-25 (réponses aux « Décisions à prendre » ci-dessous) :
+> 1. Mode par défaut : **bloquer** (option `verif` : `bloquer`, `observer`, `off`).
+> 2. **Base de référence en fond** pendant la planification : oui (lint et typage du projet ; 3 derniers commits gardés).
+> 3. **Build** (`nuxt build`, `nest build`) : hors porte, jamais proposé par défaut.
+> 4. **Testeur et vérificateur** : à la décision de l'orchestrateur à chaque plan, rien d'automatique.
+> 5. **Tests du testeur** : gardés dans le dépôt, aucune suppression en fin de flow.
+> 8. **CI GitLab** après push : hors v2.
+> Limites de la v2.0.0 : pas de `spawn`, donc 10 min au plus par commande (`run`) ; aucun contrôle de types du code du mod
+> (pas de `tsc` dans `claude plugin test`).
+> Les questions 6 (compte de test web) et 7 (mobile) concernent les lots 3 et 4, pas encore tranchées.
+
 > Étude du 2026-10-19, sur la v1.5.0 (commit 42a6a20). Aucun fichier de code n'a été modifié.
 > Trois documents : ce résumé, [conception.md](conception.md) (la feature en détail, lignes des typings comprises)
 > et [execution.md](execution.md) (preuve à l'exécution, web puis mobile : lots 3 et 4).

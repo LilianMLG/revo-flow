@@ -1,9 +1,28 @@
-/** Le cœur du mod : commande /revo-flow, outils plan, step et cache, suivi des agents (lancement, attente, relance, arrêt) et rendu du panneau. */
+/**
+ * Le cœur du mod : commande /revo-flow, outils plan, step, cache et verif, suivi des agents (lancement, attente, relance, arrêt),
+ * vérification du flow (commandes confirmées, base de référence, porte de fin, tests gelés, vérificateur) et rendu du panneau.
+ */
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, PluginOptions, Register, SessionContextUsage } from 'claude-code'
 
 import type { Activity, Context, Flow, FlowAgent, Lead } from '../types'
 import type { AgentInfo, CacheHit, CacheStats, DiffEntry, Feature, FlowCache, Graph, LearnContext, LearnInput, PerimeEntry } from '../types/cache'
+import type {
+  Critere,
+  CritereVerdict,
+  ProjetVerif,
+  TestGele,
+  Triche,
+  VerifCommande,
+  VerifEtatCommande,
+  VerifFormat,
+  VerifJournal,
+  VerifMode,
+  VerifOutil,
+  VerifPortee,
+  VerifResultat,
+  VerifView,
+} from '../types/verif'
 import {
   agentExtract,
   autoFiche,
@@ -44,6 +63,7 @@ import {
   listGraphs,
   loadGraph,
   normalizePath,
+  parseStatus,
   refreshGraph,
   resolveProject,
   saveGraph,
@@ -53,11 +73,12 @@ import {
 import {
   CACHE_TOOL,
   EMPTY,
-  LEAD_BRIEF,
   MODELS,
   PLAN_TOOL,
   PLUGIN,
   STEP_TOOL,
+  VERIFIER_TYPE,
+  VERIF_TOOL,
   addUsage,
   agentBrief,
   allFinished,
@@ -79,6 +100,8 @@ import {
   flowRecap,
   fmtDuration,
   isTally,
+  isTester,
+  isVerifier,
   matchAgent,
   modelLabel,
   parsePlan,
@@ -109,6 +132,25 @@ import {
   type PaneActions,
   type ViewData,
 } from './ui/views'
+import { addBase, baseFor } from './verif/base'
+import { MANIFESTES, SONDES, commandsQuestion, detectCommands, flutterVersionTrap, fvmVersion, manifestPaths, needsConfirm } from './verif/detect'
+import {
+  TESTER_BRIEF,
+  VERIFIER_PROMPT,
+  detectCheats,
+  freeze,
+  frozenDenial,
+  isTestFile,
+  parseVerdicts,
+  rehash,
+  testerDenial,
+  unfreeze,
+  verifierBashAllowed,
+  verifierTask,
+} from './verif/garde'
+import { reportText, summaryLine } from './verif/report'
+import { purgeOutputs, runBase, runGate, type VerifIo } from './verif/runner'
+import { hasGenAnnotation, withShell } from './verif/scope'
 
 type $ = EngineInterface
 
@@ -130,9 +172,11 @@ const sessionCostA = atom({ plugin: 'revo-flow', key: 'sessionCostUsd' } as cons
 const cacheStatsA = atom({ plugin: 'revo-flow', key: 'cacheStats' } as const, null)
 const flowCacheA = atom({ plugin: 'revo-flow', key: 'flowCache' } as const, null)
 const cacheOpenA = atom({ plugin: 'revo-flow', key: 'cacheOpen' } as const, false)
+const verifA = atom({ plugin: 'revo-flow', key: 'verif' } as const, null)
+const verifFlowA = atom({ plugin: 'revo-flow', key: 'verifFlow' } as const, null)
 
 /** Les options du plugin (userConfig), fixées pour ce chargement : un changement recharge le module. */
-const opts = { validerPlan: true, conflits: 'avertir' as 'avertir' | 'refuser', notifier: true, cache: true }
+const opts = { validerPlan: true, conflits: 'avertir' as 'avertir' | 'refuser', notifier: true, cache: true, verif: 'bloquer' as VerifMode }
 
 /** Les agents prévus déjà attribués à un appel Agent : deux lancements en parallèle ne prennent jamais le même. */
 const claimed = new Set<string>()
@@ -184,7 +228,8 @@ async function tick($: $) {
     $.ui.toast(`revo-flow : « ${a.name} » inactif depuis ${fmtDuration(now - a.lastActiveAt)}`, { timeoutMs: 10_000 })
     await notify($, `« ${a.name} » inactif depuis ${fmtDuration(now - a.lastActiveAt)} : bloqué ? /revo-flow statut, ou Arrêter dans le panneau`)
   }
-  const line = flow && flow.phase !== 'done' ? await statusOf($, flow, running.length) : undefined
+  // Pendant une commande de vérification, sa ligne passe devant celle du flow.
+  const line = verifStatus ?? (flow && flow.phase !== 'done' ? await statusOf($, flow, running.length) : undefined)
   if (line !== statusLine) {
     statusLine = line
     $.ui.status(line)
@@ -286,6 +331,13 @@ async function registerTools($: $) {
             required: ['nom', 'modele', 'effort', 'taches'],
           },
         },
+        criteres: {
+          type: 'array',
+          maxItems: 8,
+          items: { type: 'string' },
+          description:
+            "Critères d'acceptation, 1 à 8 (facultatif) : une phrase chacun, vérifiable par une commande ou un test (« Un code promo expiré affiche une erreur sous le champ ») ; revo-flow les numérote C1 à C8",
+        },
       },
       required: ['titre', 'agents'],
     },
@@ -308,6 +360,66 @@ async function registerTools($: $) {
     },
     isDeferred: false,
   })
+  if (opts.verif !== 'off') await registerVerifTool($)
+}
+
+/** L'outil verif (v2) : la vérification du flow, pour les agents (lancer, resultat) et l'orchestrateur (commandes, exception, degeler). */
+async function registerVerifTool($: $) {
+  await $.tool.register({
+    name: 'verif',
+    description:
+      "revo-flow : la vérification du flow (lint, typage, tests liés ; comparée à la base de référence, seules les erreurs nouvelles comptent). Actions : lancer (sur tes fichiers modifiés, ou ceux de « fichiers » → les erreurs nouvelles de tes fichiers ; pour l'orchestrateur, tout le flow) ; resultat (le dernier rapport de la porte de fin) ; commandes (orchestrateur : commandes = la liste complète corrigée, ou commande + exclus = motifs de tests à exclure ; toujours reposée à l'utilisateur) ; exception (orchestrateur, motif → l'utilisateur décide de terminer non vérifié ou non) ; degeler (orchestrateur, fichiers + motif → l'utilisateur décide de dégeler des tests gelés).",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['lancer', 'resultat', 'commandes', 'exception', 'degeler'] },
+        fichiers: { type: 'array', items: { type: 'string' }, description: 'lancer : tes fichiers (défaut : ceux que tu as modifiés) ; degeler : les tests gelés à dégeler' },
+        commandes: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string' },
+              outil: { type: 'string', enum: ['lint', 'typage', 'tests', 'format', 'generation'] },
+              argv: { type: 'array', items: { type: 'string' }, description: 'La commande mot à mot, sans shell ; "{fichiers}" = les fichiers du flow' },
+              portee: { type: 'string', enum: ['fichiers', 'lies', 'projet'] },
+              format: { type: 'string', enum: ['eslint-json', 'tsc', 'vitest-json', 'jest-json', 'biome', 'dart-machine', 'flutter-json', 'texte'] },
+              declencheur: { type: 'string', description: 'Motif glob : la commande ne tourne que si un fichier du flow y correspond' },
+              exclus: { type: 'array', items: { type: 'string' } },
+            },
+            required: ['id', 'outil', 'argv', 'portee'],
+          },
+          description: 'commandes : la liste complète corrigée',
+        },
+        commande: { type: 'string', description: 'commandes : l’id de la commande dont exclure des tests' },
+        exclus: { type: 'array', items: { type: 'string' }, description: 'commandes : motifs de tests à exclure (tests qui demandent un service)' },
+        motif: { type: 'string', description: 'exception, degeler : pourquoi, en une phrase' },
+      },
+      required: ['action'],
+    },
+    isDeferred: false,
+  })
+}
+
+/**
+ * Le vérificateur (lot 2) : Sonnet medium, lecture seule (Edit, Write et NotebookEdit retirés ; son Bash est filtré dans
+ * tool.call), prompt calibré. Proposé au modèle seulement pendant un flow vérifié (agent.offer).
+ */
+async function registerVerifier($: $) {
+  if (opts.verif === 'off') return
+  try {
+    await $.agent.register({
+      name: 'verifier',
+      description:
+        'revo-flow : vérificateur en lecture seule. Juge chaque critère d’acceptation du plan (ok, ko, non vérifiable) avec une preuve exécutée. À lancer quand les implémenteurs ont fini.',
+      prompt: VERIFIER_PROMPT,
+      disallowedTools: ['Edit', 'Write', 'NotebookEdit'],
+      model: 'sonnet',
+      effort: 'medium',
+    })
+  } catch {
+    // sans agent.register (API plus ancienne), pas de vérificateur : la porte mécanique reste la référence
+  }
 }
 
 // ── Tokens : session, jour, semaine ──────────────────────────────────────
@@ -442,15 +554,14 @@ async function notify($: $, text: string) {
  * `dismissed` quand l'utilisateur ferme le dialogue (Échap) ; fermer vaut toujours « ne rien faire ».
  */
 async function askOr($: $, question: string, options: string[], fallback: { headless: string; dismissed: string }): Promise<string> {
-  try {
-    return await $.ui.ask(question, { options, header: PLUGIN })
-  } catch {
-    const surfaces = await $.session.surfaces().catch(() => [])
-    return surfaces.length === 0 ? fallback.headless : fallback.dismissed
-  }
+  return (await askHow($, question, options, fallback)).answer
 }
 
-/** Le flow est fini : phase done, heure de fin, et une notification avec la durée, le coût et les fichiers. */
+/**
+ * Le flow est fini : phase done, heure de fin, et une notification avec la durée, le coût, les fichiers et la vérification
+ * (« vérifié ✓ », « non vérifié (typecheck ✗) »). Une porte encore à lancer ou en cours (observateur : elle tourne après la
+ * conclusion) ne retarde ni la notification ni la fin du tour : les journaux (graphe et store) l'attendent en fond.
+ */
 async function finishFlow($: $) {
   const flow = await read($, flowA)
   if (!flow || flow.phase === 'done') return
@@ -459,18 +570,37 @@ async function finishFlow($: $) {
   const lead = await read($, leadA)
   const cost = lead.costUsd + flow.agents.reduce((sum, a) => sum + a.costUsd, 0)
   const files = (await read($, entries)).length
-  await closeFlowCache($).catch(() => undefined)
+  const g = gate && gate.flowId === flow.id && !flow.isStopped && gate.mode !== 'off' ? gate : undefined
+  // La porte de l'état final : déjà prête (porte bloquante passée au Stop), ou lancée maintenant en fond.
+  const pending = g ? ensureGate($).catch(() => undefined) : undefined
+  const isReady = !g || (g.porte?.fini === true && g.porte.seq === g.seq)
+  const verifP: Promise<VerifJournal | undefined> = g ? pending!.then(() => verifJournal(g)) : Promise.resolve(gate && gate.flowId === flow.id && !flow.isStopped ? verifJournal(gate) : undefined)
   const blocked = flow.agents.filter(a => a.status === 'blocked').length
+  const seg = g ? (isReady ? verifSegment(g) : 'vérification en cours') : ''
   const note = `${blocked ? ` · ${blocked} agent${blocked > 1 ? 's' : ''} en attente` : ''}${endNote ? ` · ${endNote}` : ''}`
-  await notify($, `« ${flow.title} » ${flow.isStopped ? 'arrêté' : 'terminé'} · ${fmtDuration(now - flow.startedAt)} · ${euros(cost)} · ${files} fichier${files > 1 ? 's' : ''}${note}`)
-  await journalize($, { ...flow, endedAt: now }, lead, files).catch(() => undefined)
+  await notify($, `« ${flow.title} » ${flow.isStopped ? 'arrêté' : 'terminé'}${seg ? ` · ${seg}` : ''} · ${fmtDuration(now - flow.startedAt)} · ${euros(cost)} · ${files} fichier${files > 1 ? 's' : ''}${note}`)
+  const journals = Promise.all([
+    closeFlowCache($, verifP).catch(() => undefined),
+    journalize($, { ...flow, endedAt: now }, lead, files, verifP).catch(() => undefined),
+  ])
+  if (isReady) {
+    await journals
+    return
+  }
+  // Le résultat arrive après la notification : un toast le donne.
+  void verifP
+    .then(() => {
+      const line = g ? verifSegment(g) : ''
+      if (line) $.ui.toast(`revo-flow · « ${flow.title} » : ${line}`)
+    })
+    .catch(() => undefined)
 }
 
 /** Le journal des flows (store du plugin), les plus récents d'abord. */
 const JOURNAL_KEY = 'journal'
 
-/** Ajoute le flow fini au journal : durée, coût et sort de chaque agent, pour /revo-flow historique. */
-async function journalize($: $, flow: Flow, lead: Lead, files: number) {
+/** Ajoute le flow fini au journal : durée, coût et sort de chaque agent, et la vérification, pour /revo-flow historique. */
+async function journalize($: $, flow: Flow, lead: Lead, files: number, verifP: Promise<VerifJournal | undefined> = Promise.resolve(undefined)) {
   const entry: JournalEntry = {
     id: flow.id,
     title: flow.title,
@@ -492,8 +622,9 @@ async function journalize($: $, flow: Flow, lead: Lead, files: number) {
       durationMs: a.startedAt !== undefined && a.endedAt !== undefined ? a.endedAt - a.startedAt : 0,
     })),
   }
+  const verif = await verifP.catch(() => undefined)
   const prev = await $.store.get(JOURNAL_KEY)
-  await $.store.set(JOURNAL_KEY, addToJournal(prev, entry))
+  await $.store.set(JOURNAL_KEY, addToJournal(prev, verif ? { ...entry, verif } : entry))
 }
 
 // ── Cache projet ─────────────────────────────────────────────────────────
@@ -1065,7 +1196,7 @@ async function learnAtEnd($: $, flow: Flow) {
  * Le flow est fini : son entrée dans le journal du graphe (cache actif ou non : c'est la mesure), usages et gains des fiches servies,
  * fiche servie complétée des fichiers lus. Cache désactivé : seulement si le graphe existe déjà (on ne le construit pas pour mesurer).
  */
-async function closeFlowCache($: $) {
+async function closeFlowCache($: $, verifP: Promise<VerifJournal | undefined> = Promise.resolve(undefined)) {
   const fc = await read($, flowCacheA)
   if (!fc) return
   // Un flow arrêté n'est pas représentatif : ni journal, ni fiche complétée.
@@ -1073,11 +1204,13 @@ async function closeFlowCache($: $) {
   if (flow?.isStopped === true) return
   const ref = await flowRefOf($, fc)
   if (!ref) return
+  // Ce qui appartient à ce flow est lu tout de suite : la vérification peut finir après le lancement du flow suivant.
+  const appris = flow && learned.flowId === flow.id ? [...learned.features] : []
+  const verif = await verifP.catch(() => undefined)
   const graph = opts.cache ? await graphOf($, ref) : (graphCache.get(ref.cle)?.graph ?? (await loadGraph(ioOf($), ref).catch(() => null)))
   if (!graph) return
   const now = await $.clock.now()
-  const appris = flow && learned.flowId === flow.id ? [...learned.features] : []
-  let next = recordCacheUsage(graph, fc, { le: new Date(now).toISOString(), appris })
+  let next = recordCacheUsage(graph, fc, { le: new Date(now).toISOString(), appris }, verif ? { verif } : undefined)
   if (opts.cache && fc.feature && next.features[fc.feature]) next = completeFiche(next, fc.feature, [...new Set(fc.lus.map(l => l.p))])
   // Sans cache, le graphe n'a pas été revérifié par hash : il ne passe pas pour frais.
   keepGraph(await saveGraph(ioOf($), next), opts.cache ? now : (graphCache.get(ref.cle)?.refreshedAt ?? 0))
@@ -1130,6 +1263,1062 @@ function cacheRecap(fc: FlowCache | null): string | undefined {
     .map(f => f.id)
   const known = ids.length > RECAP_MAX ? `${ids.slice(0, RECAP_MAX).join(', ')}… (+${ids.length - RECAP_MAX})` : ids.join(', ')
   return `Cache revo-flow (${graph.projet.nom}) : ${fc.feature ? `fiche servie « ${fc.feature} » ; ` : ''}features connues : ${known || 'aucune'}. Outil ${CACHE_TOOL}.`
+}
+
+// ── Vérification du flow (v2, docs/rd-v2/conception.md) ──────────────────
+
+/** Le plafond de block sur la porte de fin, par flow (§8) ; au-delà, l'utilisateur décide. */
+const MAX_TENTATIVES = 3
+/** Une commande au plus 10 min : la limite de $.process.run (cc:3591). */
+const RUN_MAX_MS = 600_000
+/** Les sorties complètes des 20 derniers flows sont gardées (~/.claude/revo-flow/verif/<flow>/). */
+const SORTIES_GARDEES = 20
+/** Les choix de la question des commandes (§4). */
+const CONFIRM = ['Utiliser', 'Ajuster', 'Pas de vérification']
+/** Les choix de la question de fin, plafond atteint ou exception demandée (§4). */
+const FIN = ['Terminer non vérifié', 'Une tentative de plus', 'Voir le détail']
+
+/**
+ * La porte du flow courant, en mémoire : promesses (base, porte en cours) et décisions. Ce qui doit survivre à un
+ * rechargement du mod (gel, critères, tentatives) est recopié dans l'atom verifFlow (persistVerif) ; la base en cours,
+ * elle, est perdue (base absente : les erreurs sont « nouvelle ? »).
+ */
+type Gate = {
+  flowId: string
+  /** Le mode de ce flow : celui de l'option, observer (confirmé sans personne à qui demander) ou off (pas de vérification). */
+  mode: VerifMode
+  ref: ProjectRef
+  /** Le commit de départ : la base de référence et le diff du flow s'y rattachent. */
+  commit: string
+  /** Les commandes proposées en attente de confirmation (Ajuster) : la question revient après `verif commandes`. */
+  proposees?: { commandes: VerifCommande[]; pieges: string[]; hashes: Record<string, string> }
+  /** Les chemins déjà modifiés (git status) au lancement : hors de la portée tant que le flow n'y touche pas. */
+  saleAuDepart: Set<string>
+  base?: Promise<void>
+  baseEnCours?: boolean
+  /** Un fichier a été modifié pendant que la base tournait : elle n'est pas gardée (elle compterait des erreurs du flow comme préexistantes). */
+  baseSalie?: boolean
+  /** Le compteur des modifications du flow (Edit, Write, Bash qui écrit) : une porte n'est réutilisée que s'il n'a pas bougé. */
+  seq: number
+  porte?: { seq: number; promesse: Promise<VerifResultat | undefined>; fini: boolean }
+  dernier?: VerifResultat
+  /** Les block rendus sur la porte de fin. */
+  blocks: number
+  /** Les tentatives accordées au-delà du plafond (« Une tentative de plus »). */
+  encore: number
+  /** Les fins de tour consécutives relancées par un block (stop_hook_active) : un garde-fou contre une boucle. */
+  relances: number
+  /** Les portes de fin évaluées (fins de tour de l'orchestrateur en conclusion). */
+  portes: number
+  premierRouge?: boolean
+  /** Temps cumulé des portes globales du flow. */
+  dureeMs: number
+  /** La porte est levée : terminer non vérifié, sur décision de l'utilisateur ou sans personne à qui demander. */
+  libre?: boolean
+  /** Fini rouge sur décision de l'utilisateur (exception ou plafond). */
+  accepte?: boolean
+  /** revo-flow a planté pendant la dernière porte : elle s'est ouverte. */
+  erreur?: boolean
+  gel: TestGele[]
+  /** Les tests gelés modifiés hors outil (Bash…), avec la réponse de l'utilisateur. */
+  gelesModifies: { p: string; par: string; decision?: 'accepte' | 'refuse' }[]
+  triches: Triche[]
+  /** Les réponses de l'utilisateur sur les triches bloquantes, par « motif|fichier ». */
+  decisions: Map<string, 'accepte' | 'refuse'>
+  criteres: Critere[]
+  verdicts?: CritereVerdict[]
+}
+let gate: Gate | undefined
+/** Les sous-agents vérificateurs (revo-flow:verifier) : leur Bash est filtré, leur réponse donne les verdicts. */
+const verifierAgents = new Set<string>()
+/** Les sous-agents testeurs en cours : tant qu'il y en a un, le hook d'édition se ferme en cas d'erreur. */
+const testerAgents = new Set<string>()
+/** La commande de vérification en cours, pour la ligne d'état : « revo-flow : typecheck… (≈ 45 s) ». */
+let verifStatus: string | undefined
+/** Les exécutions de vérification passent l'une après l'autre (agents et porte globale partagent la copie de travail). */
+let verifQueue: Promise<unknown> = Promise.resolve()
+
+function serial<T>(fn: () => Promise<T>): Promise<T> {
+  const p = verifQueue.then(fn, fn)
+  verifQueue = p.catch(() => undefined)
+  return p
+}
+
+/** La vue de la porte, si elle est encore celle de ce flow (un flow remplacé ne touche plus à l'écran). */
+async function setView($: $, g: Gate, patch: Partial<VerifView>) {
+  if (gate !== g) return
+  await update($, verifA, v => (v ? { ...v, ...patch } : v))
+}
+
+/** Le gel, les critères et les tentatives dans l'atom verifFlow : ils survivent à un rechargement du mod. */
+async function persistVerif($: $, g: Gate) {
+  if (gate !== g) return
+  await update($, verifFlowA, () => ({
+    flowId: g.flowId,
+    mode: g.mode,
+    commit: g.commit,
+    gel: g.gel,
+    criteres: g.criteres,
+    blocks: g.blocks,
+    portes: g.portes,
+    ...(g.accepte ? { accepte: true } : {}),
+  }))
+}
+
+/** Les commandes confirmées du projet, telles que le graphe gardé les porte. */
+const verifOf = (g: Gate): ProjetVerif | undefined => graphCache.get(g.ref.cle)?.graph.projet.verif
+
+/** Modifie projet.verif du graphe et l'enregistre ; jamais d'exception (la vérification ne doit pas gêner le flow). */
+async function saveVerif($: $, ref: ProjectRef, change: (v: ProjetVerif | undefined) => ProjetVerif) {
+  try {
+    const held = graphCache.get(ref.cle)
+    const graph = held?.graph ?? (await graphOf($, ref))
+    if (!graph) return
+    const next = { ...graph, projet: { ...graph.projet, verif: change(graph.projet.verif) } }
+    keepGraph(await saveGraph(ioOf($), next), held?.refreshedAt ?? (await $.clock.now()))
+  } catch {
+    // le graphe sera réécrit au prochain changement
+  }
+}
+
+const isWindows = async ($: $) => Boolean(await $.env.get('USERPROFILE').catch(() => undefined))
+
+/** Le dossier des sorties complètes : ~/.claude/revo-flow/verif (chaque flow dans son sous-dossier). */
+async function verifDir($: $): Promise<string | undefined> {
+  const home = await ioOf($).home()
+  return home ? `${normalizePath(home)}/.claude/revo-flow/verif` : undefined
+}
+
+/**
+ * Les accès du module de vérification au moteur, comme ioOf pour le cache : runner.ts ne reçoit jamais `$`. Un cwd relatif
+ * est pris sous la racine ; une commande dure 10 min au plus ; remove ne supprime que sous ~/.claude/revo-flow/verif.
+ */
+async function verifIoOf($: $, g: Gate): Promise<VerifIo> {
+  const os = (await isWindows($)) ? 'windows' : 'posix'
+  const racine = normalizePath(g.ref.racine)
+  const parent = (await verifDir($)) ?? `${racine}/.revo-flow-verif`
+  const abs = (cwd: string) => (!cwd ? racine : /^([a-z]:)?[\\/]/i.test(cwd) ? cwd : `${racine}/${normalizePath(cwd)}`)
+  return {
+    run: async (argv, init) => {
+      const r = await $.process.run(argv, { cwd: abs(init.cwd), timeoutMs: Math.max(1000, Math.min(RUN_MAX_MS, init.timeoutMs)) })
+      return { exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr }
+    },
+    write: (path, text) => $.fs.write(path, text),
+    list: async dir => (await $.fs.list(dir)).map(e => e.name),
+    remove: async path => {
+      const p = normalizePath(path)
+      if (!p.startsWith(`${parent}/`) || p.includes('/../')) return
+      const argv = os === 'windows' ? ['cmd', '/c', 'rmdir', '/s', '/q', p.replace(/\//g, '\\')] : ['rm', '-rf', p]
+      await $.process.run(argv, { timeoutMs: 10_000 }).catch(() => undefined)
+    },
+    now: () => $.clock.now(),
+    os,
+    racine,
+    sorties: `${parent}/${outputsName(g.flowId)}`,
+  }
+}
+
+/**
+ * Le dossier des sorties d'un flow : la date en tête (20261025T091500-<flow>), car purgeOutputs garde les derniers dans l'ordre
+ * alphabétique des noms.
+ */
+function outputsName(flowId: string): string {
+  const at = Number(flowId)
+  const stamp = Number.isFinite(at) && at > 0 ? new Date(at).toISOString().replace(/[-:]/g, '').slice(0, 15) : '00000000T000000'
+  return `${stamp}-${flowId}`
+}
+
+/** git dans la racine du projet, sans jamais lever : la sortie, ou '' en cas d'échec. */
+async function gitOut($: $, racine: string, args: string[], stdin?: string): Promise<string> {
+  try {
+    const r = await $.process.run(['git', '-c', 'core.quotepath=false', ...args], { cwd: racine, timeoutMs: 15_000, ...(stdin !== undefined ? { stdin } : {}) })
+    return r.exitCode === 0 ? r.stdout : ''
+  } catch {
+    return ''
+  }
+}
+
+/** git hash-object des fichiers donnés (relatifs à la racine) : { chemin → hash } ; un fichier illisible est absent. */
+async function hashFiles($: $, racine: string, paths: string[]): Promise<Record<string, string>> {
+  const out: Record<string, string> = {}
+  if (!paths.length) return out
+  const lines = (await gitOut($, racine, ['hash-object', '--stdin-paths'], `${paths.join('\n')}\n`)).split(/\r?\n/).filter(Boolean)
+  if (lines.length === paths.length) {
+    paths.forEach((p, i) => (out[p] = lines[i]!.trim()))
+    return out
+  }
+  // Un chemin a échoué : un par un, pour ne perdre que celui-là.
+  for (const p of paths) {
+    const h = (await gitOut($, racine, ['hash-object', '--', p])).trim()
+    if (h) out[p] = h
+  }
+  return out
+}
+
+/** Les fichiers modifiés de la copie de travail (git status), relatifs à la racine ; les supprimés n'y sont pas. */
+async function dirtyPaths($: $, racine: string): Promise<string[]> {
+  const out = await gitOut($, racine, ['status', '--porcelain', '-z', '--untracked-files=all'])
+  return parseStatus(out)
+    .filter(e => e.x !== 'D' && e.y !== 'D')
+    .map(e => e.p)
+}
+
+/** La portée de la porte globale : les fichiers modifiés du flow (markFile), plus ceux que git status voit et qui ne l'étaient pas au lancement (Bash). */
+async function flowScope($: $, g: Gate): Promise<string[]> {
+  const marked = (await read($, entries)).map(x => relTo(g.ref.racine, x.path)).filter((p): p is string => !!p && !/^(~|\.\.)(\/|$)/.test(p))
+  const status = (await dirtyPaths($, g.ref.racine)).filter(p => !g.saleAuDepart.has(p))
+  return existing($, g, [...new Set([...marked, ...status])])
+}
+
+/** Les fichiers qui existent encore (un fichier supprimé pendant le flow ne se vérifie pas). */
+async function existing($: $, g: Gate, paths: string[]): Promise<string[]> {
+  const root = normalizePath(g.ref.racine)
+  const kept = await Promise.all(paths.map(p => $.fs.exists(`${root}/${p}`).catch(() => true)))
+  return paths.filter((_, i) => kept[i])
+}
+
+/** Les fichiers Dart de la portée dont une annotation demande build_runner (@riverpod, @freezed, part '*.g.dart'…) : `annotes` de runGate. */
+async function annotesOf($: $, g: Gate, paths: string[]): Promise<string[]> {
+  const root = normalizePath(g.ref.racine)
+  const dart = paths.filter(p => p.endsWith('.dart')).slice(0, 200)
+  const texts = await Promise.all(dart.map(p => ioOf($).fs.read(`${root}/${p}`).catch(() => '')))
+  return dart.filter((_, i) => typeof texts[i] === 'string' && hasGenAnnotation(texts[i]!))
+}
+
+/** Les tests liés d'un fichier Dart : les fichiers qui le « testent » dans le graphe (arêtes teste, graph.ts:923). */
+function testsOfGraph(graph: Graph | undefined): ((p: string) => string[]) | undefined {
+  if (!graph) return undefined
+  const rev = new Map<string, string[]>()
+  for (const [t, node] of Object.entries(graph.fichiers)) {
+    for (const to of node.out?.teste ?? []) rev.set(to, [...(rev.get(to) ?? []), t])
+  }
+  return p => rev.get(p) ?? []
+}
+
+/**
+ * $.ui.ask avec la façon dont la réponse est venue : de l'utilisateur, du repli sans personne à qui demander (headless),
+ * ou du repli dialogue fermé (Échap). Sert quand la réponse engage différemment (confirmé par l'utilisateur ou non).
+ */
+async function askHow(
+  $: $,
+  question: string,
+  options: string[],
+  fallback: { headless: string; dismissed: string },
+): Promise<{ answer: string; how: 'utilisateur' | 'headless' | 'ferme' }> {
+  try {
+    return { answer: await $.ui.ask(question, { options, header: PLUGIN }), how: 'utilisateur' }
+  } catch {
+    const surfaces = await $.session.surfaces().catch(() => [])
+    return surfaces.length === 0 ? { answer: fallback.headless, how: 'headless' } : { answer: fallback.dismissed, how: 'ferme' }
+  }
+}
+
+/** Une question de la porte : affichée « en attente de votre réponse » dans le panneau tant qu'elle est ouverte. */
+async function askGate($: $, g: Gate, question: string, options: string[], fallback: { headless: string; dismissed: string }, waiting: string) {
+  await setView($, g, { enAttente: waiting })
+  try {
+    return await askHow($, question, options, fallback)
+  } finally {
+    await setView($, g, { enAttente: undefined })
+  }
+}
+
+/** Les commandes détectées, en gardant ce que le projet avait appris de celles qui ne changent pas (durée, exclusions) et celles ajoutées par l'orchestrateur. */
+function mergeCommands(found: VerifCommande[], prev: VerifCommande[] | undefined): VerifCommande[] {
+  const old = new Map((prev ?? []).map(c => [c.id, c]))
+  const merged = found.map(c => {
+    const o = old.get(c.id)
+    return o ? { ...c, ...(o.dureeMs !== undefined ? { dureeMs: o.dureeMs } : {}), ...(o.exclus?.length ? { exclus: o.exclus } : {}) } : c
+  })
+  const added = (prev ?? []).filter(c => c.source === 'orchestrateur' && !found.some(f => f.id === c.id))
+  return [...merged, ...added]
+}
+
+/** La liste des commandes pour l'orchestrateur (Ajuster) : une ligne chacune, puis comment la corriger. */
+function adjustNote(nom: string, commandes: VerifCommande[], note?: string): string {
+  const rows = commandes.map(c => `- ${c.id} (${c.outil}, portée ${c.portee}, format ${c.format}, source ${c.source}) : ${c.argv.join(' ')}${c.exclus?.length ? ` · exclus : ${c.exclus.join(', ')}` : ''}`)
+  return [
+    `revo-flow : l'utilisateur veut ajuster les commandes de vérification de ${nom}${note ? ` (« ${note} »)` : ''} :`,
+    ...rows,
+    `Corrige-les avec l'outil ${VERIF_TOOL} action commandes : commandes = la liste complète corrigée [{id, outil (lint, typage, tests, format, generation), argv (sans shell ; "{fichiers}" = les fichiers du flow), portee (fichiers, lies, projet), format}] ; ou commande = l'id et exclus = les motifs de tests à exclure. La question sera reposée à l'utilisateur. Sans réponse de sa part, pas de vérification pour ce flow.`,
+  ].join('\n')
+}
+
+/**
+ * Au lancement d'un flow (planning) : les commandes de vérification du projet. Connues et à jour (manifestes au même hash) : rien à
+ * demander. Sinon détectées (§6), puis confirmées par l'utilisateur (Utiliser / Ajuster / Pas de vérification). La base de
+ * référence part ensuite en fond. Rend la note pour l'orchestrateur quand l'utilisateur veut ajuster. Jamais d'exception.
+ */
+async function startVerif($: $, flowId: string): Promise<string | undefined> {
+  gate = undefined
+  verifStatus = undefined
+  await update($, verifA, () => null)
+  await update($, verifFlowA, () => null)
+  if (opts.verif === 'off') return undefined
+  const ref = flowRef ?? (await resolveProject(ioOf($)).catch(() => undefined))
+  if (!ref) return undefined
+  const graph = await graphOf($, ref, { build: true }).catch(() => null)
+  if (!graph) return undefined
+  const files = Object.keys(graph.fichiers)
+  const paths = [...new Set([...MANIFESTES, ...manifestPaths(files)])]
+  const io = ioOf($)
+  const texts = await Promise.all(paths.map(p => io.fs.read(`${normalizePath(ref.racine)}/${p}`).then(t => (typeof t === 'string' ? t : undefined), () => undefined)))
+  const readMap: Record<string, string | undefined> = Object.fromEntries(paths.map((p, i) => [p, texts[i]]))
+  const hashes = await hashFiles($, ref.racine, paths.filter(p => readMap[p] !== undefined))
+  const g: Gate = {
+    flowId,
+    mode: opts.verif,
+    ref,
+    commit: (await gitOut($, ref.racine, ['rev-parse', 'HEAD'])).trim(),
+    saleAuDepart: new Set(await dirtyPaths($, ref.racine)),
+    seq: 0,
+    blocks: 0,
+    encore: 0,
+    relances: 0,
+    portes: 0,
+    dureeMs: 0,
+    gel: [],
+    gelesModifies: [],
+    triches: [],
+    decisions: new Map(),
+    criteres: [],
+  }
+  gate = g
+  await update($, verifA, () => ({ projet: ref.nom, mode: g.mode, etat: 'attente', tentative: 0, max: MAX_TENTATIVES, commandes: [], base: 'absente', geles: [], triches: [] }))
+  await persistVerif($, g)
+  // Les sorties des flows plus anciens que les 20 derniers partent, en fond.
+  $.clock.after(0, async () => {
+    try {
+      const dir = await verifDir($)
+      if (dir) await purgeOutputs(await verifIoOf($, g), dir, SORTIES_GARDEES)
+    } catch {
+      // une purge manquée sera rattrapée au flow suivant
+    }
+  })
+  const pv = graph.projet.verif
+  // Confirmées par l'utilisateur, manifestes au même hash : rien à demander. Confirmées sans personne à qui demander (claude -p) :
+  // needsConfirm redemande, et la question repart (sans personne, encore en observateur).
+  if (pv && !needsConfirm(pv, hashes)) {
+    if (!pv.commandes.length) g.mode = 'off'
+    await setView($, g, { mode: g.mode, etat: g.mode === 'off' ? 'off' : 'attente' })
+    await persistVerif($, g)
+    startBase($, g)
+    return undefined
+  }
+  // Les pièges d'environnement (node_modules absent, pub get pas fait) : seule la présence de ces chemins compte.
+  const sondes = Object.fromEntries(await Promise.all(SONDES.map(async p => [p, await io.fs.exists(`${normalizePath(ref.racine)}/${p}`).catch(() => false)] as const)))
+  const found = detectCommands({ stack: graph.projet.stack, files, read: readMap, sondes })
+  // Flutter du poste différent de celui de .fvm : un piège affiché avec la question (§6.5).
+  const fvm = fvmVersion(readMap)
+  if (fvm) {
+    const argv = withShell(['flutter', '--version', '--machine'], (await isWindows($)) ? 'windows' : 'posix')
+    const out = await $.process.run(argv, { cwd: ref.racine, timeoutMs: 20_000 }).then(r => r.stdout, () => '')
+    const trap = flutterVersionTrap(fvm, out)
+    if (trap) found.pieges.push(trap)
+  }
+  if (!found.commandes.length) {
+    // Rien à lancer dans ce projet : la porte reste fermée à l'écran, sans question.
+    g.mode = 'off'
+    await setView($, g, { mode: 'off', etat: 'off' })
+    await persistVerif($, g)
+    return undefined
+  }
+  return confirmCommands($, g, mergeCommands(found.commandes, pv?.commandes), found.pieges, hashes)
+}
+
+/**
+ * La question des commandes (§4, §6.4) : Utiliser (rangées dans projet.verif avec le hash des manifestes ; sans personne à qui
+ * demander, en observateur), Ajuster (l'orchestrateur reçoit la liste, la question revient après `verif commandes`), Pas de
+ * vérification (ce flow seulement ; aussi sur Échap). Un texte libre vaut Ajuster, avec ce que l'utilisateur a écrit.
+ * Rend la note pour l'orchestrateur, ou rien.
+ */
+async function confirmCommands($: $, g: Gate, commandes: VerifCommande[], pieges: string[], hashes: Record<string, string>): Promise<string | undefined> {
+  await setView($, g, { etat: 'a-confirmer' })
+  const { answer, how } = await askGate($, g, commandsQuestion(g.ref.nom, commandes, pieges), CONFIRM, { headless: 'Utiliser', dismissed: 'Pas de vérification' }, 'Confirmer les commandes de vérification')
+  if (gate !== g) return undefined
+  if (answer === 'Utiliser') {
+    if (how === 'headless') g.mode = 'observer'
+    g.proposees = undefined
+    const le = new Date(await $.clock.now()).toISOString()
+    await saveVerif($, g.ref, v => ({
+      commandes,
+      manifestes: hashes,
+      confirme: { le, par: how === 'headless' ? 'headless' : 'utilisateur' },
+      instables: v?.instables ?? [],
+      pieges,
+      bases: v?.bases ?? [],
+    }))
+    await setView($, g, { mode: g.mode, etat: 'attente' })
+    await persistVerif($, g)
+    startBase($, g)
+    return undefined
+  }
+  if (answer === 'Pas de vérification') {
+    g.mode = 'off'
+    g.proposees = undefined
+    await setView($, g, { mode: 'off', etat: 'off' })
+    await persistVerif($, g)
+    return undefined
+  }
+  g.proposees = { commandes, pieges, hashes }
+  await setView($, g, { etat: 'a-confirmer', enAttente: 'Commandes à ajuster par l’orchestrateur' })
+  return adjustNote(g.ref.nom, commandes, answer === 'Ajuster' ? undefined : answer)
+}
+
+/**
+ * La base de référence en fond (§7) : lint et typage du projet au commit de départ, sauf si le graphe l'a déjà pour ce commit.
+ * Un fichier modifié pendant qu'elle tourne la rend inutilisable (base absente). Perdue si le mod se recharge.
+ */
+function startBase($: $, g: Gate) {
+  if (g.mode === 'off' || g.base) return
+  const pv = verifOf(g)
+  if (!pv?.commandes.length || !g.commit) return
+  if (baseFor(pv, g.commit)) {
+    void setView($, g, { base: 'prete' }).catch(() => undefined)
+    return
+  }
+  g.baseEnCours = true
+  void setView($, g, { base: 'en_cours', etat: 'base' }).catch(() => undefined)
+  g.base = (async () => {
+    try {
+      // La ligne d'état suit la base comme la porte : « revo-flow : base de référence, typecheck… ».
+      const base = await runBase(await verifIoOf($, g), pv, g.commit, c => {
+        if (gate !== g) return
+        verifStatus = c.etat === 'en_cours' ? `revo-flow : base de référence, ${c.id}…` : undefined
+        if (verifStatus !== statusLine) {
+          statusLine = verifStatus
+          $.ui.status(verifStatus)
+        }
+      })
+      if (g.baseSalie) {
+        await setView($, g, { base: 'absente' })
+        return
+      }
+      await saveVerif($, g.ref, v => addBase(v ?? pv, base))
+      await setView($, g, { base: 'prete' })
+    } catch {
+      await setView($, g, { base: 'absente' })
+    } finally {
+      g.baseEnCours = false
+      if (gate === g) await update($, verifA, v => (v && v.etat === 'base' ? { ...v, etat: 'attente' } : v))
+    }
+  })().catch(() => undefined)
+}
+
+/** Un fichier vient d'être modifié pendant le flow : une porte déjà lancée ne vaut plus, une base encore en cours non plus. */
+function touchVerif(isWrite: boolean) {
+  const g = gate
+  if (!g) return
+  g.seq++
+  if (isWrite && g.baseEnCours) g.baseSalie = true
+}
+
+/** Une commande de la porte avance : la ligne du panneau, et la ligne d'état « revo-flow : typecheck… (≈ 45 s) » pendant qu'elle tourne. */
+async function onCommand($: $, g: Gate, c: VerifEtatCommande) {
+  if (gate !== g) return
+  await update($, verifA, v => {
+    if (!v) return v
+    const i = v.commandes.findIndex(x => x.id === c.id)
+    return { ...v, commandes: i < 0 ? [...v.commandes, c] : v.commandes.map((x, j) => (j === i ? c : x)) }
+  })
+  const expected = verifOf(g)?.commandes.find(x => x.id === c.id)?.dureeMs
+  verifStatus = c.etat === 'en_cours' ? `revo-flow : ${c.id}…${expected ? ` (≈ ${fmtDuration(expected)})` : ''}` : undefined
+  if (verifStatus !== statusLine) {
+    statusLine = verifStatus
+    $.ui.status(verifStatus)
+  }
+}
+
+/** Les durées apprises et les tests instables d'une exécution, rangés dans projet.verif sans toucher aux commandes confirmées entre-temps. */
+async function keepLearned($: $, g: Gate, learnedVerif: ProjetVerif) {
+  await saveVerif($, g.ref, v => {
+    const cur = v ?? learnedVerif
+    const durees = new Map(learnedVerif.commandes.map(c => [c.id, c.dureeMs]))
+    return {
+      ...cur,
+      commandes: cur.commandes.map(c => (durees.get(c.id) !== undefined ? { ...c, dureeMs: durees.get(c.id) } : c)),
+      instables: [...new Set([...(cur.instables ?? []), ...(learnedVerif.instables ?? [])])],
+    }
+  })
+}
+
+/** Le motif de detectCheats pour un test gelé modifié : couvert par le re-hash (gelesModifies), pas par une question de plus. */
+const FROZEN_MOTIF = 'test gelé modifié'
+
+/** Ce qui bloque la porte en plus des erreurs nouvelles : un test gelé modifié ou une triche bloquante, non acceptés. */
+function blockers(g: Gate): string[] {
+  return [
+    ...g.gelesModifies.filter(x => x.decision !== 'accepte').map(x => `Test gelé ${x.p} modifié hors outil${x.decision === 'refuse' ? ' : refusé par l’utilisateur, remets-le comme il était' : ' : en attente de la réponse de l’utilisateur'}.`),
+    ...g.triches
+      .filter(t => t.bloquant && t.motif !== FROZEN_MOTIF && g.decisions.get(`${t.motif}|${t.fichier}`) !== 'accepte')
+      .map(t => `${t.motif} : ${t.fichier}${t.extrait ? ` (${t.extrait})` : ''}${g.decisions.get(`${t.motif}|${t.fichier}`) === 'refuse' ? ' : refusé par l’utilisateur, reviens dessus' : ''}.`),
+  ]
+}
+
+const isGreen = (g: Gate, r: VerifResultat) => r.etat === 'vert' && blockers(g).length === 0
+
+/** Le fichier de sortie à ouvrir par le bouton Détail : la première commande rouge, sinon la dernière qui en a un. */
+const detailOf = (r: VerifResultat | undefined) =>
+  r ? (r.commandes.find(c => (c.etat === 'ko' || c.etat === 'erreur') && c.sortie)?.sortie ?? [...r.commandes].reverse().find(c => c.sortie)?.sortie) : undefined
+
+/** Le résultat de la dernière porte dans le panneau et la bande. */
+async function showResult($: $, g: Gate) {
+  const r = g.dernier
+  const etat: VerifView['etat'] = g.erreur || !r ? 'erreur' : isGreen(g, r) ? 'vert' : r.etat === 'erreur' && !blockers(g).length ? 'erreur' : 'rouge'
+  const detail = detailOf(r)
+  await setView($, g, {
+    etat,
+    commandes: r?.commandes ?? [],
+    tentative: g.portes,
+    geles: g.gel.map(x => {
+      const m = g.gelesModifies.find(y => y.p === x.p && y.decision !== 'accepte')
+      return m ? { p: x.p, modifie: 'hors outil (Bash ?)' } : { p: x.p }
+    }),
+    triches: g.triches,
+    ...(detail ? { detail } : {}),
+  })
+}
+
+/**
+ * Re-hash des tests gelés à chaque porte (§8) : une modification hors outil (Bash) est bloquante et soumise à l'utilisateur
+ * (Accepter : le test est regelé tel quel ; Refuser, Échap ou sans personne : la porte reste rouge).
+ */
+async function checkFrozen($: $, g: Gate) {
+  if (!g.gel.length) {
+    g.gelesModifies = []
+    return
+  }
+  const hashes = await hashFiles($, g.ref.racine, g.gel.map(x => x.p))
+  const mods = rehash(g.gel, hashes)
+  const prev = g.gelesModifies
+  g.gelesModifies = []
+  for (const m of mods) {
+    const known = prev.find(x => x.p === m.p && x.decision)
+    if (known) {
+      g.gelesModifies.push(known)
+      continue
+    }
+    const { answer } = await askGate(
+      $,
+      g,
+      `Le test gelé ${m.p} (écrit par « ${m.par} ») a été modifié hors des outils d’édition, sans doute par une commande Bash. Accepter cette modification ?`,
+      ['Accepter', 'Refuser'],
+      { headless: 'Refuser', dismissed: 'Refuser' },
+      `Test gelé ${m.p} modifié`,
+    )
+    if (answer === 'Accepter' && hashes[m.p]) {
+      g.gel = freeze([{ p: m.p, h: hashes[m.p]! }], m.par, g.gel)
+      await persistVerif($, g)
+    } else g.gelesModifies.push({ ...m, decision: 'refuse' })
+  }
+}
+
+/** Le diff du flow depuis le commit de départ, plus les fichiers nouveaux non suivis du flow, lus en entier (lignes ajoutées). */
+async function flowDiff($: $, g: Gate, scope: string[]): Promise<string> {
+  const tracked = g.commit ? await gitOut($, g.ref.racine, ['diff', g.commit, '--']) : ''
+  const untracked = parseStatus(await gitOut($, g.ref.racine, ['status', '--porcelain', '-z', '--untracked-files=all']))
+    .filter(e => e.x === '?' && scope.includes(e.p))
+    .map(e => e.p)
+    .slice(0, 50)
+  const io = ioOf($)
+  const added: string[] = []
+  for (const p of untracked) {
+    const t = await io.fs.read(`${normalizePath(g.ref.racine)}/${p}`).catch(() => undefined)
+    if (typeof t !== 'string') continue
+    const lines = t.split(/\r?\n/)
+    added.push(`diff --git a/${p} b/${p}\nnew file mode 100644\n--- /dev/null\n+++ b/${p}\n@@ -0,0 +1,${lines.length} @@\n${lines.map(l => `+${l}`).join('\n')}`)
+  }
+  return [tracked, ...added].filter(Boolean).join('\n')
+}
+
+/**
+ * La triche dans le diff du flow (§8) : signalée dans le panneau ; une triche bloquante (test gelé ou garde-fou modifié) est
+ * soumise à l'utilisateur (Accepter / Refuser ; Échap et sans personne : Refuser) et garde la porte rouge sans son accord.
+ */
+async function checkCheats($: $, g: Gate, scope: string[]) {
+  // Le diff part du commit de départ : il contient toujours la création des tests par le testeur. « test gelé modifié » n'est donc
+  // retenu que pour un fichier que le re-hash a trouvé changé depuis le gel (checkFrozen, qui a déjà posé sa question).
+  g.triches = detectCheats(await flowDiff($, g, scope), g.gel).filter(
+    t => t.motif !== FROZEN_MOTIF || g.gelesModifies.some(m => unfreeze([{ p: m.p, h: '-', par: m.par }], t.fichier).length === 0),
+  )
+  for (const t of g.triches.filter(x => x.bloquant && x.motif !== FROZEN_MOTIF)) {
+    const key = `${t.motif}|${t.fichier}`
+    if (g.decisions.has(key)) continue
+    const { answer } = await askGate(
+      $,
+      g,
+      `revo-flow a repéré dans le diff du flow : ${t.motif}, ${t.fichier}${t.extrait ? ` (${t.extrait})` : ''}. Accepter ce changement ?`,
+      ['Accepter', 'Refuser'],
+      { headless: 'Refuser', dismissed: 'Refuser' },
+      `${t.motif} : ${t.fichier}`,
+    )
+    g.decisions.set(key, answer === 'Accepter' ? 'accepte' : 'refuse')
+  }
+}
+
+/**
+ * La porte pour l'état actuel du flow : celle déjà lancée si rien n'a bougé depuis (même seq), sinon une nouvelle, en file
+ * derrière les autres exécutions. undefined : pas de porte (off, commandes non confirmées, revo-flow en erreur).
+ */
+function ensureGate($: $, force = false): Promise<VerifResultat | undefined> {
+  const g = gate
+  if (!g || g.mode === 'off') return Promise.resolve(undefined)
+  if (!force && g.porte && g.porte.seq === g.seq) return g.porte.promesse
+  const porte = { seq: g.seq, fini: false, promesse: Promise.resolve<VerifResultat | undefined>(undefined) }
+  porte.promesse = serial(() => runGlobalGate($, g)).finally(() => {
+    porte.fini = true
+  })
+  g.porte = porte
+  return porte.promesse
+}
+
+/**
+ * La porte globale (§7) : toutes les commandes confirmées sur la portée du flow, comparées à la base, puis re-hash des tests
+ * gelés et détection de triche. Commandes encore à confirmer (Ajuster sans suite) : la question revient une dernière fois.
+ */
+async function runGlobalGate($: $, g: Gate): Promise<VerifResultat | undefined> {
+  if (g.proposees) {
+    const p = g.proposees
+    const { answer, how } = await askGate($, g, commandsQuestion(g.ref.nom, p.commandes, p.pieges), ['Utiliser', 'Pas de vérification'], { headless: 'Utiliser', dismissed: 'Pas de vérification' }, 'Confirmer les commandes de vérification')
+    g.proposees = undefined
+    if (answer !== 'Utiliser') {
+      g.mode = 'off'
+      await setView($, g, { mode: 'off', etat: 'off' })
+      await persistVerif($, g)
+      return undefined
+    }
+    if (how === 'headless') g.mode = 'observer'
+    const le = new Date(await $.clock.now()).toISOString()
+    await saveVerif($, g.ref, v => ({ commandes: p.commandes, manifestes: p.hashes, confirme: { le, par: how === 'headless' ? 'headless' : 'utilisateur' }, instables: v?.instables ?? [], pieges: p.pieges, bases: v?.bases ?? [] }))
+    await setView($, g, { mode: g.mode })
+    await persistVerif($, g)
+  }
+  await g.base?.catch(() => undefined)
+  const pv = verifOf(g)
+  if (!pv?.commandes.length) return undefined
+  try {
+    const scope = await flowScope($, g)
+    await setView($, g, { etat: 'en_cours', commandes: [] })
+    const graph = graphCache.get(g.ref.cle)?.graph
+    const testsOf = testsOfGraph(graph)
+    const annotes = await annotesOf($, g, scope)
+    const r = await runGate(await verifIoOf($, g), pv, {
+      changed: scope,
+      files: Object.keys(graph?.fichiers ?? {}),
+      ...(testsOf ? { testsOf } : {}),
+      ...(annotes.length ? { annotes } : {}),
+      commit: g.commit,
+      onProgress: c => void onCommand($, g, c).catch(() => undefined),
+    })
+    await keepLearned($, g, r.verif)
+    g.dernier = r.resultat
+    g.dureeMs += r.resultat.dureeMs
+    g.erreur = false
+    // Lot 2 : les tests gelés, puis la triche ; leurs questions passent avant le verdict.
+    await checkFrozen($, g)
+    await checkCheats($, g, scope)
+    await showResult($, g)
+    return r.resultat
+  } catch {
+    // Un plantage de revo-flow ouvre la porte : le flow sera « non vérifié (erreur de revo-flow) ».
+    g.erreur = true
+    await setView($, g, { etat: 'erreur' })
+    return undefined
+  } finally {
+    if (verifStatus) {
+      verifStatus = undefined
+      statusLine = undefined
+    }
+  }
+}
+
+/** « 2 erreurs nouvelles de typage dans stores/booking/Cart.ts » : la phrase de la question de fin. */
+function redSummary(g: Gate, r: VerifResultat): string {
+  const fresh = r.erreurs.filter(x => x.statut === 'nouvelle' || x.statut === 'nouvelle?')
+  const outils = [...new Set(fresh.map(x => x.outil))]
+  const fichiers = [...new Set(fresh.map(x => x.fichier))]
+  const parts = [
+    ...(fresh.length
+      ? [`${fresh.length} erreur${fresh.length > 1 ? 's' : ''} nouvelle${fresh.length > 1 ? 's' : ''} de ${outils.join(', ')} dans ${fichiers.slice(0, 2).join(', ')}${fichiers.length > 2 ? ` et ${fichiers.length - 2} autres` : ''}`]
+      : r.etat !== 'vert'
+        ? [r.commandes.filter(c => c.etat === 'ko' || c.etat === 'erreur').map(c => `${c.id} en échec`).join(', ') || 'porte rouge']
+        : []),
+    ...blockers(g),
+  ]
+  return parts.join(' ; ')
+}
+
+/** Le texte du block : le rapport borné de la porte (reportText), plus ce qui bloque au titre des garde-fous. */
+function blockText(g: Gate, r: VerifResultat): string {
+  const extra = blockers(g)
+  return [
+    reportText(r, { tentative: g.blocks, maxTentatives: MAX_TENTATIVES + g.encore }),
+    ...(extra.length ? ['', 'Garde-fous :', ...extra.map(x => `- ${x}`)] : []),
+    '',
+    `Décide : corrige toi-même, ou reprends l'agent concerné avec SendMessage, puis conclus de nouveau ; ou demande une exception (${VERIF_TOOL} action exception, avec motif) si l'erreur ne relève pas de ce flow.`,
+  ].join('\n')
+}
+
+/**
+ * La question de fin (§4), plafond atteint ou exception demandée : Terminer non vérifié / Une tentative de plus / Voir le détail
+ * (ouvre la sortie, puis la question revient). Sans personne : terminer non vérifié, marqué ; Échap : une tentative de plus.
+ */
+async function endQuestion($: $, g: Gate, r: VerifResultat, motif?: string): Promise<'terminer' | 'encore'> {
+  for (let i = 0; i < 3; i++) {
+    const q = `La vérification reste rouge${g.portes ? ` après ${plural(g.portes, 'tentative')}` : ''} : ${redSummary(g, r)}.${motif ? ` L’orchestrateur demande une exception : « ${motif} ».` : ''} Terminer quand même ?`
+    const { answer, how } = await askGate($, g, q, FIN, { headless: 'Terminer non vérifié', dismissed: 'Une tentative de plus' }, 'Terminer non vérifié ?')
+    if (answer === 'Voir le détail') {
+      await openVerif($)
+      continue
+    }
+    if (answer === 'Terminer non vérifié') {
+      g.libre = true
+      g.accepte = how === 'utilisateur'
+      await persistVerif($, g)
+      return 'terminer'
+    }
+    return 'encore'
+  }
+  return 'encore'
+}
+
+/** Le tour de l'orchestrateur attend-il ses agents (travail de fond) ? Alors ce n'est pas sa conclusion. */
+const waitsForAgents = (tasks: readonly { type: string; status: string }[] | undefined) =>
+  (tasks ?? []).some(t => t.type === 'subagent' && !/^(completed|failed|killed|stopped|done)$/i.test(t.status))
+
+/**
+ * La porte de fin (classic.Stop de l'orchestrateur, §2 étapes 10 à 12). Seulement en conclusion d'un flow vérifié (tous les
+ * agents ont fini) et pas pendant que le tour attend ses agents. Observer : la porte tourne, rien ne bloque. Bloquer : vert,
+ * porte levée ou porte en erreur → le tour finit ; rouge → block avec le rapport, 3 fois au plus, puis la question de fin.
+ * Rend le texte du block, ou rien.
+ */
+async function stopGate($: $, e: { stop_hook_active?: boolean; background_tasks?: readonly { type: string; status: string }[] }): Promise<string | undefined> {
+  const g = gate
+  const flow = await read($, flowA)
+  if (!g || !flow || flow.id !== g.flowId || flow.isStopped || g.mode === 'off') return undefined
+  if (!(flow.phase === 'review' || (flow.phase === 'running' && allFinished(flow)))) return undefined
+  if (waitsForAgents(e.background_tasks)) return undefined
+  if (g.mode === 'observer') {
+    void ensureGate($).catch(() => undefined)
+    return undefined
+  }
+  if (g.libre) return undefined
+  // stop_hook_active : cette fin de tour suit un block. Le plafond se compte par flow ; ce compte des relances consécutives
+  // est un second garde-fou, au cas où le premier serait faux (rechargement du mod) : au-delà, le tour finit.
+  g.relances = e.stop_hook_active === true ? g.relances + 1 : 0
+  if (g.relances > MAX_TENTATIVES + g.encore + 1) return undefined
+  g.portes++
+  await setView($, g, { tentative: g.portes })
+  const r = await ensureGate($)
+  if (gate !== g || !r) return undefined
+  if (g.premierRouge === undefined) g.premierRouge = !isGreen(g, r)
+  await persistVerif($, g)
+  if (isGreen(g, r)) return undefined
+  // Des commandes qui n'ont pas pu tourner, sans erreur nouvelle ni garde-fou : rien que l'orchestrateur puisse corriger.
+  if (r.etat === 'erreur' && !blockers(g).length) return undefined
+  if (g.blocks >= MAX_TENTATIVES + g.encore) {
+    if ((await endQuestion($, g, r)) === 'terminer') return undefined
+    g.encore++
+  }
+  g.blocks++
+  await persistVerif($, g)
+  return blockText(g, r)
+}
+
+/** Le champ verif du journal (graphe et store) pour la porte de ce flow. */
+function verifJournal(g: Gate): VerifJournal {
+  const r = g.dernier
+  const fresh = r?.erreurs.filter(x => x.statut === 'nouvelle' || x.statut === 'nouvelle?').length ?? 0
+  const old = r?.erreurs.filter(x => x.statut === 'preexistante').length ?? 0
+  const green = r ? isGreen(g, r) : false
+  const etat: VerifJournal['etat'] = g.mode === 'off' ? 'off' : g.erreur ? 'erreur' : g.mode === 'observer' ? 'observe' : green ? 'verifie' : 'non-verifie'
+  const ok = g.verdicts?.filter(v => v.verdict === 'ok').length ?? 0
+  return {
+    etat,
+    tentatives: Math.max(g.portes, r ? 1 : 0),
+    premierRouge: g.premierRouge ?? (r ? !green : false),
+    nouvelles: fresh,
+    preexistantes: old,
+    dureeMs: g.dureeMs,
+    triches: g.triches.length,
+    ...(g.accepte && !green ? { accepte: true } : {}),
+    ...(g.criteres.length ? { criteres: { total: g.criteres.length, ok } } : {}),
+  }
+}
+
+/** Le segment de la notification de fin : « vérifié ✓ », « non vérifié (typecheck ✗) », « non vérifié (erreur de revo-flow) ». */
+function verifSegment(g: Gate): string {
+  if (g.mode === 'off') return ''
+  if (g.erreur) return 'non vérifié (erreur de revo-flow)'
+  const r = g.dernier
+  if (!r) return ''
+  const line = summaryLine(r)
+  if (r.etat === 'vert' && blockers(g).length) return 'non vérifié (garde-fou refusé)'
+  const prefix = g.mode === 'observer' ? 'vérif observée : ' : ''
+  return `${prefix}${line}${g.accepte && !isGreen(g, r) ? ' · accepté' : ''}`
+}
+
+/** Le testeur a fini : ses fichiers de test (ceux qu'il a modifiés) sont gelés à leur hash git (§8). */
+async function freezeTester($: $, a: FlowAgent) {
+  const g = gate
+  if (!g) return
+  const mine = [
+    ...new Set(
+      (await read($, entries))
+        .filter(x => x.by === a.key)
+        .map(x => relTo(g.ref.racine, x.path))
+        .filter((p): p is string => !!p && isTestFile(p, g.ref.racine)),
+    ),
+  ]
+  if (!mine.length) return
+  const hashes = await hashFiles($, g.ref.racine, mine)
+  const files = mine.filter(p => hashes[p]).map(p => ({ p, h: hashes[p]! }))
+  if (!files.length) return
+  g.gel = freeze(files, a.key, g.gel)
+  await persistVerif($, g)
+  await setView($, g, { geles: g.gel.map(x => ({ p: x.p })) })
+  $.ui.toast(`revo-flow : ${plural(files.length, 'test')} de « ${a.name} » ${files.length > 1 ? 'gelés' : 'gelé'}`)
+}
+
+/**
+ * Le refus d'une édition (Edit, Write, NotebookEdit) au titre du gel : le testeur ne touche qu'aux fichiers de test, un test gelé
+ * ne se modifie que par son auteur jusqu'au dégel. Rien hors d'un flow vérifié.
+ */
+async function editDenial($: $, e: { agentId?: string }): Promise<string | undefined> {
+  const g = gate
+  if (!g) return undefined
+  const flow = await read($, flowA)
+  if (!flow || flow.id !== g.flowId || flow.phase === 'done') return undefined
+  const input = e as unknown as Record<string, unknown>
+  const raw = text(input.file_path) || text(input.notebook_path)
+  if (!raw) return undefined
+  const who = whoIs(flow, e.agentId) ?? e.agentId ?? ''
+  const a = who && who !== 'lead' ? flow.agents.find(x => x.key === who) : undefined
+  if (a && isTester(a)) {
+    const deny = testerDenial(raw, g.ref.racine)
+    if (deny) return deny
+  }
+  return g.gel.length ? frozenDenial(g.gel, relTo(g.ref.racine, raw) ?? raw, who) : undefined
+}
+
+/** Le gel est-il actif (des tests gelés, ou un testeur au travail) ? Le .catch du hook d'édition refuse alors par prudence. */
+const isGelActive = () => !!gate && (gate.gel.length > 0 || testerAgents.size > 0)
+
+const GEL_ERROR = 'revo-flow : le contrôle des tests gelés a échoué ; modification refusée par prudence, réessaie.'
+
+/** Les commandes confirmées du projet, telles que le vérificateur peut les lancer (argv). */
+const confirmedArgv = () => (gate ? (verifOf(gate)?.commandes ?? []).map(c => c.argv) : [])
+
+/** La consigne de tâche du vérificateur : critères, git diff --stat du flow, commandes confirmées, triches repérées. */
+async function verifierBrief($: $): Promise<string | undefined> {
+  const g = gate
+  if (!g) return undefined
+  const stat = g.commit ? await gitOut($, g.ref.racine, ['diff', '--stat', g.commit, '--']) : ''
+  return verifierTask(g.criteres, stat, verifOf(g)?.commandes ?? [], g.triches)
+}
+
+/** La réponse du vérificateur : un verdict par critère (parseVerdicts), dans le panneau ; une réponse sans aucun verdict lisible ne remplace pas la précédente. */
+async function readVerdicts($: $, answer: string) {
+  const g = gate
+  if (!g || !g.criteres.length) return
+  const verdicts = parseVerdicts(answer, g.criteres)
+  const readable = verdicts.some(v => !/^pas de verdict|^réponse du vérificateur illisible/.test(v.preuve))
+  if (!readable && g.verdicts) return
+  g.verdicts = verdicts
+  await setView($, g, { criteres: { total: g.criteres.length, ok: verdicts.filter(v => v.verdict === 'ok').length, verdicts } })
+}
+
+/**
+ * Après un rechargement du mod en plein flow : la porte est reconstruite depuis l'atom verifFlow (gel, critères, tentatives)
+ * et le graphe (commandes) ; la base qui tournait est perdue, ses erreurs seront « nouvelle ? ».
+ */
+async function restoreVerif($: $) {
+  const flow = await read($, flowA)
+  const saved = await read($, verifFlowA)
+  if (gate || !flow || flow.phase === 'done' || !saved || saved.flowId !== flow.id) return
+  const ref = await resolveProject(ioOf($)).catch(() => undefined)
+  if (!ref) return
+  flowRef = flowRef ?? ref
+  await graphOf($, ref).catch(() => null)
+  gate = {
+    flowId: saved.flowId,
+    mode: saved.mode,
+    ref,
+    commit: saved.commit,
+    saleAuDepart: new Set(),
+    seq: 0,
+    blocks: saved.blocks,
+    encore: 0,
+    relances: 0,
+    portes: saved.portes,
+    dureeMs: 0,
+    gel: saved.gel,
+    gelesModifies: [],
+    triches: [],
+    decisions: new Map(),
+    criteres: saved.criteres,
+    ...(saved.accepte ? { accepte: true, libre: true } : {}),
+  }
+  await update($, verifA, v => (v ? { ...v, base: v.base === 'en_cours' ? 'absente' : v.base, etat: v.etat === 'en_cours' || v.etat === 'base' ? 'attente' : v.etat } : v))
+}
+
+/** Un `verif lancer` d'un agent : seulement ses fichiers (ceux qu'il a modifiés, ou ceux qu'il donne), rapport limité à eux. */
+async function lancerTool($: $, g: Gate, who: string, e: Record<string, unknown>): Promise<string> {
+  if (g.mode === 'off') return 'revo-flow verif : pas de vérification pour ce flow (option ou choix de l’utilisateur) ; continue.'
+  if (g.proposees) return 'revo-flow verif : les commandes de vérification attendent encore la confirmation de l’utilisateur ; continue, la porte de fin vérifiera.'
+  const given = (Array.isArray(e.fichiers) ? e.fichiers : []).map(text).filter(Boolean).map(p => relTo(g.ref.racine, p) ?? p)
+  const flow = await read($, flowA)
+  const mine =
+    who === 'lead'
+      ? await flowScope($, g)
+      : (await read($, entries))
+          .filter(x => x.by === who)
+          .map(x => relTo(g.ref.racine, x.path))
+          .filter((p): p is string => !!p)
+  const files = await existing($, g, [...new Set([...mine, ...given])])
+  if (!files.length) return 'revo-flow verif : aucun fichier modifié à ton nom, rien à vérifier (donne-les dans « fichiers » si tu les as créés par Bash).'
+  await g.base?.catch(() => undefined)
+  const pv = verifOf(g)
+  if (!pv?.commandes.length) return 'revo-flow verif : aucune commande de vérification confirmée pour ce projet ; continue.'
+  const graph = graphCache.get(g.ref.cle)?.graph
+  const testsOf = testsOfGraph(graph)
+  const only = who === 'lead' ? undefined : files
+  const annotes = await annotesOf($, g, files)
+  const r = await serial(async () => {
+    await setView($, g, { etat: 'en_cours', commandes: [] })
+    try {
+      return await runGate(await verifIoOf($, g), pv, {
+        changed: files,
+        files: Object.keys(graph?.fichiers ?? {}),
+        ...(testsOf ? { testsOf } : {}),
+        ...(annotes.length ? { annotes } : {}),
+        commit: g.commit,
+        ...(only ? { seulement: only } : {}),
+        onProgress: c => void onCommand($, g, c).catch(() => undefined),
+      })
+    } finally {
+      verifStatus = undefined
+    }
+  })
+  await keepLearned($, g, r.verif)
+  // Le panneau montre l'exécution ; la porte de fin reste celle de tout le flow.
+  await setView($, g, { etat: g.dernier ? (isGreen(g, g.dernier) ? 'vert' : 'rouge') : 'attente', commandes: r.resultat.commandes })
+  const name = flow?.agents.find(a => a.key === who)?.name
+  return `${name ? `revo-flow verif (« ${name} », ${plural(files.length, 'fichier')}) :\n` : ''}${reportText(r.resultat, { ...(only ? { seulement: only } : {}) })}`
+}
+
+/** Une commande proposée par l'orchestrateur : validée champ par champ, source « orchestrateur » si elle est nouvelle. */
+function commandOf(raw: unknown, known: VerifCommande[]): VerifCommande | string {
+  const o = typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : {}
+  const id = text(o.id)
+  const outils: VerifOutil[] = ['lint', 'typage', 'tests', 'format', 'generation']
+  const portees: VerifPortee[] = ['fichiers', 'lies', 'projet']
+  const formats: VerifFormat[] = ['eslint-json', 'tsc', 'vitest-json', 'jest-json', 'biome', 'dart-machine', 'flutter-json', 'texte']
+  const argv = Array.isArray(o.argv) ? o.argv.filter((x): x is string => typeof x === 'string' && x.length > 0) : []
+  if (!id) return 'une commande sans « id »'
+  if (!outils.includes(text(o.outil) as VerifOutil)) return `« ${id} » : outil doit être lint, typage, tests, format ou generation`
+  if (!argv.length) return `« ${id} » : argv vide (la commande mot à mot, sans shell)`
+  if (!portees.includes(text(o.portee) as VerifPortee)) return `« ${id} » : portee doit être fichiers, lies ou projet`
+  const format = formats.includes(text(o.format) as VerifFormat) ? (text(o.format) as VerifFormat) : 'texte'
+  const same = known.find(k => k.id === id)
+  const unchanged = same && same.argv.join('\u0000') === argv.join('\u0000') && same.portee === text(o.portee)
+  return {
+    id,
+    outil: text(o.outil) as VerifOutil,
+    argv,
+    portee: text(o.portee) as VerifPortee,
+    format,
+    source: same && unchanged ? same.source : 'orchestrateur',
+    ...(text(o.declencheur) ? { declencheur: text(o.declencheur) } : {}),
+    ...(same?.dureeMs !== undefined ? { dureeMs: same.dureeMs } : {}),
+    ...(texts(o.exclus).length ? { exclus: texts(o.exclus) } : same?.exclus?.length ? { exclus: same.exclus } : {}),
+  }
+}
+
+/** `verif commandes` (orchestrateur) : une liste corrigée, ou des tests à exclure d'une commande ; toujours reposée à l'utilisateur. */
+async function commandesTool($: $, g: Gate, e: Record<string, unknown>): Promise<string> {
+  const pv = verifOf(g)
+  const known = g.proposees?.commandes ?? pv?.commandes ?? []
+  let list: VerifCommande[]
+  if (Array.isArray(e.commandes) && e.commandes.length) {
+    const parsed = e.commandes.map(c => commandOf(c, known))
+    const bad = parsed.find((c): c is string => typeof c === 'string')
+    if (bad) return `revo-flow verif : commandes refusées : ${bad}.`
+    list = parsed as VerifCommande[]
+  } else if (texts(e.exclus).length) {
+    const id = text(e.commande)
+    const target = known.find(c => c.id === id)
+    if (!target) return `revo-flow verif : « commande » = l’id d’une commande connue (${known.map(c => c.id).join(', ') || 'aucune'}).`
+    list = known.map(c => (c.id === id ? { ...c, exclus: [...new Set([...(c.exclus ?? []), ...texts(e.exclus)])] } : c))
+  } else return 'revo-flow verif : donne « commandes » (la liste corrigée) ou « commande » et « exclus » (les motifs de tests à exclure).'
+  const pieges = g.proposees?.pieges ?? pv?.pieges ?? []
+  const hashes = g.proposees?.hashes ?? pv?.manifestes ?? {}
+  const wasOff = g.mode === 'off'
+  if (wasOff) g.mode = opts.verif
+  const note = await confirmCommands($, g, list, pieges, hashes)
+  if (gate !== g) return 'revo-flow verif : le flow a changé entre-temps.'
+  if (note) return `revo-flow verif : l’utilisateur veut encore ajuster ; demande-lui quoi, puis rappelle l’action commandes.\n${note}`
+  if (g.mode === 'off') return 'revo-flow verif : l’utilisateur ne veut pas de vérification pour ce flow.'
+  return `revo-flow verif : ${plural(list.length, 'commande')} confirmée${list.length > 1 ? 's' : ''} par l’utilisateur et enregistrée${list.length > 1 ? 's' : ''} pour ${g.ref.nom}.`
+}
+
+/** L'outil verif : lancer, resultat, commandes, exception, degeler. Les trois dernières sont réservées à l'orchestrateur. */
+async function verifTool($: $, e: Record<string, unknown> & { agentId?: string }): Promise<string> {
+  const action = text(e.action).toLowerCase()
+  const g = gate
+  const flow = await read($, flowA)
+  if (!g || !flow || flow.id !== g.flowId || flow.phase === 'done') return 'revo-flow verif : aucun flow vérifié en cours ; continue.'
+  const who = whoIs(flow, e.agentId) ?? e.agentId ?? 'lead'
+  const leadOnly = (s: string) => (who === 'lead' ? undefined : `revo-flow verif : l’action ${s} est réservée à l’orchestrateur ; dis-lui ce qu’il faut dans ta réponse.`)
+  switch (action) {
+    case 'lancer':
+      return lancerTool($, g, who, e)
+    case 'resultat': {
+      if (!g.dernier) return g.porte && !g.porte.fini ? 'revo-flow verif : la porte tourne encore ; rappelle resultat dans un moment.' : 'revo-flow verif : aucune porte encore lancée (elle part quand tous les agents ont fini).'
+      const extra = blockers(g)
+      const crit = g.verdicts?.length ? [`Critères : ${g.verdicts.map(v => `${v.id} ${v.verdict}`).join(', ')}`] : []
+      return [reportText(g.dernier, { tentative: g.portes, maxTentatives: MAX_TENTATIVES }), ...extra.map(x => `- ${x}`), ...crit].join('\n')
+    }
+    case 'commandes':
+      return leadOnly('commandes') ?? commandesTool($, g, e)
+    case 'exception': {
+      const denied = leadOnly('exception')
+      if (denied) return denied
+      const motif = text(e.motif)
+      if (!motif) return 'revo-flow verif : « motif » manquant (pourquoi terminer malgré la porte rouge, en une phrase).'
+      const r = g.dernier
+      if (!r || isGreen(g, r)) return 'revo-flow verif : la porte n’est pas rouge, pas d’exception à demander.'
+      const choice = await endQuestion($, g, r, motif)
+      if (choice === 'terminer') return 'revo-flow verif : l’utilisateur accepte de terminer non vérifié ; conclus (le flow sera marqué non vérifié).'
+      if (g.blocks >= MAX_TENTATIVES + g.encore) g.encore++
+      await persistVerif($, g)
+      return 'revo-flow verif : l’utilisateur veut une tentative de plus : corrige, puis conclus.'
+    }
+    case 'degeler': {
+      const denied = leadOnly('degeler')
+      if (denied) return denied
+      const motif = text(e.motif)
+      const asked = [...texts(e.fichiers), text(e.chemin)].filter(Boolean).map(p => relTo(g.ref.racine, p) ?? p)
+      if (!motif || !asked.length) return 'revo-flow verif : donne « fichiers » (les tests gelés à dégeler) et « motif » (pourquoi le test est faux).'
+      const targets = g.gel.filter(x => asked.some(p => unfreeze([x], p).length === 0))
+      if (!targets.length) return `revo-flow verif : aucun de ces fichiers n’est gelé (gelés : ${g.gel.map(x => x.p).join(', ') || 'aucun'}).`
+      const { answer } = await askGate(
+        $,
+        g,
+        `L’orchestrateur demande de dégeler ${targets.map(x => x.p).join(', ')} : « ${motif} ». Dégeler ?`,
+        ['Dégeler', 'Garder gelé'],
+        { headless: 'Garder gelé', dismissed: 'Garder gelé' },
+        'Dégeler un test ?',
+      )
+      if (answer !== 'Dégeler') return 'revo-flow verif : l’utilisateur garde ces tests gelés ; corrige le code de production.'
+      for (const x of targets) g.gel = unfreeze(g.gel, x.p)
+      await persistVerif($, g)
+      await setView($, g, { geles: g.gel.map(x => ({ p: x.p })) })
+      return `revo-flow verif : ${targets.map(x => x.p).join(', ')} dégelé${targets.length > 1 ? 's' : ''} par l’utilisateur.`
+    }
+    default:
+      return `revo-flow verif : action « ${action} » inconnue (lancer, resultat, commandes, exception, degeler).`
+  }
 }
 
 // ── Commande cache ───────────────────────────────────────────────────────
@@ -1353,6 +2542,7 @@ async function viewData($: $): Promise<ViewData> {
     sessionCostUsd: await read($, sessionCostA),
     cache: await read($, cacheStatsA),
     cacheOpen: await read($, cacheOpenA),
+    verif: await read($, verifA),
   }
 }
 
@@ -1367,6 +2557,8 @@ function paneActions($: $): PaneActions {
     cancelPlan: () => cancelPlan($),
     openPlan: () => openPlan($),
     toggleCache: () => update($, cacheOpenA, v => !v),
+    openVerif: () => openVerif($),
+    rerunVerif: () => rerunVerif($),
   }
 }
 
@@ -1421,6 +2613,9 @@ async function afterEnd($: $, key: string, outcome: Outcome) {
   const a = flow?.agents.find(x => x.key === key)
   if (!flow || !a) return
   const dependents = flow.agents.filter(x => x.status === 'blocked' && x.waitingFor?.key === key)
+  if (a.agentId ?? a.lastAgentId) testerAgents.delete((a.agentId ?? a.lastAgentId)!)
+  // Le testeur a fini : ses tests sont gelés avant que quiconque reprenne (§8).
+  if (outcome === 'done' && isTester(a)) await freezeTester($, a).catch(() => undefined)
   if (outcome === 'done') {
     for (const x of dependents) await relaunch($, x.key, `« ${a.name} » a fini, « ${x.name} » l’attendait :`)
     return
@@ -1469,8 +2664,19 @@ function blockedNote($: $, a: FlowAgent, why: 'en échec' | 'hors plan' | 'atten
     .catch(() => undefined)
 }
 
-/** Tous les agents ont fini pendant l'exécution : l'orchestrateur passe à la vérification. */
-const toReview = ($: $) => setFlow($, f => (f.phase === 'running' && allFinished(f) ? { ...f, phase: 'review' } : f))
+/**
+ * Tous les agents ont fini pendant l'exécution : l'orchestrateur passe à la vérification, et la porte globale part aussitôt en
+ * fond, pendant qu'il lit les réponses (§2 étape 8) ; souvent prête quand il conclut.
+ */
+async function toReview($: $) {
+  let isReview = false as boolean
+  await setFlow($, f => {
+    if (f.phase !== 'running' || !allFinished(f)) return f
+    isReview = true
+    return { ...f, phase: 'review' }
+  })
+  if (isReview && gate && gate.mode !== 'off') void ensureGate($).catch(() => undefined)
+}
 
 /**
  * L'état réel des sous-agents, lu auprès de Claude Code : la fin d'un tour ne veut pas dire que l'agent a fini
@@ -1653,14 +2859,30 @@ async function writePlanFile($: $, plan: PlanInput, flow: Flow): Promise<string 
 /** Bouton « plan.md » : ouvre le fichier du plan dans l'application par défaut du système ; sinon, un toast donne son chemin. */
 async function openPlan($: $) {
   const file = (await read($, flowA))?.planFile
-  if (!file) return
-  const isWindows = Boolean(await $.env.get('USERPROFILE').catch(() => undefined))
-  const tries = isWindows ? [['cmd', '/c', 'start', '', file.replace(/\//g, '\\')]] : [['open', file], ['xdg-open', file]]
+  if (file) await openFile($, file, 'le plan')
+}
+
+/** Bouton « Détail » de la vérification : la sortie complète de la dernière commande rouge, comme plan.md. */
+async function openVerif($: $) {
+  const file = (await read($, verifA))?.detail
+  if (file) await openFile($, file, 'la sortie complète')
+}
+
+/** Ouvre un fichier dans l'application par défaut du système (cmd /c start sous Windows) ; sinon, un toast donne son chemin. */
+async function openFile($: $, file: string, what: string) {
+  const tries = (await isWindows($)) ? [['cmd', '/c', 'start', '', file.replace(/\//g, '\\')]] : [['open', file], ['xdg-open', file]]
   for (const argv of tries) {
     const r = await $.process.run(argv, { timeoutMs: 5000 }).catch(() => undefined)
     if (r?.exitCode === 0) return
   }
-  $.ui.toast(`revo-flow : le plan est dans ${file}`)
+  $.ui.toast(`revo-flow : ${what} est dans ${file}`)
+}
+
+/** Bouton « Relancer » de la vérification : une nouvelle porte sur l'état actuel du flow, en fond. */
+async function rerunVerif($: $) {
+  const flow = await read($, flowA)
+  if (!gate || !flow || flow.id !== gate.flowId || gate.mode === 'off') return
+  void ensureGate($, true).catch(() => undefined)
 }
 
 function statusText(flow: Flow | null) {
@@ -1679,6 +2901,8 @@ function readOptions(o: PluginOptions) {
   opts.conflits = o.conflits === 'refuser' ? 'refuser' : 'avertir'
   opts.notifier = o.notifier !== false
   opts.cache = o.cache !== false
+  // La porte de vérification (v2) : bloquer par défaut ; observer la fait tourner sans jamais bloquer ; off la retire.
+  opts.verif = o.verif === 'observer' || o.verif === 'off' ? o.verif : 'bloquer'
 }
 
 // ── Les hooks ────────────────────────────────────────────────────────────
@@ -1703,6 +2927,9 @@ export const register: Register = (on, options) => {
       if (opts.cache) await registerCacheTool($).catch(() => undefined)
     }
     await registerIndexer($)
+    await registerVerifier($)
+    // Rechargé en plein flow vérifié : la porte revient (gel, critères, tentatives) ; la base qui tournait est perdue.
+    await restoreVerif($).catch(() => undefined)
     await migrate($)
     await purge($)
     await loadTokens($)
@@ -1803,12 +3030,14 @@ export const register: Register = (on, options) => {
     }
     // Le brief du cache (si une fiche correspond, après confirmation) ; sans graphe possible, on continue sans.
     const brief = await startFlowCache($, String(now), args).catch(() => undefined)
+    // Les commandes de vérification du projet (confirmées une fois), puis la base de référence en fond ; jamais bloquant.
+    const verifNote = await startVerif($, String(now)).catch(() => undefined)
     // Le rôle d'orchestrateur est une note cachée laissée au modèle par la commande ; la demande part ensuite
     // comme si l'utilisateur l'avait tapée. Sans /revo-flow, rien de tout cela n'est ajouté.
     $.clock.after(0, () => void $.prompt.submit({ text: args, asUser: true }).catch(() => undefined))
     return {
       text: `revo-flow : ${modelLabel(model)} lit la demande et les specs, puis prépare le plan et l’équipe d’agents…`,
-      context: brief ? [LEAD_BRIEF, brief] : [opts.cache ? LEAD_BRIEF : leadBrief(false)],
+      context: [leadBrief(opts.cache, opts.verif !== 'off'), ...(brief ? [brief] : []), ...(verifNote ? [verifNote] : [])],
     }
   })
 
@@ -1876,6 +3105,8 @@ export const register: Register = (on, options) => {
       return next(e)
     }
     if (e.agentId) {
+      // Le vérificateur : son verdict par critère va au panneau (VerifView.criteres).
+      if (verifierAgents.has(e.agentId) && e.answer) await readVerdicts($, e.answer).catch(() => undefined)
       const a = flow.agents.find(x => x.agentId === e.agentId)
       if (a) {
         await setAgent($, a.key, x => ({ ...x, hasEndedTurn: true, isDoing: false }))
@@ -1997,17 +3228,32 @@ export const register: Register = (on, options) => {
       e.description,
       e.name,
     )
-    if (!a) return next(e)
+    if (!a) {
+      // Un vérificateur lancé hors plan : sa tâche (critères, diff, commandes) s'ajoute à son prompt et son Bash sera filtré.
+      if (e.subagentType !== VERIFIER_TYPE) return next(e)
+      const task = await verifierBrief($).catch(() => undefined)
+      const r = await next(task ? { ...e, prompt: `${e.prompt}\n\n${task}` } : e)
+      if (r.deny === undefined && r.agentId) verifierAgents.add(r.agentId)
+      return r
+    }
     claimed.add(a.key)
     const others = flow.agents.filter(x => x.key !== a.key).map(x => x.name)
     // L'extrait de la fiche servie qui concerne cet agent, après ses consignes.
     const extract = await agentCacheExtract($, a, e.prompt)
-    const prompt = `${e.prompt}\n\n${agentBrief(a, await agentCacheMode($), others)}${extract ? `\n\n${extract.text}` : ''}`
-    const r = await next({ ...e, model: MODELS[a.model].id, prompt })
+    // La vérification (v2) : la consigne « verif lancer » si la porte est active ; la consigne du testeur et les critères pour un
+    // testeur ; la tâche du vérificateur (critères, diff, commandes, triches) pour un vérificateur, dont le type est imposé.
+    const isVerifOn = !!gate && gate.flowId === flow.id && gate.mode !== 'off'
+    const criteres = gate?.flowId === flow.id ? gate.criteres : []
+    const tester = isTester(a) ? `\n\n${TESTER_BRIEF}${criteres.length ? `\n\nCritères d'acceptation du plan :\n${criteres.map(c => `- ${c.id} : ${c.texte}`).join('\n')}` : ''}` : ''
+    const verifier = isVerifier(a) ? await verifierBrief($).catch(() => undefined) : undefined
+    const prompt = `${e.prompt}\n\n${agentBrief(a, await agentCacheMode($), others, isVerifOn)}${tester}${verifier ? `\n\n${verifier}` : ''}${extract ? `\n\n${extract.text}` : ''}`
+    const r = await next({ ...e, model: MODELS[a.model].id, prompt, ...(isVerifier(a) ? { subagentType: VERIFIER_TYPE } : {}) })
     if (r.deny !== undefined || !r.agentId) {
       claimed.delete(a.key)
       return r
     }
+    if (isTester(a)) testerAgents.add(r.agentId)
+    if (isVerifier(a) || e.subagentType === VERIFIER_TYPE) verifierAgents.add(r.agentId)
     if (extract) await served($, extract.cle, extract.hits, tokensOf(extract.text)).catch(() => undefined)
     const agentId = r.agentId
     const now = await $.clock.now()
@@ -2049,6 +3295,18 @@ export const register: Register = (on, options) => {
     if ('error' in parsed) return { deny: `Plan refusé : ${parsed.error}` }
     const { plan } = parsed
     claimed.clear()
+    // Les critères d'acceptation (lot 2) : à la porte (vérificateur, testeur) et au panneau.
+    if (gate && gate.flowId === flow.id) {
+      const g = gate
+      g.criteres = plan.criteres ?? []
+      g.verdicts = undefined
+      await persistVerif($, g)
+      await update($, verifA, v => {
+        if (!v) return v
+        const { criteres: _c, ...rest } = v
+        return g.criteres.length ? { ...rest, criteres: { total: g.criteres.length, ok: 0, verdicts: [] } } : rest
+      })
+    }
     // Le plan en .md : un fichier à garder ou à rouvrir (bouton « plan.md » du panneau) ; il ne bloque jamais le plan.
     const planFile = await writePlanFile($, plan, flow).catch(() => undefined)
     await setFlow($, f => ({
@@ -2121,13 +3379,64 @@ export const register: Register = (on, options) => {
     }
   }).catch(() => ({ result: 'revo-flow cache : indisponible pour l’instant, continue sans.' as never }))
 
+  // L'outil verif : aucune exception ne remonte, l'erreur est dite en texte.
+  on('tool.call', { tool: VERIF_TOOL }, async ($, e) => {
+    try {
+      return { result: (await verifTool($, e as unknown as Record<string, unknown> & { agentId?: string })) as never }
+    } catch (err) {
+      return { result: `revo-flow verif : ${errText(err)}` as never }
+    }
+  }).catch(() => ({ result: 'revo-flow verif : indisponible pour l’instant ; continue, la porte de fin vérifiera.' as never }))
+
+  // Le gel des tests (lot 2) : le testeur n'édite que des tests, un test gelé ne se modifie que par son auteur. Fermé : un
+  // plantage refuse l'édition tant que le gel est actif.
+  on('tool.call', { tool: 'Edit' }, async ($, e, next) => {
+    const deny = await editDenial($, e)
+    return deny ? { deny } : next(e)
+  }).catch(($, e, next) => (isGelActive() ? { deny: GEL_ERROR } : next(e)))
+  on('tool.call', { tool: 'Write' }, async ($, e, next) => {
+    const deny = await editDenial($, e)
+    return deny ? { deny } : next(e)
+  }).catch(($, e, next) => (isGelActive() ? { deny: GEL_ERROR } : next(e)))
+  on('tool.call', { tool: 'NotebookEdit' }, async ($, e, next) => {
+    const deny = await editDenial($, e)
+    return deny ? { deny } : next(e)
+  }).catch(($, e, next) => (isGelActive() ? { deny: GEL_ERROR } : next(e)))
+
+  // La porte de fin (§2 étapes 10 à 12) : la fin de tour de l'orchestrateur en conclusion attend la porte. Sans .catch qui
+  // refuse : un plantage laisse finir (porte ouverte), et le flow est marqué « non vérifié (erreur de revo-flow) ».
+  on('classic.Stop', async ($, e, next) => {
+    let reason: string | undefined
+    try {
+      reason = await stopGate($, e)
+    } catch {
+      if (gate) gate.erreur = true
+    }
+    return reason ? { block: reason } : next(e)
+  })
+
+  // Le vérificateur n'est proposé au modèle que pendant un flow (même sans commande de vérification, il lit et juge les critères).
+  on('agent.offer', { agent: VERIFIER_TYPE }, async ($, e, next) => {
+    const flow = await read($, flowA)
+    return flow && flow.phase !== 'done' ? next(e) : { isOffered: false }
+  })
+
   // L'agent de construction n'est lancé que par /revo-flow cache build : le modèle ne le voit pas.
   on('agent.offer', { agent: `${PLUGIN}:${INDEXER}` }, () => ({ isOffered: false }))
 
   // Ce que chacun fait en direct, et les fichiers modifiés : seulement pendant un flow.
   on('tool.call', async ($, e, next) => {
     const tool = String(e.tool)
-    if (tool === PLAN_TOOL || tool === STEP_TOOL) return next(e)
+    if (tool === PLAN_TOOL || tool === STEP_TOOL || tool === VERIF_TOOL) return next(e)
+    // Le vérificateur est en lecture seule : son Bash ne passe que pour des lectures et les commandes confirmées (§8).
+    if (tool === 'Bash' && e.agentId && verifierAgents.has(e.agentId)) {
+      const command = text((e as unknown as { command?: unknown }).command)
+      if (!verifierBashAllowed(command, confirmedArgv())) {
+        return {
+          deny: 'revo-flow : le vérificateur est en lecture seule. Seules passent les lectures (git diff, git show, git log, git status, cat, ls, head, tail, grep, wc, sed -n) et les commandes de vérification confirmées données dans ta tâche, sans enchaînement ni redirection.',
+        }
+      }
+    }
     const flow = await read($, flowA)
     const who = flow && flow.phase !== 'done' ? whoIs(flow, e.agentId) : undefined
     if (!who) return next(e)
@@ -2155,6 +3464,8 @@ export const register: Register = (on, options) => {
       const done = failed ? `✗ ${label}` : label
       const prev = who === 'lead' ? await read($, leadA) : (await read($, flowA))?.agents.find(a => a.key === who)
       await setActivity($, who, { isDoing: false, history: [...(prev?.history ?? []), done].slice(-3) })
+      // La porte déjà lancée ne vaut plus pour ce nouvel état (une lecture Bash ne change rien).
+      if (!failed && (path || (tool === 'Bash' && !verifierBashAllowed(text(input.command), [])))) touchVerif(Boolean(path) || flow?.phase !== 'planning')
       if (!failed && path) {
         await markFile($, path, who, e.tool_use_id, e.agentId)
         // Un fichier du projet vient de changer : le graphe gardé est revérifié au prochain appel, pas dans 30 s (L17).
@@ -2199,7 +3510,7 @@ export const register: Register = (on, options) => {
     if (e.agentId !== undefined || e.trigger === 'precompute' || !r.messages) return r
     const flow = await read($, flowA)
     if (!flow || flow.phase === 'done') return r
-    const recap = flowRecap(flow, opts.cache ? cacheRecap(await read($, flowCacheA)) : false)
+    const recap = flowRecap(flow, opts.cache ? cacheRecap(await read($, flowCacheA)) : false, opts.verif !== 'off')
     return { ...r, messages: [...r.messages, { role: 'user' as const, text: recap, toolUses: [] }] }
   })
 

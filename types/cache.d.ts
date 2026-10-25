@@ -1,5 +1,6 @@
 // Le graphe de cache d'un projet (voir docs/rd-graphe-cache/conception.md §2).
 // Couche mécanique (fichiers, arêtes, routes, opérations) recalculée sans LLM ; couche « savoir » (fiches de feature) écrite par un modèle.
+import type { ProjetVerif, VerifJournal } from './verif'
 
 export type NodeKind =
   | 'page'
@@ -87,7 +88,18 @@ export type Feature = {
  * Un flow terminé (recordUsage) : cache actif ou non, fiche servie, fiches apprises, tokens lus (Read et Bash), sortis des outils
  * (Grep, Glob, Bash non attribuable à un fichier), injectés et évités.
  */
-export type JournalEntry = { le: string; cache: boolean; feature?: string; appris?: string[]; lus: number; outils: number; injecte: number; evites: number }
+export type JournalEntry = {
+  le: string
+  cache: boolean
+  feature?: string
+  appris?: string[]
+  lus: number
+  outils: number
+  injecte: number
+  evites: number
+  /** La vérification du flow (v2, docs/rd-v2/conception.md §10) ; absent = flow d'avant la v2 ou porte non lancée. */
+  verif?: VerifJournal
+}
 export type Candidate = { id: string; commits: number; fichiers: number; tok: number; note?: string }
 export type Graph = {
   v: 1
@@ -104,6 +116,8 @@ export type Graph = {
     conventions?: string
     indexe: { commit: string; branche: string; le: string; fichiers: number; tok: number }
     exclus: string[]
+    /** Commandes de vérification confirmées, bases de référence, tests instables et pièges d'environnement (v2, docs/rd-v2/conception.md §6). */
+    verif?: ProjetVerif
   }
   fichiers: Record<string, FileNode>
   noeuds: Record<string, GraphNode>
@@ -169,6 +183,12 @@ export type CacheStats = {
     avecFiche: { flows: number; lus: number }
     parFeature: { id: string; avant: { flows: number; lus: number }; apres: { flows: number; lus: number } }[]
   }
+  /**
+   * Indicateurs de vérification tirés du journal (absent si aucun flow vérifié). echappement : part (0 à 1) des flows observés rouges ;
+   * premierRouge : part des flows dont la première porte est rouge ; attrapees : erreurs nouvelles des flows vérifiés ;
+   * acceptes : flows finis rouges sur décision de l'utilisateur ; dureeMoyMs : durée moyenne de la porte.
+   */
+  verif?: { flows: number; echappement: number; premierRouge: number; attrapees: number; acceptes: number; dureeMoyMs: number }
   build?: { feature: string; tokens: number; costUsd: number }
 }
 export type LearnInput = {

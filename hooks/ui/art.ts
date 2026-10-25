@@ -147,6 +147,8 @@ export type BarOptions = {
   context?: number
   /** Le dernier prompt en une phrase courte (« 3,2k ↑ 850 ↓ · 0,04 € »), si la largeur le permet. */
   lastPrompt?: string
+  /** Le segment de vérification (« vérif ✓ 3/3 »), avec sa couleur : vert, rouge, orange ou discret. */
+  verif?: { text: string; tone: 'ok' | 'ko' | 'warn' | 'dim' }
 }
 
 type Tier = 'full' | 'compact' | 'tiny'
@@ -199,8 +201,17 @@ export function barSvg(stages: readonly BarStage[], o: BarOptions): string {
     (promptText
       ? `<text x="${num(groupX - ctxW)}" y="26" text-anchor="end" font-family="${MONO}" font-size="11" fill="${PALETTE.muted}">${esc(promptText)}</text>`
       : '')
+  const verifText = o.verif && tier !== 'tiny' ? o.verif.text : ''
+  const verifW = verifText ? Math.round(verifText.length * 6.8) + 14 : 0
+  const verifColor = o.verif?.tone === 'ko' ? PALETTE.redText : o.verif?.tone === 'warn' ? PALETTE.orange : o.verif?.tone === 'ok' ? PALETTE.live : PALETTE.muted
+  const verifX = groupX - ctxW - promptW
+  const extraAll =
+    extra +
+    (verifText
+      ? `<text x="${num(verifX)}" y="26" text-anchor="end" font-family="${MONO}" font-size="11" fill="${verifColor}">${esc(verifText)}</text>`
+      : '')
   const gap = 4
-  const usable = Math.max(60, x1 - x0) - gap * (n - 1)
+  const usable = Math.max(60, x1 - verifW - x0) - gap * (n - 1)
   const weights = stages.map((_, i) => (i === active ? (tier === 'full' ? 1.5 : 3) : 1))
   const sum = weights.reduce((a, b) => a + b, 0)
   const widths = weights.map(w => (usable * w) / sum)
@@ -251,7 +262,7 @@ export function barSvg(stages: readonly BarStage[], o: BarOptions): string {
   const count = `<text x="${num(countX)}" y="26" font-family="${MONO}" font-size="11" fill="${PALETTE.muted}">×${o.agents}</text>`
   const close = `<path d="M${closeX + 11} 18 l10 8 M${closeX + 21} 18 l-10 8" fill="none" stroke="${PALETTE.muted}" stroke-width="1.5" stroke-linecap="round"/>`
 
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}"><rect x=".5" y=".5" width="${W - 1}" height="${H - 1}" rx="22" fill="${PALETTE.bar}" stroke="${isError ? PALETTE.redBorder : PALETTE.border}"/>${left}${seg}${extra}${pct}${mascot}${count}${close}<title>${esc(`${o.title} — ${reached}/${n} étapes, ${Math.round(o.percent)} %`)}</title></svg>`
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}"><rect x=".5" y=".5" width="${W - 1}" height="${H - 1}" rx="22" fill="${PALETTE.bar}" stroke="${isError ? PALETTE.redBorder : PALETTE.border}"/>${left}${seg}${extraAll}${pct}${mascot}${count}${close}<title>${esc(`${o.title} — ${reached}/${n} étapes, ${Math.round(o.percent)} %`)}</title></svg>`
 }
 
 // ── Les cartes d'agent ───────────────────────────────────────────────────
@@ -570,4 +581,37 @@ export function cacheBandSvg(o: { text: string; saved?: string; stale: number; w
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} 18" width="${W}" height="18"><text x="20" y="13" font-family="${MONO}" font-size="11">${body}</text>${
     stale ? `<text x="${W - 20}" y="13" text-anchor="end" font-family="${MONO}" font-size="11" fill="${PALETTE.orange}">${esc(stale)}</text>` : ''
   }<title>${esc(o.text)}</title></svg>`
+}
+
+// ── La vérification du flow (la porte de fin) ────────────────────────────
+
+export type VerifTone = 'ok' | 'ko' | 'warn' | 'dim'
+const verifColorOf = (tone: VerifTone) =>
+  tone === 'ok' ? PALETTE.live : tone === 'ko' ? PALETTE.redText : tone === 'warn' ? PALETTE.orange : PALETTE.muted
+
+/**
+ * Une commande de vérification : pastille d'état et identifiant en mono (durée à droite), et dessous le résultat tronqué
+ * (« 2 nouvelles · 5 préexistantes ») avec les instables en orange. Hauteur 38.
+ */
+export function verifRowSvg(o: { mark: string; tone: VerifTone; id: string; detail: string; duration?: string; flaky?: string; width: number }): string {
+  const W = Math.max(200, Math.round(o.width))
+  const color = verifColorOf(o.tone)
+  const duration = o.duration ?? ''
+  const durW = duration ? duration.length * 6.6 + 4 : 0
+  const id = clip(o.id, Math.max(8, Math.floor((W - 24 - durW - 8) / 7.2)))
+  const flaky = o.flaky ? clip(o.flaky, 14) : ''
+  const flakyW = flaky ? flaky.length * 6.4 + 8 : 0
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} 38" width="${W}" height="38"><text x="0" y="13" font-family="${MONO}" font-size="12" font-weight="700" fill="${color}">${esc(o.mark)}</text><text x="20" y="13" font-family="${MONO}" font-size="12" fill="${PALETTE.text}">${esc(id)}</text>${
+    duration ? `<text x="${W}" y="13" text-anchor="end" font-family="${MONO}" font-size="11" fill="${PALETTE.muted}">${esc(duration)}</text>` : ''
+  }<text x="20" y="31" font-family="${FONT}" font-size="12" fill="${o.tone === 'ko' ? PALETTE.redText : PALETTE.muted}">${esc(clip(o.detail, Math.floor((W - 24 - flakyW) / 6.1)))}</text>${
+    flaky ? `<text x="${W}" y="31" text-anchor="end" font-family="${MONO}" font-size="11" fill="${PALETTE.orange}">${esc(flaky)}</text>` : ''
+  }<title>${esc(`${o.id} : ${o.detail}${duration ? `, ${duration}` : ''}`)}</title></svg>`
+}
+
+/** Une ligne de remarque de la section Vérification : tests gelés, triches, critères, question. Hauteur 20, texte tronqué. */
+export function verifNoteSvg(o: { mark: string; tone: VerifTone; text: string; width: number }): string {
+  const W = Math.max(200, Math.round(o.width))
+  const color = verifColorOf(o.tone)
+  const strong = o.tone === 'ko' || o.tone === 'warn'
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} 20" width="${W}" height="20"><text x="0" y="14" font-family="${MONO}" font-size="12" font-weight="700" fill="${color}">${esc(o.mark)}</text><text x="20" y="14" font-family="${FONT}" font-size="12"${strong ? ' font-weight="600"' : ''} fill="${strong ? color : PALETTE.text2}">${esc(clip(o.text, Math.floor((W - 24) / 6.1)))}</text><title>${esc(o.text)}</title></svg>`
 }

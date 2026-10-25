@@ -98,6 +98,39 @@ revo-flow garde pour chaque projet un **graphe de connaissances** dans `~/.claud
 
 **Mesure** : chaque flow terminé (pas un flow arrêté) entre au **journal** du graphe (200 derniers), cache activé ou non : tokens lus par Read (≈ 9 tokens par ligne d'une lecture partielle) et par une lecture Bash d'un seul fichier (`cat`, `sed -n`, `head`, `tail` ; les autres commandes Bash ne comptent pas), sorties de Grep et Glob, tokens injectés et évités. La section « Cache » en tire une ligne `Lus par flow : sans cache 12k (4) · sans fiche 9k (6) · avec fiche 5k (3)`, et la feature qui gagne le plus entre ses flows d'avant sa fiche et ceux où elle a été servie (même feature : bien moins de variance). Pour remplir la colonne « sans cache », désactive l'option `cache` sur quelques flows ; le graphe doit déjà exister (il n'est pas construit pour mesurer). Un fichier modifié par un agent fait revérifier le graphe au prochain appel, sans attendre 30 s.
 
+## Flow vérifié
+
+Depuis la v2, un flow ne finit plus « terminé » sur un lint, un typage ou un test rouge sans que quelqu'un l'ait décidé en le sachant. revo-flow **exécute lui-même** les vérifications du projet (zéro token : ce sont des commandes, pas un modèle) ; ce qu'un agent écrit (« j'ai lancé les tests, tout passe ») ne compte pas. Il ne corrige rien et ne relance personne : il rapporte, l'orchestrateur décide.
+
+- **Commandes du projet** : au premier flow d'un projet, revo-flow les déduit (scripts de `package.json`, `pubspec.yaml`, CI, `biome.json`, `tsconfig.json`…) : ESLint, Biome, `tsc`, `nuxi typecheck`, `vue-tsc`, `vitest related`, `jest --findRelatedTests`, `dart analyze`, `flutter test` sur les tests liés, `codegen` ou `build_runner` quand un fichier source de génération change. Un dialogue montre les commandes exactes, leur portée et leur source : **Utiliser**, **Ajuster** ou **Pas de vérification**. Elles sont rangées dans le graphe (`projet.verif`) et redemandées si un manifeste change. Sans personne pour répondre (`claude -p`), **Utiliser** bascule en mode observateur : la vérification tourne, sans bloquer. Échap : pas de vérification pour ce flow. Sous Windows, `npx`, `npm` et `flutter` passent par `cmd /c`.
+- **Portée ciblée** : les fichiers modifiés du flow, les tests liés (par la commande, ou par les arêtes `teste` du graphe en Dart), le typage du projet une seule fois par porte, le tout découpé par paquet dans un monorepo. Un test rouge est relancé seul : vert à la relance, il est noté **instable** et ne bloque plus. Les tests qui demandent un service (sandbox, base locale) sont exclus. Le `build` (`nuxt build`, `nest build`) reste hors porte. Une commande dure 10 min au plus (pas de `spawn`) : une suite plus longue n'a rien à faire dans la porte.
+- **Base de référence** : pendant la planification, en arrière-plan, revo-flow lance lint et typage sur le projet (rien n'est modifié) et garde les signatures des erreurs (sans numéro de ligne), par commit, pour les 3 derniers. À la porte, seules les erreurs **nouvelles** comptent ; les préexistantes sont montrées à part. Une commande sans base (tests liés) donne « nouvelle ? », que l'utilisateur tranche.
+- **Porte de fin** : quand tous les agents ont fini, la porte démarre aussitôt, pendant que l'orchestrateur relit. À la conclusion de l'orchestrateur, vert : le flow se termine « vérifié ✓ ». Rouge : sa fin est refusée et il reçoit les erreurs nouvelles (30 au plus, groupées par fichier, 4 000 tokens au plus, avec le chemin de la sortie complète), puis corrige lui-même, reprend un agent par `SendMessage` ou en relance un. **3 tentatives** au plus, puis un dialogue : **Terminer non vérifié**, **Une tentative de plus** ou **Voir le détail**. Si revo-flow plante, la porte s'ouvre et le flow est marqué « non vérifié (erreur de revo-flow) ».
+
+**Outil `mcp__revo-flow__verif`**, pour l'orchestrateur et les agents :
+
+| Action | Effet |
+| --- | --- |
+| `lancer` | tous : lance la vérification sur les fichiers de l'appelant ; un agent le fait avant de finir et ne voit que les erreurs de ses fichiers |
+| `resultat` | tous : le dernier résultat (commandes, erreurs nouvelles, préexistantes, instables) |
+| `commandes` | orchestrateur seul : une liste de commandes corrigée, ou des tests à exclure ; toujours reposée à l'utilisateur |
+| `exception` | orchestrateur seul : terminer malgré le rouge, avec un motif ; toujours reposée à l'utilisateur |
+| `degeler` | orchestrateur seul : rouvrir un test gelé, avec un motif ; toujours reposée à l'utilisateur |
+
+**Critères d'acceptation, vérificateur, tests gelés** (sur décision de l'orchestrateur, jamais automatiques ; ≈ 0,5 à 1,3 € de plus par flow) :
+
+- **Critères** : le plan peut porter 1 à 8 critères vérifiables (C1 à C8), montrés à la validation du plan et dans `plan.md`.
+- **Testeur** : un agent de tâches `test` traduit les critères en tests, à partir de la spec et des interfaces, pas du code écrit ; il ne touche qu'aux fichiers de test. Ses tests **restent dans le dépôt**.
+- **Tests gelés** : à la fin du testeur, ses fichiers sont gelés par hash git. Un `Edit` ou `Write` d'un autre agent ou de l'orchestrateur dessus est refusé (le refus se ferme : un plantage refuse aussi), et une modification par Bash est détectée à chaque porte. Seul `degeler`, confirmé par l'utilisateur, les rouvre.
+- **Vérificateur** `revo-flow:verifier` : en lecture seule (aucun `Edit`, `Write` ni `NotebookEdit`, Bash limité aux lectures git, `cat`, `ls`, `grep` et aux commandes confirmées), contexte neuf, prompt calibré. Pour chaque critère il rend `ok`, `ko` ou `non vérifiable`, avec la preuve exécutée ; un critère sans verdict compte « non vérifiable ».
+- **Triche** : le diff du flow est cherché pour `.skip`, `.only`, `xit`, `test.todo`, moins d'`expect` dans un test modifié, `eslint-disable`, `@ts-ignore`, `@ts-expect-error`, `biome-ignore`, `as any`, ou une configuration de lint, de test ou de typage modifiée. Un test gelé ou un garde-fou modifié garde la porte rouge jusqu'à la réponse de l'utilisateur ; les autres motifs sont signalés sans bloquer.
+
+**Option `verif`** (`/config`) : `bloquer` (défaut) tient la porte ; `observer` lance et affiche la vérification sans jamais bloquer ; `off` ne fait rien.
+
+**Affichage** : section « Vérification » du panneau (une ligne par commande : état, fichiers, erreurs nouvelles, durée ; tentative n/3 ; tests gelés ; triches ; critères ; boutons **Détail**, qui ouvre la sortie complète, et **Relancer**), segment de bande `vérif ✓ 3/3`, `vérif ✗ typecheck (2)` ou `vérif …`, notification de fin « vérifié ✓ » ou « non vérifié (typecheck ✗) », colonne « vérif » de l'historique (`✓`, `✗ accepté`, `✗`, `✗ erreur`, `observé`, `—`). Les sorties complètes sont dans `~/.claude/revo-flow/verif/<date>-<flow>/` (les 20 derniers flows gardés).
+
+**Mesure** : le journal du graphe note pour chaque flow l'état de la vérification, ses tentatives, ses erreurs nouvelles et sa durée. La section « Cache » du panneau en tire le taux d'échappement (flows observés rouges), la part de flows rouges au premier passage, les erreurs nouvelles attrapées, les flows acceptés non vérifiés et la durée moyenne de la porte.
+
 ## Options (`/config`)
 
 | Option | Défaut | Effet |
@@ -105,6 +138,7 @@ revo-flow garde pour chaque projet un **graphe de connaissances** dans `~/.claud
 | `validerPlan` | oui | demande « Lancer » ou « Annuler » avant de lancer les agents ; sans personne à qui demander (`claude -p`), le plan part tout seul |
 | `conflits` | `avertir` | fichier déjà modifié par un autre agent encore au travail : `avertir` affiche un toast, `refuser` bloque la modification |
 | `notifier` | oui | notification système à la fin d'un flow et quand un agent échoue (un toast si elle ne peut pas partir) |
+| `verif` | `bloquer` | vérification des flows : `bloquer` refuse la fin d'un flow tant qu'une erreur nouvelle subsiste (3 tentatives), `observer` vérifie et affiche sans bloquer, `off` ne vérifie pas |
 | `cache` | oui | brief du cache projet au lancement, extrait de fiche dans le prompt de chaque agent et outil `cache` proposé ; `non` : ni brief, ni extrait, ni outil, la commande `cache` reste et les flows comptent dans la mesure « sans cache » |
 
 Sur l'app desktop, `/revo-flow` n'apparaît pas toujours dans le menu `/` : tape la commande en entier, elle fonctionne.
@@ -128,19 +162,23 @@ revo-flow/
 │   └── types/             écrit par Claude Code au chargement (ignoré par git)
 ├── hooks/                 le code du mod, chargé par le moteur
 │   ├── hooks.json         désigne le module d'entrée
-│   ├── register.tsx       entrée : commande /revo-flow, outils plan, step et cache, suivi des agents
+│   ├── register.tsx       entrée : commande /revo-flow, outils plan, step, cache et verif, suivi des agents
 │   ├── lib.ts             logique pure du flow : plan, tâches, progression, consignes, coûts
 │   ├── ui/
 │   │   ├── views.tsx      panneau et bande (terminal, desktop, mobile)
 │   │   └── art.ts         les dessins SVG
-│   └── cache/
-│       ├── graph.ts       graphe du cache, module pur
-│       └── store.ts       disque et git du cache
+│   ├── cache/
+│   │   ├── graph.ts       graphe du cache, module pur
+│   │   └── store.ts       disque et git du cache
+│   └── verif/             le flow vérifié : détection, portée, lecture des sorties, base, rapport, exécution, garde-fous
 ├── tests/                 lancés par claude plugin test .
 │   ├── flow.test.ts
 │   ├── cache/             graph.test.ts, store.test.ts
+│   ├── verif/             coeur.test.ts, garde.test.ts
+│   ├── ui/                verif.test.ts
 │   └── helpers/os.ts      les deux machines simulées (Windows, macOS)
-├── types/                 contrats : état du mod (index.d.ts), graphe du cache (cache.d.ts)
+├── types/                 contrats : état du mod (index.d.ts), graphe du cache (cache.d.ts), vérification (verif.d.ts)
 ├── docs/rd-graphe-cache/  conception et R&D du cache
+├── docs/rd-v2/            conception et R&D du flow vérifié
 └── tsconfig.json
 ```

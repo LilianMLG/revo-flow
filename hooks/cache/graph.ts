@@ -28,6 +28,7 @@ import type {
   RefreshContext,
   SourceFile,
 } from '../../types/cache'
+import type { VerifJournal } from '../../types/verif'
 
 // ── Bases ────────────────────────────────────────────────────────────────
 
@@ -1044,6 +1045,7 @@ export function buildGraph(input: {
   const exclus = input.exclus ?? prev?.projet.exclus ?? EXCLUS_DEFAUT
   const stack = detectStack(input.pkgJson, input.files.map(f => f.p), input.pubspec, input.manifestes)
   const dart = dartPackageOf(input.pubspec)
+  const prevVerif = (prev?.projet as { verif?: unknown } | undefined)?.verif
   const files = input.files.map(f => ({ ...f, p: norm(f.p) })).filter(f => isIndexable(f.p, exclus))
   const g: Graph = {
     v: 1,
@@ -1056,6 +1058,8 @@ export function buildGraph(input: {
       format: MECA_FORMAT,
       ...(dart ? { dart } : {}),
       ...(prev?.projet.conventions ? { conventions: prev.projet.conventions } : {}),
+      // v2 : les commandes de vérification et les bases de référence survivent à une réindexation
+      ...(prevVerif ? { verif: prevVerif } : {}),
       indexe: { commit: input.commit, branche: input.branche, le: input.le, fichiers: 0, tok: 0 },
       exclus,
     },
@@ -1924,7 +1928,7 @@ function gains(graph: Graph | null, flow: FlowCache): Gains {
  * (servie, évités, fichiers lus dans usages.lus) et les statistiques cumulées, puis purge les brouillons jamais servis depuis 10 flows.
  * ctx.le : date ISO de fin ; ctx.appris : les fiches apprises pendant le flow (apprendre ou autoFiche).
  */
-export function recordUsage(graph: Graph, flow: FlowCache, ctx: { le: string; appris?: string[] }): Graph {
+export function recordUsage(graph: Graph, flow: FlowCache, ctx: { le: string; appris?: string[] }, extra?: { verif?: VerifJournal }): Graph {
   const g = gains(graph, flow)
   const s = graph.stats
   const flows = s.flows + 1
@@ -1947,7 +1951,8 @@ export function recordUsage(graph: Graph, flow: FlowCache, ctx: { le: string; ap
     outils: Math.max(0, flow.outils ?? 0),
     injecte: flow.injecte || 0,
     evites: g.evites,
-  }
+    ...(extra?.verif ? { verif: extra.verif } : {}),
+  } as JournalEntry
   const journal = [...(graph.journal ?? []), entry].slice(-JOURNAL_MAX)
   const quiet = !flow.servis?.length && !flow.injecte && !g.feats.length
   const stats = quiet ? { ...s, flows } : { flows, servis: s.servis + g.servis, evites: s.evites + g.evites, net: s.net + g.net }
@@ -1982,6 +1987,26 @@ export function measureOf(journal: JournalEntry[] | undefined): CacheStats['mesu
   }
 }
 
+/**
+ * Les indicateurs de vérification (§14), tirés du journal : seuls les flows qui portent un `verif` compte.
+ * echappement : part des flows observés (mode observateur) dont la porte est rouge ; premierRouge : part des flows dont la première porte est rouge ;
+ * attrapees : erreurs nouvelles des flows vérifiés ; acceptes : flows finis rouges sur décision de l'utilisateur ; dureeMoyMs : durée moyenne des portes.
+ * Undefined si aucun flow n'a été vérifié.
+ */
+export function verifStatsOf(journal: JournalEntry[] | undefined): CacheStats['verif'] {
+  const j = (Array.isArray(journal) ? journal : []).map(e => (e as { verif?: VerifJournal }).verif).filter((v): v is VerifJournal => !!v && v.etat !== 'off')
+  if (!j.length) return undefined
+  const observes = j.filter(v => v.etat === 'observe')
+  return {
+    flows: j.length,
+    echappement: observes.length ? observes.filter(v => v.nouvelles > 0).length / observes.length : 0,
+    premierRouge: j.filter(v => v.premierRouge).length / j.length,
+    attrapees: j.filter(v => v.etat === 'verifie').reduce((s, v) => s + (v.nouvelles || 0), 0),
+    acceptes: j.filter(v => v.accepte).length,
+    dureeMoyMs: Math.round(j.reduce((s, v) => s + (v.dureeMs || 0), 0) / j.length),
+  }
+}
+
 /** Les données du panneau et de la bande. */
 export function computeStats(graph: Graph | null, flow: FlowCache | null, nom: string): CacheStats | null {
   if (!graph) return null
@@ -2008,6 +2033,7 @@ export function computeStats(graph: Graph | null, flow: FlowCache | null, nom: s
   for (const h of g?.hits ?? [])
     noeuds.push({ id: h.p, k: graph.fichiers[h.p]?.k ?? 'autre', titre: baseName(h.p), niveau: h.frais ? 'fraiche' : 'perimee', hit: h.par, tok: h.tok })
   const fraiches = feats.filter(x => x.fr.niveau === 'fraiche').length
+  const verifStats = verifStatsOf(graph.journal)
   return {
     projet: nom,
     cle: graph.projet.cle,
@@ -2023,6 +2049,7 @@ export function computeStats(graph: Graph | null, flow: FlowCache | null, nom: s
       : { injecte: 0, evites: 0, net: 0, lus: 0, completude: 0 },
     cumul: { flows: graph.stats.flows, evites: graph.stats.evites, net: graph.stats.net },
     mesure: measureOf(graph.journal),
+    ...(verifStats ? { verif: verifStats } : {}),
   }
 }
 // ── Textes (français, compacts, jamais de JSON) ──────────────────────────

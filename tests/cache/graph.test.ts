@@ -1365,3 +1365,35 @@ test('diffText : un diff de plus de 30 % du fichier n’est pas servi, il faut r
   // petit diff : servi
   expect(diffText(g, f, undefined, [{ p: 'services/offer.ts', depuis: 'a', diff: '@@ -1 +1 @@\n-a\n+b' }])).toContain('-a\n+b')
 })
+
+// ── v2 : indicateurs de vérification ─────────────────────────────────────
+
+test('recordUsage garde verif dans le journal ; sans verif, l’entrée ne change pas', () => {
+  const g = withFeatures()
+  const flow: FlowCache = { cle: g.projet.cle, cache: true, servis: [], lus: [], injecte: 0 }
+  const v = { etat: 'verifie', tentatives: 2, premierRouge: true, nouvelles: 3, preexistantes: 1, dureeMs: 4000, triches: 0 } as const
+  const g1 = recordUsage(g, flow, { le: '2026-10-14T11:00:00.000Z' }, { verif: v })
+  expect(g1.journal![0]!.verif).toEqual(v)
+  const g2 = recordUsage(g, flow, { le: '2026-10-14T11:00:00.000Z' })
+  expect('verif' in g2.journal![0]!).toBe(false)
+})
+
+test('computeStats : indicateurs de vérification (échappement, premier rouge, attrapées, acceptés, durée)', () => {
+  const g = withFeatures()
+  expect(computeStats(g, null, 'demo')!.verif).toBeUndefined()
+  const flow: FlowCache = { cle: g.projet.cle, cache: true, servis: [], lus: [], injecte: 0 }
+  const base = { tentatives: 1, premierRouge: false, nouvelles: 0, preexistantes: 0, dureeMs: 1000, triches: 0 }
+  const verifs = [
+    { ...base, etat: 'observe' as const, nouvelles: 2 },
+    { ...base, etat: 'observe' as const },
+    { ...base, etat: 'verifie' as const, premierRouge: true, nouvelles: 4, dureeMs: 3000, tentatives: 2 },
+    { ...base, etat: 'non-verifie' as const, premierRouge: true, accepte: true, nouvelles: 1, dureeMs: 5000 },
+    { ...base, etat: 'off' as const, dureeMs: 99999 },
+  ]
+  let h = g
+  verifs.forEach((verif, i) => {
+    h = recordUsage(h, flow, { le: `2026-10-14T1${i}:00:00.000Z` }, { verif })
+  })
+  h = recordUsage(h, flow, { le: '2026-10-14T20:00:00.000Z' })
+  expect(computeStats(h, null, 'demo')!.verif).toEqual({ flows: 4, echappement: 0.5, premierRouge: 0.5, attrapees: 4, acceptes: 1, dureeMoyMs: 2500 })
+})

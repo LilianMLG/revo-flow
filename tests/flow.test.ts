@@ -20,6 +20,10 @@ import {
   planQuestion,
   progress,
   remainingTasks,
+  historyText,
+  isTester,
+  verifCost,
+  verifMark,
 } from '../hooks/lib'
 import { bestFeatureLine, measureLine } from '../hooks/ui/views'
 import type { Flow, FlowAgent } from '../types'
@@ -68,6 +72,9 @@ function world(on: On, os: Os = WINDOWS) {
   // git diff <blob> <blob> (action diff du cache) : la sortie que le test décide, et les appels reçus.
   const gitDiff = { out: '', calls: [] as string[][] }
   const runs: string[][] = []
+  // Les hash git des fichiers (hash-object) et la sortie de tsc, que les tests de la vérification font varier.
+  const hashes: Record<string, string> = {}
+  const verifRun = { tsc: { exitCode: 0, stdout: '', stderr: '' } }
   on('process.run', (_$, e) => {
     runs.push([...e.argv])
     const out = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
@@ -78,6 +85,15 @@ function world(on: On, os: Os = WINDOWS) {
     if (e.argv.includes('ls-files')) return out(Object.entries(tracked).map(([p, h]) => `100644 ${h.padEnd(40, '0')} 0\t${p}\0`).join(''))
     if (e.argv.includes('status') || e.argv.includes('log') || e.argv.includes('diff')) return out('')
     if (e.argv.includes('--short')) return out('abc1234\n')
+    // git hash-object (manifestes, tests gelés) : le hash que le test décide, sinon un hash fixe.
+    if (e.argv.includes('hash-object')) {
+      const paths = ((e as unknown as { init?: { stdin?: string } }).init?.stdin ?? '').split('\n').filter(Boolean)
+      const list = paths.length ? paths : [e.argv.at(-1)!]
+      return out(`${list.map(p => hashes[p] ?? H0).join('\n')}\n`)
+    }
+    if (e.argv.includes('rev-parse') && !e.argv.includes('--abbrev-ref')) return out(`${COMMIT}\n`)
+    // Les commandes de vérification : la sortie de tsc que le test décide (cmd /c sous Windows compris).
+    if (e.argv.includes('tsc')) return { value: { ...verifRun.tsc, isStdoutTruncated: false, isStderrTruncated: false } }
     return out('feat/promo\n')
   })
   on('fs.stat', () => ({ value: { realPath: rootOf(os), kind: 'directory' } }) as never)
@@ -191,6 +207,8 @@ function world(on: On, os: Os = WINDOWS) {
   })
   on('turn.start', () => ({ turnId: 't' }))
   on('turn.complete', () => ({ text: '' }))
+  // La fin de tour de l'orchestrateur (porte de fin) : sans hook de réglages en dessous, rien à ajouter.
+  on('classic.Stop', () => ({}) as never)
   // Ce que l'engine dessinerait sans le mod : une boîte vide.
   on('ui.render', (hook$, e) => h(hook$.ui.resolve(e).Box as never, {}) as never)
   return {
@@ -212,11 +230,16 @@ function world(on: On, os: Os = WINDOWS) {
     gitDiff,
     haiku,
     runs,
+    hashes,
+    verifRun,
     surfaces,
     statuses,
     redraws: () => redraws,
   }
 }
+
+const H0 = 'a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0'
+const COMMIT = 'c0ffee0000000000000000000000000000000000'
 
 /** La réponse « dialogue fermé » : ui.ask rejette. */
 const DISMISS = '\u0000fermé'
@@ -1524,4 +1547,304 @@ test('vues, mesure du cache : lus par flow des groupes non vides, et la feature 
   expect(measureLine(stats(m), true)).toMatch(/^Lus\/flow : sans .+ \(4\) · fiche .+ \(3\)$/)
   expect(bestFeatureLine(stats(m))).toMatch(/^« panier » : .+ → .+ lus\/flow \(−70 %\) · 2 → 3 flows$/)
   expect(bestFeatureLine(stats(m), true)).not.toMatch(/flows$/)
+})
+
+// ── Vérification du flow (v2) ────────────────────────────────────────────
+
+const PKG = JSON.stringify({ scripts: { typecheck: 'tsc --noEmit' }, devDependencies: { typescript: '5.6.0' } })
+const RED = { exitCode: 2, stdout: "components/Basket.vue(3,5): error TS2322: Type 'string' is not assignable to type 'number'.\n", stderr: '' }
+const GREEN = { exitCode: 0, stdout: '', stderr: '' }
+const stop = async ($: Engine, extra: Record<string, unknown> = {}) => (await $.classic.Stop({ stop_hook_active: false, ...extra } as never)) as { block?: string }
+
+/** Un projet avec un script typecheck (tsc) : revo-flow le propose au lancement. */
+const seedVerif = (w: ReturnType<typeof world>, os: Os) => {
+  w.disk[diskKey(`${rootOf(os)}/package.json`)] = PKG
+  // Le fichier que les agents modifient : la portée ne garde que les fichiers qui existent encore.
+  w.disk[diskKey(native(os, 'Documents', 'Front', 'ui-vel', 'components', 'Basket.vue'))] = '<template />'
+}
+
+/** /revo-flow avec les commandes confirmées (Utiliser), le plan validé et les deux agents lancés. */
+async function launchVerif($: Engine, w: ReturnType<typeof world>) {
+  w.ctl.answer = 'Utiliser'
+  await launch($, w)
+  w.ctl.answer = 'Lancer'
+  await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN } as never)
+  const front = (await spawn($, 'Front panier')).agentId!
+  const api = (await spawn($, 'API promo')).agentId!
+  return { front, api }
+}
+
+for (const os of OSES) {
+  describe(`vérification (${os.nom})`, () => {
+    test('commandes confirmées, porte rouge bloquante 3 fois, puis la question ; « non vérifié » accepté au journal', async ($, on) => {
+      const w = world(on, os)
+      seedVerif(w, os)
+      const { front, api } = await launchVerif($, w)
+      // La question des commandes : la commande exacte, sa portée, sa source.
+      expect(w.asked[0]!).toMatch(/revo-flow a trouvé ces vérifications pour ui-vel/)
+      expect(w.asked[0]!).toMatch(/npx tsc --noEmit/)
+      expect(w.asked[0]!).toMatch(/Utiliser.*Ajuster.*Pas de vérification/)
+      // La consigne de chaque agent : verif lancer avant de finir.
+      expect(w.prompts[0]).toMatch(/Avant de finir, appelle l'outil mcp__revo-flow__verif action lancer sur tes fichiers/)
+      // La base de référence a tourné en fond, sur le projet entier (vert au commit de départ).
+      expect((w.states.verif as { base: string }).base).toBe('prete')
+      expect(w.runs.some(r => r.includes('tsc'))).toBe(true)
+
+      await $.tool.call({ tool: 'Edit', file_path: native(os, 'Documents', 'Front', 'ui-vel', 'components', 'Basket.vue'), agentId: front, tool_use_id: 'u1' } as never)
+      w.verifRun.tsc = RED
+      await endTurn($, w, front, 'completed')
+      await endTurn($, w, api, 'completed')
+      // La porte est partie à toReview ; la ligne d'état a montré la commande en cours.
+      expect(w.statuses.some(x => /^revo-flow : typecheck…/.test(x ?? ''))).toBe(true)
+
+      // Un tour qui attend ses agents n'est pas une conclusion : rien ne bloque.
+      expect((await stop($, { background_tasks: [{ id: 'b', type: 'subagent', status: 'running', description: 'x' }] })).block).toBeUndefined()
+      for (const n of [1, 2, 3]) {
+        const r = await stop($, { stop_hook_active: n > 1 })
+        expect(r.block).toMatch(new RegExp(`Vérification revo-flow : rouge \\(tentative ${n}/3\\)`))
+        expect(r.block).toMatch(/components\/Basket\.vue[\s\S]*TS2322/)
+        expect(r.block).toMatch(/action exception, avec motif/)
+      }
+      // Plafond : la question de fin ; « Une tentative de plus » rend un block de plus.
+      w.ctl.answer = 'Une tentative de plus'
+      expect((await stop($, { stop_hook_active: true })).block).toMatch(/tentative 4\/4/)
+      expect(w.asked.at(-1)!).toMatch(/La vérification reste rouge après 4 tentatives : 1 erreur nouvelle de typecheck dans components\/Basket\.vue/)
+      expect(w.asked.at(-1)!).toMatch(/Terminer non vérifié.*Une tentative de plus.*Voir le détail/)
+      w.ctl.answer = 'Terminer non vérifié'
+      expect((await stop($, { stop_hook_active: true })).block).toBeUndefined()
+      await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' } as never)
+      await w.clock.settle()
+      expect(w.notified.join('\n')).toMatch(/« Code promo panier » terminé · non vérifié \(typecheck ✗\) · accepté/)
+      expect(await run($, 'historique')).toMatch(/Code promo panier \(ui-vel\) · .* · vérif ✗ accepté/)
+    })
+
+    test('porte rouge puis corrigée : le block cède, « vérifié ✓ » dans la notification et l’historique', async ($, on) => {
+      const w = world(on, os)
+      seedVerif(w, os)
+      const { front, api } = await launchVerif($, w)
+      const file = native(os, 'Documents', 'Front', 'ui-vel', 'components', 'Basket.vue')
+      await $.tool.call({ tool: 'Edit', file_path: file, agentId: front, tool_use_id: 'u1' } as never)
+      w.verifRun.tsc = RED
+      await endTurn($, w, front, 'completed')
+      await endTurn($, w, api, 'completed')
+      expect((await stop($)).block).toMatch(/rouge \(tentative 1\/3\)/)
+      expect(w.states.verif).toMatchObject({ etat: 'rouge', tentative: 1 })
+      // La sortie complète (bouton Détail) : sous ~/.claude/revo-flow/verif, dans un dossier daté (la purge garde les 20 derniers par nom).
+      expect((w.states.verif as { detail?: string }).detail).toMatch(/\/\.claude\/revo-flow\/verif\/20261012T090000-\d+[\\/]typecheck\.txt$/)
+      // L'orchestrateur corrige : la porte suivante tourne sur le nouvel état.
+      w.verifRun.tsc = GREEN
+      await $.tool.call({ tool: 'Edit', file_path: file, tool_use_id: 'u2' } as never)
+      expect((await stop($, { stop_hook_active: true })).block).toBeUndefined()
+      expect(w.states.verif).toMatchObject({ etat: 'vert' })
+      await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' } as never)
+      await w.clock.settle()
+      expect(w.notified.join('\n')).toMatch(/terminé · vérifié ✓/)
+      expect(await run($, 'historique')).toMatch(/· vérif ✓/)
+    })
+
+    test('verif lancer : un agent ne vérifie que ses fichiers ; resultat avant la porte', async ($, on) => {
+      const w = world(on, os)
+      seedVerif(w, os)
+      const { front } = await launchVerif($, w)
+      expect(JSON.stringify(await $.tool.call({ tool: 'mcp__revo-flow__verif', action: 'lancer', agentId: front } as never))).toMatch(/aucun fichier modifié à ton nom/)
+      await $.tool.call({ tool: 'Edit', file_path: native(os, 'Documents', 'Front', 'ui-vel', 'components', 'Basket.vue'), agentId: front, tool_use_id: 'u1' } as never)
+      w.verifRun.tsc = RED
+      const r = JSON.stringify(await $.tool.call({ tool: 'mcp__revo-flow__verif', action: 'lancer', agentId: front } as never))
+      expect(r).toMatch(/« Front panier », 1 fichier/)
+      expect(r).toMatch(/TS2322/)
+      expect(JSON.stringify(await $.tool.call({ tool: 'mcp__revo-flow__verif', action: 'resultat' } as never))).toMatch(/aucune porte encore lancée/)
+      // Les actions de décision sont à l'orchestrateur.
+      expect(JSON.stringify(await $.tool.call({ tool: 'mcp__revo-flow__verif', action: 'exception', motif: 'x', agentId: front } as never))).toMatch(/réservée à l’orchestrateur/)
+    })
+  })
+}
+
+test('vérification en observateur : la porte rouge ne bloque pas, le flow est journalisé « observé »', { options: { verif: 'observer' } }, async ($, on) => {
+  const w = world(on)
+  seedVerif(w, WINDOWS)
+  const { front, api } = await launchVerif($, w)
+  await $.tool.call({ tool: 'Edit', file_path: FILE, agentId: front, tool_use_id: 'u1' } as never)
+  w.verifRun.tsc = RED
+  await endTurn($, w, front, 'completed')
+  await endTurn($, w, api, 'completed')
+  expect((await stop($)).block).toBeUndefined()
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' } as never)
+  await w.clock.settle()
+  expect(w.notified.join('\n')).toMatch(/vérif observée : non vérifié \(typecheck ✗\)/)
+  expect(await run($, 'historique')).toMatch(/· vérif observé/)
+})
+
+test('commandes : Échap à la question, pas de vérification pour ce flow ; Ajuster, la liste va à l’orchestrateur', async ($, on) => {
+  const w = world(on)
+  seedVerif(w, WINDOWS)
+  w.ctl.answer = DISMISS
+  await launch($, w)
+  expect((w.states.verif as { mode: string }).mode).toBe('off')
+  await run($, 'stop')
+  w.ctl.answer = 'Ajuster'
+  const r = await launch($, w)
+  expect((r.context ?? []).join('\n')).toMatch(/l'utilisateur veut ajuster les commandes de vérification de ui-vel[\s\S]*typecheck \(typage, portée projet/)
+  // La liste corrigée repasse par l'utilisateur.
+  w.ctl.answer = 'Utiliser'
+  const fixed = await $.tool.call({
+    tool: 'mcp__revo-flow__verif',
+    action: 'commandes',
+    commandes: [{ id: 'typecheck', outil: 'typage', argv: ['npx', 'tsc', '--noEmit', '-p', 'tsconfig.app.json'], portee: 'projet', format: 'tsc' }],
+  } as never)
+  expect(JSON.stringify(fixed)).toMatch(/1 commande confirmée par l’utilisateur/)
+  expect(w.asked.at(-1)!).toMatch(/tsconfig\.app\.json · orchestrateur/)
+})
+
+test('verif off : ni outil verif, ni consigne de porte, ni question', { options: { verif: 'off' } }, async ($, on) => {
+  const w = world(on)
+  seedVerif(w, WINDOWS)
+  const r = await launch($, w)
+  expect(w.registered).not.toContain('verif')
+  expect((r.context ?? []).join('\n')).not.toMatch(/porte revo-flow|mcp__revo-flow__verif/)
+  expect(w.asked).toEqual([])
+  await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN } as never)
+  await spawn($, 'Front panier')
+  expect(w.prompts[0]).not.toMatch(/mcp__revo-flow__verif/)
+})
+
+const PLAN_V2 = {
+  titre: 'Code promo panier',
+  resume: 'Un champ code promo.',
+  criteres: ['Un code promo expiré affiche une erreur sous le champ', 'Le total du panier est arrondi au centime'],
+  agents: [
+    { nom: 'Testeur', modele: 'sonnet', effort: 'high', taches: [{ titre: 'Tests de C1', type: 'test' }, { titre: 'Tests de C2', type: 'test' }] },
+    { nom: 'Front panier', modele: 'sonnet', effort: 'medium', taches: [{ titre: 'Ajouter le champ', type: 'codage' }] },
+    { nom: 'Vérificateur', type: 'revo-flow:verifier', modele: 'sonnet', effort: 'medium', taches: [{ titre: 'Juger les critères', type: 'review' }] },
+  ],
+}
+
+for (const os of OSES) {
+  test(`tests gelés (${os.nom}) : le testeur n’écrit que des tests, gelés à sa fin ; vérificateur en lecture seule, verdicts au panneau`, async ($, on) => {
+    const w = world(on, os)
+    await launch($, w)
+    await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN_V2 } as never)
+    // La validation montre les critères et le coût du testeur et du vérificateur.
+    expect(w.asked[0]!).toMatch(/Testeur — Sonnet 5\.5, effort high, 2 tâches \(testeur\)/)
+    expect(w.asked[0]!).toMatch(/Critères d'acceptation \(2\) :[\s\S]*C1 Un code promo expiré[\s\S]*C2 Le total/)
+    expect(w.asked[0]!).toMatch(/Coût estimé : testeur ≈ .* à .* · vérificateur ≈ /)
+    const tester = (await spawn($, 'Testeur')).agentId!
+    expect(w.prompts[0]).toMatch(/# Ton rôle : testeur revo-flow[\s\S]*- C1 : Un code promo expiré/)
+    const testFile = native(os, 'Documents', 'Front', 'ui-vel', 'tests', 'promo.test.ts')
+    const prodFile = native(os, 'Documents', 'Front', 'ui-vel', 'components', 'Basket.vue')
+    expect((await $.tool.call({ tool: 'Write', file_path: testFile, agentId: tester, tool_use_id: 'w1' } as never)).deny).toBeUndefined()
+    expect((await $.tool.call({ tool: 'Edit', file_path: prodFile, agentId: tester, tool_use_id: 'w2' } as never)).deny).toMatch(/n'est pas un fichier de test/)
+    await endTurn($, w, tester, 'completed')
+    expect(w.toasts.join('\n')).toMatch(/1 test de « Testeur » gelé/)
+    // Gelé : ni un autre agent, ni l'orchestrateur n'y touchent.
+    const front = (await spawn($, 'Front panier')).agentId!
+    expect((await $.tool.call({ tool: 'Edit', file_path: testFile, agentId: front, tool_use_id: 'e1' } as never)).deny).toMatch(/test gelé/)
+    expect((await $.tool.call({ tool: 'Edit', file_path: testFile, tool_use_id: 'e2' } as never)).deny).toMatch(/test gelé/)
+    expect((await $.tool.call({ tool: 'Edit', file_path: prodFile, agentId: front, tool_use_id: 'e3' } as never)).deny).toBeUndefined()
+    // Le dégel passe par l'utilisateur.
+    w.ctl.answer = 'Garder gelé'
+    expect(JSON.stringify(await $.tool.call({ tool: 'mcp__revo-flow__verif', action: 'degeler', fichiers: ['tests/promo.test.ts'], motif: 'le test attend un arrondi faux' } as never))).toMatch(/garde ces tests gelés/)
+    // Le vérificateur : sa tâche (critères, diff), son Bash filtré, ses verdicts au panneau.
+    const verifier = (await spawn($, 'Vérificateur')).agentId!
+    expect(w.prompts.at(-1)).toMatch(/# Vérification du flow[\s\S]*- C2 : Le total du panier/)
+    expect((await $.tool.call({ tool: 'Bash', command: 'rm -rf components', agentId: verifier, tool_use_id: 'b1' } as never)).deny).toMatch(/lecture seule/)
+    expect((await $.tool.call({ tool: 'Bash', command: 'git diff --stat', agentId: verifier, tool_use_id: 'b2' } as never)).deny).toBeUndefined()
+    const answer = '```json\n[{"id":"C1","verdict":"ok","preuve":"npx vitest run tests/promo.test.ts → ✓ C1"},{"id":"C2","verdict":"ko","preuve":"expected 10.005 to be 10.01"}]\n```'
+    await $.turn.complete({ answer, durationMs: 1, isAborted: false, turnId: 'v', reason: 'answer', agentId: verifier } as never)
+    expect((w.states.verif as { criteres?: { total: number; ok: number } }).criteres).toMatchObject({ total: 2, ok: 1 })
+    w.ctl.answer = 'Dégeler'
+    expect(JSON.stringify(await $.tool.call({ tool: 'mcp__revo-flow__verif', action: 'degeler', fichiers: ['tests/promo.test.ts'], motif: 'le test attend un arrondi faux' } as never))).toMatch(/dégelé par l’utilisateur/)
+    expect((await $.tool.call({ tool: 'Edit', file_path: testFile, agentId: front, tool_use_id: 'e4' } as never)).deny).toBeUndefined()
+  })
+}
+
+test('test gelé modifié par Bash : la porte reste rouge sans l’accord de l’utilisateur', async ($, on) => {
+  const w = world(on)
+  seedVerif(w, WINDOWS)
+  w.ctl.answer = 'Utiliser'
+  await launch($, w)
+  w.ctl.answer = 'Lancer'
+  await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN_V2 } as never)
+  const tester = (await spawn($, 'Testeur')).agentId!
+  await $.tool.call({ tool: 'Write', file_path: `${ROOT}\\tests\\promo.test.ts`, agentId: tester, tool_use_id: 'w1' } as never)
+  await endTurn($, w, tester, 'completed')
+  const front = (await spawn($, 'Front panier')).agentId!
+  const verifier = (await spawn($, 'Vérificateur')).agentId!
+  // Un Bash réécrit le test gelé : son hash change.
+  w.hashes['tests/promo.test.ts'] = 'f'.repeat(40)
+  w.ctl.answer = 'Refuser'
+  await endTurn($, w, front, 'completed')
+  await endTurn($, w, verifier, 'completed')
+  const r = await stop($)
+  expect(w.asked.join('\n')).toMatch(/Le test gelé tests\/promo\.test\.ts \(écrit par « testeur »\) a été modifié hors des outils/)
+  expect(r.block).toMatch(/Garde-fous :[\s\S]*Test gelé tests\/promo\.test\.ts modifié hors outil : refusé par l’utilisateur/)
+})
+
+test('critères : parsePlan les numérote, refuse un critère vague ; planMarkdown et le coût estimé', () => {
+  const ok = parsePlan(PLAN_V2 as never)
+  if (!('plan' in ok)) throw new Error('plan invalide')
+  expect(ok.plan.criteres).toEqual([
+    { id: 'C1', texte: 'Un code promo expiré affiche une erreur sous le champ' },
+    { id: 'C2', texte: 'Le total du panier est arrondi au centime' },
+  ])
+  expect(ok.plan.agents.find(a => a.name === 'Vérificateur')?.subagentType).toBe('revo-flow:verifier')
+  expect(isTester(ok.plan.agents[0]!)).toBe(true)
+  expect(isTester(ok.plan.agents[1]!)).toBe(false)
+  expect(verifCost(ok.plan)).toMatch(/^testeur ≈ 0,28 € à 0,74 € · vérificateur ≈ 0,18 € à 0,46 €$/)
+  const bad = parsePlan({ ...PLAN_V2, criteres: ['ça marche'] } as never)
+  expect('error' in bad && bad.error).toMatch(/^« criteres » : C1 « ça marche » n’est pas vérifiable/)
+  // Sans critères : le plan de la v1.5, inchangé.
+  const plain = parsePlan(PLAN as never)
+  expect('plan' in plain && plain.plan.criteres).toBeUndefined()
+  expect('plan' in plain && verifCost(plain.plan)).toBeUndefined()
+  const md = planMarkdown(ok.plan)
+  expect(md).toMatch(/## Critères d'acceptation\n\n- \*\*C1\*\* Un code promo expiré affiche une erreur sous le champ\n- \*\*C2\*\* Le total/)
+  expect(md).toMatch(/\*Coût estimé : testeur ≈/)
+  expect(planQuestion(ok.plan)).toMatch(/Vérificateur — Sonnet 5\.5, effort medium, 1 tâche \(vérificateur\)/)
+})
+
+test('consignes v2 : la porte vérifie, testeur et vérificateur proposés avec des critères, revue d’un gros flow ; verif lancer pour chaque agent', () => {
+  expect(LEAD_BRIEF).toMatch(/4\. Fin : quand tous ont fini, la porte revo-flow vérifie[\s\S]*lis son rapport et décide/)
+  expect(LEAD_BRIEF).toMatch(/mcp__revo-flow__verif action exception, avec motif/)
+  expect(LEAD_BRIEF).toMatch(/critères d'acceptation \(criteres, 1 à 8[\s\S]*testeur[\s\S]*vérificateur \(type revo-flow:verifier/)
+  expect(LEAD_BRIEF).toMatch(/revue \(\/code-review\)/)
+  expect(LEAD_BRIEF).not.toMatch(/vérifie l'ensemble \(tests et lint ciblés\)/)
+  // Sans porte (verif off) : l'étape 4 de la v1.5, rien sur la porte ni les critères.
+  const off = leadBrief(true, false)
+  expect(off).toMatch(/vérifie l'ensemble \(tests et lint ciblés\)/)
+  expect(off).not.toMatch(/porte|criteres|verif/)
+  expect(leadBrief(false, true)).not.toMatch(/cache|rafraichir|extrait/i)
+  const a = agentOf({ tasks: [{ title: 'Coder', kind: 'codage', status: 'pending' }] })
+  expect(agentBrief(a)).toMatch(/Avant de finir, appelle l'outil mcp__revo-flow__verif action lancer sur tes fichiers ; corrige ce qui est nouveau et à toi/)
+  expect(agentBrief(a, 'fiches', [], false)).not.toMatch(/mcp__revo-flow__verif/)
+  expect(agentBrief(agentOf({ subagentType: 'Explore', tasks: [] }))).not.toMatch(/mcp__revo-flow__verif/)
+  expect(agentBrief(agentOf({ subagentType: 'revo-flow:verifier', tasks: [] }))).not.toMatch(/mcp__revo-flow__verif/)
+})
+
+test('historique : la colonne vérif (✓, ✗ accepté, observé, —)', () => {
+  const entry = (id: string, verif?: unknown) => ({
+    id,
+    title: `Flow ${id}`,
+    project: 'ui-vel',
+    branch: 'main',
+    startedAt: NOW,
+    durationMs: 60_000,
+    isStopped: false,
+    files: 1,
+    lead: { modelId: 'claude-opus-5-5', costUsd: 0.1, tokens: 1000 },
+    agents: [],
+    ...(verif ? { verif } : {}),
+  })
+  const base = { tentatives: 1, premierRouge: false, nouvelles: 0, preexistantes: 0, dureeMs: 1000, triches: 0 }
+  const h = historyText([
+    entry('1', { ...base, etat: 'verifie' }),
+    entry('2', { ...base, etat: 'non-verifie', accepte: true }),
+    entry('3', { ...base, etat: 'observe' }),
+    entry('4'),
+  ])
+  expect(h).toMatch(/Flow 1 .* · vérif ✓/)
+  expect(h).toMatch(/Flow 2 .* · vérif ✗ accepté/)
+  expect(h).toMatch(/Flow 3 .* · vérif observé/)
+  expect(h).toMatch(/Flow 4 .* · vérif —/)
+  expect(verifMark({ ...base, etat: 'erreur' })).toBe('✗ erreur')
+  expect(verifMark({ ...base, etat: 'non-verifie' })).toBe('✗')
 })

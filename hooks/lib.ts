@@ -1,10 +1,14 @@
 /** La logique pure du flow : plan, appariement des agents, tâches et progression, consignes, tokens et coûts, journal. */
-import type { Effort, Flow, FlowAgent, FlowTask, ModelKey, Phase, TaskKind, TaskStatus, Tally } from '../types'
+import type { Critere, Effort, Flow, FlowAgent, FlowTask, ModelKey, Phase, TaskKind, TaskStatus, Tally, VerifJournal } from '../types'
+import { parseCriteres } from './verif/garde'
 
 export const PLUGIN = 'revo-flow'
 export const PLAN_TOOL = `mcp__${PLUGIN}__plan`
 export const STEP_TOOL = `mcp__${PLUGIN}__step`
 export const CACHE_TOOL = `mcp__${PLUGIN}__cache`
+export const VERIF_TOOL = `mcp__${PLUGIN}__verif`
+/** Le type d'agent du vérificateur (lot 2) : lecture seule, enregistré par register.tsx. */
+export const VERIFIER_TYPE = `${PLUGIN}:verifier`
 
 // ── Modèles ──────────────────────────────────────────────────────────────
 
@@ -37,6 +41,8 @@ export type PlanInput = {
   title: string
   summary: string
   agents: Omit<FlowAgent, 'status' | 'tokens' | 'costUsd'>[]
+  /** Les critères d'acceptation (lot 2), 1 à 8 ; absents quand l'orchestrateur n'en donne pas. */
+  criteres?: Critere[]
 }
 
 /** « Front Panier » → « front-panier » : pour retrouver un agent d'après la description de l'appel Agent. */
@@ -79,15 +85,40 @@ export function parsePlan(input: Record<string, unknown>): { plan: PlanInput } |
       key,
       name,
       role: str(a.role).slice(0, 160),
-      subagentType: str(a.type) || 'general-purpose',
+      subagentType: typeOf(str(a.type)),
       model: model as ModelKey,
       effort: effort as Effort,
       why: str(a.pourquoi).slice(0, 160),
       tasks,
     })
   }
-  return { plan: { title, summary: str(input.resume).slice(0, 400), agents } }
+  // Les critères d'acceptation : facultatifs ; donnés, ils doivent être valides (1 à 8, vérifiables), sinon le plan est refusé.
+  const rawCriteres = input.criteres
+  const hasCriteres = rawCriteres !== undefined && rawCriteres !== null && !(Array.isArray(rawCriteres) && rawCriteres.length === 0)
+  let criteres: Critere[] | undefined
+  if (hasCriteres) {
+    const c = parseCriteres(rawCriteres)
+    if ('error' in c) return { error: `« criteres » : ${c.error}` }
+    criteres = c.criteres
+  }
+  return { plan: { title, summary: str(input.resume).slice(0, 400), agents, ...(criteres?.length ? { criteres } : {}) } }
 }
+
+/** Le type de sous-agent : « verifier » ou « revo-flow:verifier » désignent le vérificateur enregistré par revo-flow. */
+function typeOf(raw: string): string {
+  if (!raw) return 'general-purpose'
+  return /^(revo-flow:)?verifi(er|cateur)$/i.test(raw) ? VERIFIER_TYPE : raw
+}
+
+/** Le testeur (lot 2) : un agent dont toutes les tâches sont de type test. Ses fichiers de test sont gelés à sa fin. */
+export const isTester = (a: Pick<FlowAgent, 'tasks'>) => a.tasks.length > 0 && a.tasks.every(t => t.kind === 'test')
+
+/** Le vérificateur (lot 2) : un agent du type revo-flow:verifier. */
+export const isVerifier = (a: Pick<FlowAgent, 'subagentType'>) => a.subagentType === VERIFIER_TYPE
+
+/** Coût estimé d'un testeur et d'un vérificateur, en dollars (docs/rd-v2/conception.md §12, estimation). */
+export const TESTER_USD = [0.3, 0.8] as const
+export const VERIFIER_USD = [0.2, 0.5] as const
 
 function kindOf(raw: string): TaskKind {
   const l = slug(raw)
@@ -256,15 +287,21 @@ export const allFinished = (flow: Flow) =>
 
 /**
  * Ajoutées, invisibles, à la demande envoyée par /revo-flow : le rôle de l'orchestrateur. Sans cache (option
- * désactivée), rien n'y parle du cache ni de son outil.
+ * désactivée), rien n'y parle du cache ni de son outil ; sans vérification (option verif à off), l'orchestrateur
+ * vérifie lui-même comme en v1.5, et rien n'y parle de la porte, des critères ni de l'outil verif.
  */
-export function leadBrief(withCache: boolean): string {
+export function leadBrief(withCache: boolean, withVerif = true): string {
   const cache = (s: string) => (withCache ? s : '')
+  const verif = (s: string) => (withVerif ? s : '')
+  const end = withVerif
+    ? `4. Fin : quand tous ont fini, la porte revo-flow vérifie (lint, typage et tests liés sur les fichiers du flow, comparés à la base de référence) ; lis son rapport et décide : corrige toi-même, reprends l'agent avec SendMessage ou relance-le. Seules les erreurs nouvelles bloquent ; demande une exception (${VERIF_TOOL} action exception, avec motif) seulement pour une erreur qui ne relève pas de ce flow`
+    : `4. Fin : quand tous ont fini, vérifie l'ensemble (tests et lint ciblés) et corrige si besoin`
   return `# revo-flow — tu es l'orchestrateur de cette demande
 1. Plan : ${cache(`commence par le cache revo-flow ci-dessous s'il y en a un, une carte, pas la vérité : vérifie dans le code ce que tu affirmes ou changes. S'il connaît la feature, ne lis que les fichiers à modifier et ceux modifiés depuis l'apprentissage. Puis `)}lis toi-même la demande et les specs utiles, seulement le nécessaire, sans rien modifier. Pas de sous-agent avant le plan, sauf un éclaireur Explore (lecture seule, haiku ou sonnet) quand la lecture est large : revo-flow demande l'accord de l'utilisateur.
-2. Équipe : appelle UNE fois l'outil ${PLAN_TOOL} : titre, résumé, et 1 à 6 sous-agents, pas plus que le travail ne le demande. Pour chacun : nom court et unique, rôle, type (general-purpose par défaut, Explore pour de la lecture seule), modèle le plus fiable pour SES tâches (haiku : mécanique et localisé ; sonnet : la plupart des features et correctifs ; opus : transverse, ambigu, délicat, sécurité), effort (low à xhigh), et 2 à 10 tâches courtes à l'infinitif avec leur type. Découpe pour qu'ils avancent en parallèle sans modifier les mêmes fichiers.
+2. Équipe : appelle UNE fois l'outil ${PLAN_TOOL} : titre, résumé, et 1 à 6 sous-agents, pas plus que le travail ne le demande. Pour chacun : nom court et unique, rôle, type (general-purpose par défaut, Explore pour de la lecture seule), modèle le plus fiable pour SES tâches (haiku : mécanique et localisé ; sonnet : la plupart des features et correctifs ; opus : transverse, ambigu, délicat, sécurité), effort (low à xhigh), et 2 à 10 tâches courtes à l'infinitif avec leur type. Découpe pour qu'ils avancent en parallèle sans modifier les mêmes fichiers.${verif(`
+   Vérification : donne des critères d'acceptation (criteres, 1 à 8, chacun vérifiable par une commande ou un test) quand la demande s'y prête. Avec des critères, à toi de juger s'il faut un testeur (un agent dont toutes les tâches sont de type test, au moins du niveau des implémenteurs : il écrit les tests à partir des critères et des interfaces, revo-flow les gèle à sa fin) et un vérificateur (type ${VERIFIER_TYPE}, sonnet medium, lecture seule : il juge chaque critère avec une preuve exécutée, après les autres). Un gros flow (beaucoup de fichiers, plusieurs agents) mérite aussi une revue (/code-review) avant de conclure.`)}
 3. Exécution : lance chaque agent avec l'outil Agent (description = son nom exact), dans un même message quand ils sont indépendants ; prompt = sa mission et le contexte utile (fichiers, conventions, contraintes, ce que font les autres). revo-flow ajoute lui-même son modèle, son effort, sa liste de tâches${cache(` et l'extrait de fiche du cache qui le concerne : ajoute seulement ce qui manque (pièges transverses, décisions)`)} ; ne les recopie pas.
-4. Fin : quand tous ont fini, vérifie l'ensemble (tests et lint ciblés) et corrige si besoin${cache(`. Puis, pour chaque feature touchée, ${CACHE_TOOL} action « apprendre » (feature, titre, alias, resume, flux, entrees, fichiers et rôles, pièges, corrections de ce que le cache disait de faux) ; pour une fiche seulement périmée et toujours juste, action « rafraichir » (feature, fichiers relus)`)}. Conclus par une synthèse courte.
+${end}${cache(`. Puis, pour chaque feature touchée, ${CACHE_TOOL} action « apprendre » (feature, titre, alias, resume, flux, entrees, fichiers et rôles, pièges, corrections de ce que le cache disait de faux) ; pour une fiche seulement périmée et toujours juste, action « rafraichir » (feature, fichiers relus)`)}. Conclus par une synthèse courte.
 Ne fais pas toi-même les tâches confiées aux sous-agents. Pas de commit, de push ni de MR sans que l'utilisateur le demande.`
 }
 
@@ -297,7 +334,7 @@ export const remainingTasks = (a: FlowAgent) => a.tasks.filter(t => t.status ===
  * et l'état du flow ; on les redonne tels quels au modèle. `cache` : la ligne du cache (fiche servie, features
  * connues), ou false quand le cache est désactivé.
  */
-export function flowRecap(flow: Flow, cache?: string | false): string {
+export function flowRecap(flow: Flow, cache?: string | false, withVerif = true): string {
   const rows = flow.agents.map(a => {
     const left = remainingTasks(a)
     const todo = left.length ? `reste : ${left.map(t => t.title).join(' ; ')}` : 'plus rien à faire'
@@ -305,7 +342,7 @@ export function flowRecap(flow: Flow, cache?: string | false): string {
     return `- « ${a.name} » (${MODELS[a.model].label}, effort ${a.effort}) [${state}] — ${todo}`
   })
   return [
-    cache === false ? leadBrief(false) : LEAD_BRIEF,
+    leadBrief(cache !== false, withVerif),
     '',
     `# État du flow revo-flow (rappel après compaction)`,
     `Feature : « ${flow.title} » — phase : ${PHASE_LABEL[flow.phase]}.`,
@@ -319,12 +356,35 @@ export function flowRecap(flow: Flow, cache?: string | false): string {
   ].join('\n')
 }
 
-/** Le texte du dialogue de validation du plan : chaque agent, son modèle, son effort et son nombre de tâches. */
+/**
+ * Le texte du dialogue de validation du plan : chaque agent, son modèle, son effort et son nombre de tâches ; puis les critères
+ * d'acceptation et le coût estimé du testeur et du vérificateur s'il y en a.
+ */
 export function planQuestion(plan: PlanInput): string {
   const rows = plan.agents.map(
-    a => `• ${a.name} — ${MODELS[a.model].label}, effort ${a.effort}, ${a.tasks.length} tâche${a.tasks.length > 1 ? 's' : ''}`,
+    a => `• ${a.name} — ${MODELS[a.model].label}, effort ${a.effort}, ${a.tasks.length} tâche${a.tasks.length > 1 ? 's' : ''}${isTester(a) ? ' (testeur)' : isVerifier(a) ? ' (vérificateur)' : ''}`,
   )
-  return [`Plan « ${plan.title} » : ${plan.agents.length} agent${plan.agents.length > 1 ? 's' : ''}.`, ...rows, 'Lancer ce plan ?'].join('\n')
+  const criteres = plan.criteres?.length ? [`Critères d'acceptation (${plan.criteres.length}) :`, ...plan.criteres.map(c => `  ${c.id} ${c.texte}`)] : []
+  const cost = verifCost(plan)
+  return [
+    `Plan « ${plan.title} » : ${plan.agents.length} agent${plan.agents.length > 1 ? 's' : ''}.`,
+    ...rows,
+    ...criteres,
+    ...(cost ? [`Coût estimé : ${cost}`] : []),
+    'Lancer ce plan ?',
+  ].join('\n')
+}
+
+/** « testeur ≈ 0,28 € à 0,74 € · vérificateur ≈ 0,18 € à 0,46 € » pour les agents du plan concernés ; rien sans eux. */
+export function verifCost(plan: PlanInput): string | undefined {
+  const range = (r: readonly [number, number], n: number) => `${euros(r[0] * n)} à ${euros(r[1] * n)}`
+  const testers = plan.agents.filter(isTester).length
+  const verifiers = plan.agents.filter(isVerifier).length
+  const parts = [
+    ...(testers ? [`testeur${testers > 1 ? 's' : ''} ≈ ${range(TESTER_USD, testers)}`] : []),
+    ...(verifiers ? [`vérificateur${verifiers > 1 ? 's' : ''} ≈ ${range(VERIFIER_USD, verifiers)}`] : []),
+  ]
+  return parts.length ? parts.join(' · ') : undefined
 }
 
 /** Ce que le fichier plan.md ajoute à l'aperçu : la demande, le projet et l'heure. */
@@ -346,6 +406,11 @@ export function planMarkdown(plan: PlanInput, meta?: PlanMeta): string {
   }
   if (plan.summary) out.push(plan.summary, '')
   out.push(`**${plan.agents.length} agent${plan.agents.length > 1 ? 's' : ''} · ${tasks} tâche${tasks > 1 ? 's' : ''}**`, '')
+  if (plan.criteres?.length) {
+    out.push(`## Critères d'acceptation`, '', ...plan.criteres.map(c => `- **${c.id}** ${c.texte}`), '')
+    const cost = verifCost(plan)
+    if (cost) out.push(`*Coût estimé : ${cost}*`, '')
+  }
   for (const [i, a] of plan.agents.entries()) {
     out.push(`## ${i + 1}. ${a.name}`, '', `${MODELS[a.model].label} · effort ${a.effort} · ${a.subagentType}`, '')
     if (a.role) out.push(`*${a.role}*`, '')
@@ -371,16 +436,21 @@ Le cache est une carte, pas la vérité : vérifie dans le code ce que tu modifi
 /**
  * Ajouté au prompt du sous-agent : ses tâches (celles déjà faites lors d'un lancement précédent cochées), comment
  * les signaler et, avec le cache, comment s'en servir. `others` : les noms des autres agents du plan, ceux qu'il
- * peut attendre (statut attente).
+ * peut attendre (statut attente). `verif` : la porte est active, l'agent lance verif sur ses fichiers avant de finir
+ * (sauf un agent en lecture seule : Explore ou vérificateur).
  */
-export function agentBrief(a: FlowAgent, cache: AgentCache | boolean = 'fiches', others: readonly string[] = []): string {
+export function agentBrief(a: FlowAgent, cache: AgentCache | boolean = 'fiches', others: readonly string[] = [], verif = true): string {
   const mode = cache === true ? 'fiches' : cache
   const done = a.tasks.filter(t => t.status === 'completed').length
   const resume = done > 0 && done < a.tasks.length
+  const check =
+    verif && a.subagentType !== 'Explore' && !isVerifier(a)
+      ? `\nAvant de finir, appelle l'outil ${VERIF_TOOL} action lancer sur tes fichiers ; corrige ce qui est nouveau et à toi (les erreurs préexistantes ou d'un autre agent ne sont pas à toi).`
+      : ''
   return `# Tes tâches (revo-flow) — « ${a.name} »${a.role ? ` : ${a.role}` : ''}
 ${a.tasks.map((t, i) => `${i + 1}. ${t.title}${t.status === 'completed' ? ' ✓ déjà faite' : ''}`).join('\n')}
 ${resume ? `Reprise : les tâches cochées ✓ ont été faites lors d'un lancement précédent ; ne les refais pas, reprends à la première qui ne l'est pas (garde sa numérotation).\n` : ''}${mode ? `\n${AGENT_CACHE[mode]}\n` : ''}
-Suivi : fais ces tâches dans l'ordre. Au début de chacune, appelle l'outil ${STEP_TOOL} avec {"tache": <numéro>, "statut": "en_cours"} : cela clôt la précédente, et la dernière est close quand tu finis, donc "fait" est inutile. "attente" avec "attend" = le nom de l'agent du plan dont tu dépends si la tâche ne peut pas avancer tant qu'il n'a pas fini (termine alors ta réponse en disant ce qui manque : revo-flow te relancera quand il aura fini) ; "echec" seulement pour ce que tu ne peux pas faire du tout, en expliquant pourquoi dans ta réponse. N'utilise cet outil pour rien d'autre.${others.length ? `\nLes autres agents du plan (à nommer dans "attend") : ${others.map(n => `« ${n} »`).join(', ')}.` : ''}`
+Suivi : fais ces tâches dans l'ordre. Au début de chacune, appelle l'outil ${STEP_TOOL} avec {"tache": <numéro>, "statut": "en_cours"} : cela clôt la précédente, et la dernière est close quand tu finis, donc "fait" est inutile. "attente" avec "attend" = le nom de l'agent du plan dont tu dépends si la tâche ne peut pas avancer tant qu'il n'a pas fini (termine alors ta réponse en disant ce qui manque : revo-flow te relancera quand il aura fini) ; "echec" seulement pour ce que tu ne peux pas faire du tout, en expliquant pourquoi dans ta réponse. N'utilise cet outil pour rien d'autre.${others.length ? `\nLes autres agents du plan (à nommer dans "attend") : ${others.map(n => `« ${n} »`).join(', ')}.` : ''}${check}`
 }
 
 // ── Tokens, jour et semaine ──────────────────────────────────────────────
@@ -629,6 +699,8 @@ export type JournalEntry = {
     attempts: number
     durationMs: number
   }[]
+  /** La vérification du flow (v2) ; absente pour un flow d'avant la v2 ou sans porte. */
+  verif?: VerifJournal
 }
 
 /** Au plus autant de flows gardés dans le journal. */
@@ -641,6 +713,19 @@ const isEntry = (v: unknown): v is JournalEntry =>
 export function addToJournal(prev: unknown, entry: JournalEntry): JournalEntry[] {
   const list = Array.isArray(prev) ? prev.filter(isEntry).filter(e => e.id !== entry.id) : []
   return [entry, ...list].slice(0, JOURNAL_MAX)
+}
+
+/**
+ * La colonne « vérif » de l'historique : ✓ vérifié ; ✗ accepté (fini rouge sur décision de l'utilisateur) ; ✗ (rouge sans
+ * décision, sans personne à qui demander) ; ✗ erreur (revo-flow a planté, la porte s'est ouverte) ; observé ; — sans porte.
+ */
+export function verifMark(v: VerifJournal | undefined): string {
+  if (!v) return '—'
+  if (v.etat === 'verifie') return '✓'
+  if (v.etat === 'non-verifie') return v.accepte ? '✗ accepté' : '✗'
+  if (v.etat === 'erreur') return '✗ erreur'
+  if (v.etat === 'observe') return 'observé'
+  return '—'
 }
 
 /** Le coût d'un flow : l'orchestrateur et ses agents. */
@@ -663,7 +748,7 @@ export function historyText(raw: unknown, n = 10): string {
       failed ? `${failed} en échec` : '',
       relaunched ? `${relaunched} relance${relaunched > 1 ? 's' : ''}` : '',
     ].filter(Boolean)
-    return `  ${dayKey(d)} ${p(d.getHours())}:${p(d.getMinutes())}  ${e.title} (${e.project}) · ${fmtDuration(e.durationMs)} · ${euros(entryCost(e))} · ${e.agents.length} agent${e.agents.length > 1 ? 's' : ''}${extra.length ? ` · ${extra.join(', ')}` : ''}`
+    return `  ${dayKey(d)} ${p(d.getHours())}:${p(d.getMinutes())}  ${e.title} (${e.project}) · ${fmtDuration(e.durationMs)} · ${euros(entryCost(e))} · ${e.agents.length} agent${e.agents.length > 1 ? 's' : ''}${extra.length ? ` · ${extra.join(', ')}` : ''} · vérif ${verifMark(e.verif)}`
   })
   const byModel = new Map<string, { n: number; cost: number; failed: number; relaunch: number }>()
   for (const a of all.flatMap(e => e.agents)) {
