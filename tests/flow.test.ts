@@ -26,6 +26,8 @@ import {
   verifMark,
 } from '../hooks/lib'
 import { bestFeatureLine, measureLine } from '../hooks/ui/views'
+import { readSnapshot, resumedFlow, type FlowSnapshot } from '../hooks/reprise'
+import type { JournalEntry } from '../hooks/lib'
 import type { Flow, FlowAgent } from '../types'
 import type { CacheStats } from '../types/cache'
 import { MACOS, OSES, WINDOWS, diskKey, native, type Os } from './helpers/os'
@@ -56,8 +58,19 @@ const PLAN = {
   ],
 }
 
-function world(on: On, os: Os = WINDOWS) {
-  mock.store(on, {})
+function world(on: On, os: Os = WINDOWS, store: Record<string, unknown> = {}) {
+  // Le store du plugin en mémoire, lisible par le test (instantané de reprise, journal) ; une copie à chaque lecture et écriture.
+  const copy = (v: unknown) => (v === undefined ? undefined : (JSON.parse(JSON.stringify(v)) as unknown))
+  on('store.get', (_$, e) => ({ value: copy(store[e.key]) }) as never)
+  on('store.set', (_$, e) => {
+    store[e.key] = copy(e.value)
+    return { value: undefined } as never
+  })
+  on('store.delete', (_$, e) => {
+    delete store[e.key]
+    return { value: undefined } as never
+  })
+  on('store.keys', () => ({ value: Object.keys(store) }) as never)
   mock.env(on, os.env)
   const clock = mock.clock(on, { now: NOW })
   const sent: { text: string; context: readonly string[] }[] = []
@@ -218,6 +231,7 @@ function world(on: On, os: Os = WINDOWS) {
   on('ui.render', (hook$, e) => h(hook$.ui.resolve(e).Box as never, {}) as never)
   return {
     clock,
+    store,
     sent,
     opened,
     prompts,
@@ -1981,4 +1995,188 @@ test('sans agent installé : aucun bloc de catalogue, consigne inchangée', asyn
   const started = await launch($, w)
   const context = (started.context ?? []).join('\n')
   expect(context).not.toMatch(/catalogue|Agents installés/)
+})
+
+// ── Reprise après redémarrage (rd-v3 §2.3) ──────────────────────────────
+
+/** Les instantanés de flow dans le store du plugin. */
+const snapshots = (w: ReturnType<typeof world>) => Object.keys(w.store).filter(k => k.startsWith('flow:'))
+/** Les tâches restantes de chaque agent, par nom. */
+const leftByAgent = (flow: Flow) => Object.fromEntries(flow.agents.map(a => [a.name, remainingTasks(a).map(t => t.title)]))
+
+const task = (title: string, status: FlowAgent['tasks'][number]['status']) => ({ title, kind: 'codage' as const, status })
+const snapAgent = (key: string, name: string, status: FlowAgent['status'], tasks: FlowAgent['tasks'], more: Partial<FlowAgent> = {}): FlowAgent => ({
+  key,
+  name,
+  role: '',
+  subagentType: 'general-purpose',
+  model: 'sonnet',
+  effort: 'medium',
+  why: '',
+  tasks,
+  status,
+  tokens: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 },
+  costUsd: 0.1,
+  ...more,
+})
+
+/**
+ * L'instantané d'un flow à mi-course, tel qu'une session morte l'a laissé : un agent actif (tâche 2 en cours), un fini, un en
+ * attente d'un autre, un jamais lancé.
+ */
+const midSnapshot = (project = 'ui-vel'): FlowSnapshot => ({
+  v: 1,
+  savedAt: NOW + 120_000,
+  flow: {
+    id: '42',
+    request: 'ajoute un code promo dans le panier avec validation côté API',
+    title: 'Code promo panier',
+    summary: 'Un champ code promo dans le panier.',
+    project,
+    branch: 'feat/promo',
+    phase: 'running',
+    startedAt: NOW,
+    isApproved: true,
+    agents: [
+      snapAgent('front-panier', 'Front panier', 'running', [task('Lire le panier', 'completed'), task('Ajouter le champ', 'in_progress'), task('Tester', 'pending')], {
+        agentId: 'a-front',
+        startedAt: NOW + 1000,
+        attempts: 1,
+        isDoing: true,
+      }),
+      snapAgent('api-promo', 'API promo', 'done', [task('Ajouter la mutation', 'completed')], { startedAt: NOW + 1000, endedAt: NOW + 60_000, attempts: 1 }),
+      snapAgent('tests', 'Tests', 'blocked', [task('Lire', 'completed'), task('Écrire les tests', 'pending')], {
+        lastAgentId: 'a-tests',
+        waitingFor: { key: 'front-panier', name: 'Front panier', since: NOW + 50_000 },
+        attempts: 1,
+      }),
+      snapAgent('doc', 'Doc', 'waiting', [task('Documenter', 'pending')]),
+    ],
+  },
+  lead: { modelId: 'claude-opus-5-5', tokens: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0 }, costUsd: 0.5 },
+  entries: [{ path: FILE, rel: 'components/Basket.vue', reason: 'Le champ code promo.', count: 1, at: NOW + 30_000, by: 'front-panier' }],
+})
+
+for (const os of OSES) {
+  describe(`reprise après redémarrage (${os.nom})`, () => {
+    test('un flow à mi-course est écrit dans le store, relu il donne les tâches restantes ; la fin normale l’efface', async ($, on) => {
+      const w = world(on, os)
+      expect(snapshots(w)).toEqual([])
+      const { front, api } = await twoRunning($, w)
+      await $.tool.call({ tool: STEP, agentId: front, tache: 2, statut: 'en_cours' } as never)
+      await w.clock.settle()
+      expect(snapshots(w)).toEqual([`flow:${NOW}`])
+      const saved = readSnapshot(w.store[`flow:${NOW}`])!
+      expect(saved.flow.phase).toBe('running')
+      expect(saved.flow.agents.map(a => [a.name, a.status, a.tasks.map(t => t.status)])).toEqual([
+        ['Front panier', 'running', ['completed', 'in_progress', 'pending']],
+        ['API promo', 'running', ['pending', 'pending', 'pending', 'pending', 'pending', 'pending', 'pending']],
+      ])
+      expect(saved.lead.modelId).toBe('claude-opus-5-5')
+      // Relu après un redémarrage : personne d'actif, les tâches faites restent faites.
+      const back = resumedFlow(saved.flow)
+      expect(back.agents.filter(a => a.status === 'running')).toEqual([])
+      expect(back.agents.every(a => a.agentId === undefined)).toBe(true)
+      expect(leftByAgent(back)).toEqual({
+        'Front panier': ['Ajouter le champ', 'Tester'],
+        'API promo': ['Lire le schéma', 'Ajouter la mutation', 'Écrire les tests', 'Relire', 'Documenter', 'Vérifier le lint', 'Synthèse'],
+      })
+
+      // Fin normale : le flow passe en done, l'instantané disparaît, le journal le garde.
+      await endTurn($, w, front, 'completed')
+      await endTurn($, w, api, 'completed')
+      await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' } as never)
+      await w.clock.settle()
+      expect((w.states.flow as Flow).phase).toBe('done')
+      expect(snapshots(w)).toEqual([])
+      expect((w.store.journal as JournalEntry[])[0]).toMatchObject({ id: String(NOW), isStopped: false })
+    })
+
+    test('/revo-flow stop efface l’instantané ; un nouveau flow remplace celui de l’ancien', async ($, on) => {
+      const w = world(on, os)
+      await twoRunning($, w)
+      await w.clock.settle()
+      expect(snapshots(w)).toEqual([`flow:${NOW}`])
+      w.ctl.answer = 'Tout arrêter'
+      await run($, 'stop')
+      await w.clock.settle()
+      expect(snapshots(w)).toEqual([])
+      await w.clock.advance(5000)
+      w.ctl.answer = 'Lancer'
+      await launch($, w)
+      await w.clock.settle()
+      const id = (w.states.flow as Flow).id
+      expect(id).not.toBe(String(NOW))
+      expect(snapshots(w)).toEqual([`flow:${id}`])
+    })
+
+    test('redémarrage, Reprendre : chaque agent non terminé est à relancer sur ses tâches restantes, aucun actif, le panneau se rouvre', async ($, on) => {
+      const w = world(on, os, { 'flow:42': midSnapshot() })
+      w.ctl.answer = 'Reprendre'
+      await $.session.start({ cwd: rootOf(os), surface: 'terminal', isInteractive: true })
+      await w.clock.advance(1)
+      await w.clock.settle()
+      expect(w.asked.join('\n')).toMatch(/« Code promo panier » \(3 agents à relancer\)\. Le reprendre \?/)
+      const flow = w.states.flow as Flow
+      expect(flow.id).toBe('42')
+      expect(flow.phase).toBe('running')
+      expect(flow.agents.map(a => a.status)).toEqual(['waiting', 'done', 'waiting', 'waiting'])
+      expect(flow.agents.filter(a => a.status === 'running' || a.agentId || a.lastAgentId || a.waitingFor)).toEqual([])
+      expect(flow.agents.map(a => a.attempts)).toEqual([2, 1, 2, 1])
+      expect(leftByAgent(flow)).toEqual({ 'Front panier': ['Ajouter le champ', 'Tester'], 'API promo': [], Tests: ['Écrire les tests'], Doc: ['Documenter'] })
+      expect((w.states.entries as unknown[]).length).toBe(1)
+      expect(w.opened).toEqual(['revo-flow'])
+      expect(w.registered).toEqual(expect.arrayContaining(['plan', 'step']))
+      // Un seul message à l'orchestrateur : son rôle, l'état du flow, et une relance par agent avec l'outil Agent.
+      expect(w.sent).toHaveLength(1)
+      const msg = w.sent[0]!.text
+      expect(msg).toMatch(/^revo-flow : reprise du flow « Code promo panier » après un redémarrage/)
+      expect(msg).toMatch(/relance l’agent « Front panier » avec l’outil Agent \(description = son nom exact\) pour ses tâches restantes : Ajouter le champ ; Tester/)
+      expect(msg).toMatch(/relance l’agent « Tests » .*: Écrire les tests/)
+      expect(msg).toMatch(/relance l’agent « Doc » .*: Documenter/)
+      expect(msg).not.toMatch(/relance l’agent « API promo »|SendMessage \(to:/)
+      expect(msg).toMatch(/tu es l'orchestrateur/)
+      // L'instantané suit le flow repris ; l'orchestrateur relance, l'agent retravaille.
+      expect(readSnapshot(w.store['flow:42'])!.flow.agents.map(a => a.status)).toEqual(['waiting', 'done', 'waiting', 'waiting'])
+      const again = await spawn($, 'Front panier')
+      expect(again.deny).toBeUndefined()
+      expect(agentIn(w, 'front-panier').status).toBe('running')
+    })
+
+    test('redémarrage, Abandonner : journalisé comme arrêté, instantané effacé, rien de relancé', async ($, on) => {
+      const w = world(on, os, { 'flow:42': midSnapshot() })
+      w.ctl.answer = 'Abandonner'
+      await $.session.start({ cwd: rootOf(os), surface: 'terminal', isInteractive: true })
+      await w.clock.advance(1)
+      await w.clock.settle()
+      expect(snapshots(w)).toEqual([])
+      expect((w.store.journal as JournalEntry[])[0]).toMatchObject({ id: '42', title: 'Code promo panier', isStopped: true, durationMs: 120_000, files: 1 })
+      expect(w.states.flow ?? null).toBeNull()
+      expect(w.sent).toEqual([])
+      expect(w.opened).toEqual([])
+    })
+  })
+}
+
+test('redémarrage sans personne à qui demander (-p) : Abandonner, sans question', async ($, on) => {
+  const w = world(on, WINDOWS, { 'flow:42': midSnapshot() })
+  w.surfaces.length = 0
+  await $.session.start({ cwd: ROOT, surface: null, isInteractive: false })
+  await w.clock.advance(1)
+  await w.clock.settle()
+  expect(w.asked).toEqual([])
+  expect(snapshots(w)).toEqual([])
+  expect((w.store.journal as JournalEntry[])[0]).toMatchObject({ id: '42', isStopped: true })
+})
+
+test('redémarrage : dialogue fermé, l’instantané attend ; celui d’un autre projet n’est pas proposé', async ($, on) => {
+  const w = world(on, WINDOWS, { 'flow:42': midSnapshot(), 'flow:7': { ...midSnapshot('autre-projet'), flow: { ...midSnapshot('autre-projet').flow, id: '7' } } })
+  w.ctl.answer = DISMISS
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  await w.clock.advance(1)
+  await w.clock.settle()
+  expect(w.asked).toHaveLength(1)
+  expect(snapshots(w).sort()).toEqual(['flow:42', 'flow:7'])
+  expect(w.states.flow ?? null).toBeNull()
+  expect(w.store.journal).toBeUndefined()
 })

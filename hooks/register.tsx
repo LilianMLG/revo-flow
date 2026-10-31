@@ -134,6 +134,8 @@ import {
   type PaneActions,
   type ViewData,
 } from './ui/views'
+import { rapportMarkdown } from './rapport'
+import { doctorText, manifestsOf, pluginVersion, versionText } from './doctor'
 import { addBase, baseFor } from './verif/base'
 import { CRAP_SEUIL } from './verif/crap'
 import { MANIFESTES, SONDES, commandsQuestion, detectCommands, flutterVersionTrap, fvmVersion, manifestPaths, needsConfirm, withoutCrap } from './verif/detect'
@@ -154,6 +156,7 @@ import {
 import { reportText, summaryLine } from './verif/report'
 import { purgeOutputs, runBase, runGate, type VerifIo } from './verif/runner'
 import { hasGenAnnotation, withShell } from './verif/scope'
+import { SNAPSHOT_PREFIX, isBeforeLaunch, isUnfinished, readSnapshot, resumeQuestion, resumedFlow, snapshotKey, snapshotOf, type FlowSnapshot } from './reprise'
 
 type $ = EngineInterface
 
@@ -254,7 +257,42 @@ async function statusOf($: $, flow: Flow, running: number) {
 // ── Flow ─────────────────────────────────────────────────────────────────
 
 function setFlow($: $, change: (f: Flow) => Flow) {
-  return update($, flowA, f => (f ? change(f) : f))
+  return update($, flowA, f => (f ? change(f) : f)).finally(() => void saveFlow($).catch(() => undefined))
+}
+
+/** La clé du dernier instantané écrit par ce module : effacée quand son flow finit, est arrêté ou remplacé. */
+let savedId: string | undefined
+/** Une écriture de l'instantané en cours ; again : le flow a encore changé pendant, une écriture de plus suffira. */
+const saving = { isBusy: false, again: false }
+
+/**
+ * L'instantané du flow dans le store (reprise après redémarrage, reprise.ts) : réécrit à chaque changement du flow, effacé quand
+ * il passe en done, est arrêté ou remplacé. Les écritures ne se chevauchent pas : celles demandées pendant une écriture n'en
+ * font qu'une, avec l'état le plus récent.
+ */
+async function saveFlow($: $) {
+  if (saving.isBusy) {
+    saving.again = true
+    return
+  }
+  saving.isBusy = true
+  try {
+    do {
+      saving.again = false
+      const flow = await read($, flowA)
+      const live = flow && flow.phase !== 'done' && !flow.isStopped ? flow : null
+      if (savedId && savedId !== live?.id) {
+        await $.store.delete(snapshotKey(savedId))
+        savedId = undefined
+      }
+      if (!live) continue
+      const more = { verif: await read($, verifA), verifFlow: await read($, verifFlowA), flowCache: await read($, flowCacheA) }
+      await $.store.set(snapshotKey(live.id), snapshotOf(await $.clock.now(), live, await read($, leadA), await read($, entries), more))
+      savedId = live.id
+    } while (saving.again)
+  } finally {
+    saving.isBusy = false
+  }
 }
 
 function setAgent($: $, key: string, change: (a: FlowAgent) => FlowAgent) {
@@ -595,6 +633,7 @@ async function finishFlow($: $) {
   const journals = Promise.all([
     closeFlowCache($, verifP).catch(() => undefined),
     journalize($, { ...flow, endedAt: now }, lead, files, verifP).catch(() => undefined),
+    writeRapport($, { ...flow, endedAt: now }, lead, verifP, g ?? (gate?.flowId === flow.id ? gate : undefined)).catch(() => undefined),
   ])
   if (isReady) {
     await journals
@@ -2644,6 +2683,7 @@ function paneActions($: $): PaneActions {
     approvePlan: () => approvePlan($),
     cancelPlan: () => cancelPlan($),
     openPlan: () => openPlan($),
+    openRapport: () => openRapport($),
     toggleCache: () => update($, cacheOpenA, v => !v),
     openVerif: () => openVerif($),
     rerunVerif: () => rerunVerif($),
@@ -2849,11 +2889,12 @@ async function retryAgent($: $, key: string) {
 /**
  * Réarme un agent et demande sa relance : il redevient « en attente de lancement » (nouvelle tentative), ses tâches
  * non faites repartent de zéro, son attente est levée, et l'orchestrateur reçoit la consigne de le relancer avec
- * l'outil Agent. `why` précède la consigne : pourquoi on le relance.
+ * l'outil Agent. `why` précède la consigne : pourquoi on le relance. isQuiet : la consigne est rendue au lieu d'être envoyée
+ * (la reprise après redémarrage les envoie toutes en un message).
  */
-async function relaunch($: $, key: string, why = '') {
+async function relaunch($: $, key: string, why = '', isQuiet = false): Promise<string | undefined> {
   const a = (await read($, flowA))?.agents.find(x => x.key === key)
-  if (!a) return
+  if (!a) return undefined
   claimed.delete(key)
   const tasks = a.tasks.map(t => (t.status === 'completed' ? t : { ...t, status: 'pending' as const }))
   const resumeId = a.agentId ?? a.lastAgentId
@@ -2876,12 +2917,102 @@ async function relaunch($: $, key: string, why = '') {
   const how = resumeId
     ? `reprends l’agent « ${a.name} » avec SendMessage (to: "${resumeId}") pour qu’il garde son contexte, ou relance-le avec l’outil Agent (description = son nom exact),`
     : `relance l’agent « ${a.name} » avec l’outil Agent (description = son nom exact)`
+  const line = `${why ? `${why} ` : ''}${how} pour ses tâches restantes : ${left}`
+  if (isQuiet) return line
   void $.prompt
     .submit({
-      text: `revo-flow : ${why ? `${why} ` : ''}${how} pour ses tâches restantes : ${left}`,
+      text: `revo-flow : ${line}`,
       asUser: true,
     })
     .catch(() => undefined)
+  return undefined
+}
+
+// ── Reprise après redémarrage ────────────────────────────────────────────
+
+/**
+ * Au chargement, sans flow en mémoire : le plus récent des instantanés non terminés de ce projet est proposé (Reprendre ou
+ * Abandonner). Sans personne à qui demander (-p, SDK) : Abandonner. Dialogue fermé, ou session pas encore prête : rien,
+ * l'instantané attend le prochain démarrage. Un instantané illisible ou fini est effacé.
+ */
+async function offerResume($: $, isInteractive: boolean) {
+  if (await read($, flowA)) return
+  const { project } = await projectHeader($)
+  let snap: FlowSnapshot | undefined
+  for (const key of await $.store.keys()) {
+    if (!key.startsWith(SNAPSHOT_PREFIX)) continue
+    const s = readSnapshot(await $.store.get(key))
+    if (!s) {
+      await $.store.delete(key)
+      continue
+    }
+    // Un flow d'un autre projet attend qu'on rouvre Claude Code là-bas.
+    if (s.flow.project !== project) continue
+    if (!snap || s.savedAt > snap.savedAt) snap = s
+  }
+  if (!snap) return
+  let answer = 'Abandonner'
+  if (isInteractive) {
+    const r = await askHow($, resumeQuestion(snap.flow), ['Reprendre', 'Abandonner'], { headless: '', dismissed: '' })
+    answer = r.answer
+  }
+  // Un flow est parti pendant la question : il a la main, l'instantané reste pour le prochain démarrage.
+  if (await read($, flowA)) return
+  if (answer === 'Reprendre') await resumeFlow($, snap)
+  else if (answer === 'Abandonner') await abandonFlow($, snap)
+}
+
+/**
+ * Reprendre : le flow, l'orchestrateur, les fichiers, la vérification et le cache reviennent dans l'état partagé ; tout agent non
+ * terminé est à relancer (resumedFlow, jamais actif). L'orchestrateur reçoit en un message son rôle, l'état du flow et la consigne
+ * de relancer chaque agent sur ses tâches restantes (relaunch, comme après une attente) ; le panneau se rouvre.
+ */
+async function resumeFlow($: $, snap: FlowSnapshot) {
+  const flow = resumedFlow(snap.flow)
+  claimed.clear()
+  Object.assign(learned, { flowId: flow.id, features: [] })
+  await update($, flowA, () => flow)
+  await update($, leadA, () => ({ ...snap.lead, isDoing: false }))
+  await update($, entries, () => snap.entries)
+  await update($, flowCacheA, () => snap.flowCache ?? null)
+  await update($, verifA, () => snap.verif ?? null)
+  await update($, verifFlowA, () => snap.verifFlow ?? null)
+  await saveFlow($).catch(() => undefined)
+  await registerTools($)
+  if (opts.cache) await registerCacheTool($).catch(() => undefined)
+  await restoreVerif($).catch(() => undefined)
+  agentsInstalles = await loadAgents($).catch(() => [])
+  watchAgents($)
+  try {
+    if (!flow.isPaneClosed && !(await isPaneShown($))) await openPane($)
+  } catch {
+    // le panneau ne doit jamais bloquer la reprise
+  }
+  const todo: string[] = []
+  if (isBeforeLaunch(snap.flow)) {
+    todo.push(`Le plan n’était pas encore lancé : relis la demande et propose le plan avec l’outil ${PLAN_TOOL}.`, `Demande : ${flow.request}`)
+  } else {
+    for (const a of flow.agents.filter(isUnfinished)) {
+      const line = await relaunch($, a.key, '', true)
+      if (line) todo.push(`- ${line}`)
+    }
+    if (todo.length) todo.unshift(`N’appelle plus l’outil ${PLAN_TOOL} : le plan est posé. Les agents sont morts avec la session ; leurs tâches faites restent cochées.`)
+    else todo.push('Tous les agents avaient fini : vérifie l’ensemble et conclus.')
+  }
+  const recap = flowRecap((await read($, flowA)) ?? flow, opts.cache ? cacheRecap(await read($, flowCacheA)) : false, opts.verif !== 'off').replace(
+    '(rappel après compaction)',
+    '(reprise après redémarrage)',
+  )
+  const text = [`revo-flow : reprise du flow « ${flow.title} » après un redémarrage de Claude Code.`, ...todo, '', recap].join('\n')
+  void $.prompt.submit({ text, asUser: true }).catch(() => undefined)
+}
+
+/** Abandonner : le flow entre au journal comme arrêté, à l'heure de son dernier instantané, et l'instantané est effacé. */
+async function abandonFlow($: $, snap: FlowSnapshot) {
+  const flow: Flow = { ...snap.flow, isStopped: true, endedAt: Math.max(snap.savedAt, snap.flow.startedAt) }
+  await journalize($, flow, snap.lead, snap.entries.length).catch(() => undefined)
+  await $.store.delete(snapshotKey(flow.id))
+  $.ui.toast(`revo-flow : flow « ${flow.title} » abandonné, inscrit au journal comme arrêté`)
 }
 
 const CANCELLED =
@@ -2944,6 +3075,41 @@ async function writePlanFile($: $, plan: PlanInput, flow: Flow): Promise<string 
   return path
 }
 
+/**
+ * Le rapport de flow (rapportMarkdown) à côté des plans : ~/.claude/revo-flow/rapports/<titre>.md, écrit une fois la vérification connue.
+ * Un flow arrêté n'a pas de rapport ; le chemin est gardé dans le flow (rapportFile) pour le bouton « rapport.md ».
+ */
+async function writeRapport($: $, flow: Flow, lead: Lead, verifP: Promise<VerifJournal | undefined>, g: Gate | undefined): Promise<string | undefined> {
+  if (flow.isStopped) return undefined
+  const home = await ioOf($).home()
+  if (!home) return undefined
+  const verif = await verifP.catch(() => undefined)
+  const d = new Date(flow.endedAt ?? (await $.clock.now()))
+  const p = (n: number) => String(n).padStart(2, '0')
+  const date = `${dayKey(d)} ${p(d.getHours())}:${p(d.getMinutes())}`
+  const text = rapportMarkdown({
+    flow,
+    lead,
+    entries: await read($, entries),
+    date,
+    verif,
+    porte: g ? { resultat: g.dernier, accepte: g.accepte, gelesModifies: g.gelesModifies } : undefined,
+    criteres: g?.criteres,
+    verdicts: g?.verdicts,
+    cache: (await read($, cacheStatsA))?.flow,
+  })
+  const path = `${normalizePath(home)}/.claude/revo-flow/rapports/${slug(flow.title) || 'rapport'}.md`
+  await $.fs.write(path, text)
+  await setFlow($, f => (f.id === flow.id ? { ...f, rapportFile: path } : f))
+  return path
+}
+
+/** Bouton « rapport.md » : ouvre le rapport de fin de flow, comme plan.md. */
+async function openRapport($: $) {
+  const file = (await read($, flowA))?.rapportFile
+  if (file) await openFile($, file, 'le rapport')
+}
+
 /** Bouton « plan.md » : ouvre le fichier du plan dans l'application par défaut du système ; sinon, un toast donne son chemin. */
 async function openPlan($: $) {
   const file = (await read($, flowA))?.planFile
@@ -2997,6 +3163,58 @@ function readOptions(o: PluginOptions) {
   opts.agents = (o as { agents?: unknown }).agents !== false
 }
 
+/**
+ * /revo-flow doctor : ce que le mod a détecté sur le projet courant. Lecture seule : le graphe est lu (ou construit en mémoire, jamais écrit),
+ * les commandes de la porte sont celles confirmées ou, sinon, détectées maintenant ; aucune n'est lancée (seul `flutter --version` l'est, si .fvm existe).
+ */
+async function doctorCommand($: $): Promise<string> {
+  const ref = await resolveProject(ioOf($)).catch(() => undefined)
+  const agents = await loadAgents($).catch(() => [])
+  const common = { mode: opts.verif, crap: opts.crap, cache: opts.cache, agentsActif: opts.agents, agents }
+  if (!ref) return doctorText({ ...common, manifestes: [], commandes: [], confirmation: 'a-confirmer', stats: null, journal: 0, pieges: [] })
+  const io = ioOf($)
+  const graph = graphCache.get(ref.cle)?.graph ?? (await loadGraph(io, ref).catch(() => null)) ?? (await buildMechanical(io, ref).catch(() => null))
+  if (!graph) return doctorText({ ...common, nom: ref.nom, manifestes: [], commandes: [], confirmation: 'a-confirmer', stats: null, journal: 0, pieges: [] })
+  const files = Object.keys(graph.fichiers)
+  const paths = [...new Set([...MANIFESTES, ...manifestPaths(files)])]
+  const texts = await Promise.all(paths.map(p => io.fs.read(`${normalizePath(ref.racine)}/${p}`).then(t => (typeof t === 'string' ? t : undefined), () => undefined)))
+  const readMap: Record<string, string | undefined> = Object.fromEntries(paths.map((p, i) => [p, texts[i]]))
+  const hashes = await hashFiles($, ref.racine, paths.filter(p => readMap[p] !== undefined))
+  const pv = graph.projet.verif
+  const isConfirmed = !!pv && !needsConfirm(pv, hashes)
+  let commandes = pv?.commandes ?? []
+  let pieges = pv?.pieges ?? []
+  if (isConfirmed) commandes = opts.crap ? commandes : withoutCrap(commandes)
+  else {
+    const sondes = Object.fromEntries(await Promise.all(SONDES.map(async p => [p, await io.fs.exists(`${normalizePath(ref.racine)}/${p}`).catch(() => false)] as const)))
+    const found = detectCommands({ stack: graph.projet.stack, files, read: readMap, sondes, crap: opts.crap })
+    commandes = found.commandes
+    pieges = found.pieges
+  }
+  // Flutter du poste contre celui de .fvm : la version lue remplace le rappel générique.
+  const fvm = fvmVersion(readMap)
+  if (fvm) {
+    const argv = withShell(['flutter', '--version', '--machine'], (await isWindows($)) ? 'windows' : 'posix')
+    const out = await $.process.run(argv, { cwd: ref.racine, timeoutMs: 20_000 }).then(r => r.stdout, () => '')
+    const trap = flutterVersionTrap(fvm, out)
+    if (out) pieges = pieges.filter(p => !/attendu par \.fvm/.test(p))
+    if (trap) pieges = [...pieges, trap]
+  }
+  return doctorText({
+    ...common,
+    nom: ref.nom,
+    stack: graph.projet.stack,
+    manifestes: manifestsOf(files, readMap),
+    commandes,
+    confirmation: isConfirmed ? 'confirmee' : 'a-confirmer',
+    ...(pv ? { verif: pv } : {}),
+    commit: (await gitOut($, ref.racine, ['rev-parse', 'HEAD'])).trim(),
+    stats: computeStats(graph, null, ref.nom),
+    journal: graph.journal?.length ?? 0,
+    pieges,
+  })
+}
+
 // ── Les hooks ────────────────────────────────────────────────────────────
 
 export const register: Register = (on, options) => {
@@ -3017,6 +3235,7 @@ export const register: Register = (on, options) => {
     if (await read($, flowA)) {
       await registerTools($)
       if (opts.cache) await registerCacheTool($).catch(() => undefined)
+      savedId = (await read($, flowA))?.id
     }
     await registerIndexer($)
     await registerVerifier($)
@@ -3030,6 +3249,9 @@ export const register: Register = (on, options) => {
     await update($, contextA, () => contextOf(usage.context))
     await update($, sessionCostA, () => usage.cost?.usd ?? 0)
     watchAgents($)
+    // Redémarré (pas rechargé : l'état du flow est perdu) avec un flow en cours dans le store : Reprendre ou Abandonner,
+    // demandé hors du démarrage pour ne pas le retenir.
+    if (!(await read($, flowA))) $.clock.after(0, () => void offerResume($, e.isInteractive).catch(() => undefined))
     return next(e)
   })
 
@@ -3039,6 +3261,11 @@ export const register: Register = (on, options) => {
     const flow = await read($, flowA)
 
     if (!args || word === 'statut' || word === 'status') return { text: statusText(flow) }
+    if (word === 'doctor') return { text: await doctorCommand($) }
+    if (word === 'version') {
+      const manifest = await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`).then(t => (typeof t === 'string' ? t : undefined), () => undefined)
+      return { text: versionText(pluginVersion(manifest)) }
+    }
     const hist = /^(historique|history)(?:\s+(\d+))?$/.exec(word)
     if (hist) return { text: historyText(await $.store.get(JOURNAL_KEY), hist[2] ? Math.max(1, Number(hist[2])) : 10) }
     if (word === 'stop') {
@@ -3054,6 +3281,8 @@ export const register: Register = (on, options) => {
       } else isStopped = flow !== null && leadTurnId !== undefined
       if (isStopped) await stopAll($)
       await update($, flowA, () => null)
+      // Plus de flow : plus d'instantané à reprendre.
+      await saveFlow($).catch(() => undefined)
       if (await isPaneShown($)) await $.ui.close({ id: PANE })
       return {
         text: isStopped
@@ -3115,6 +3344,8 @@ export const register: Register = (on, options) => {
     const model = await $.session.model()
     await update($, leadA, () => ({ ...LEAD0, modelId: model }))
     await update($, entries, () => [])
+    // L'instantané du nouveau flow remplace celui de l'ancien.
+    await saveFlow($).catch(() => undefined)
     try {
       if (!(await isPaneShown($))) await openPane($)
     } catch {
@@ -3220,6 +3451,7 @@ export const register: Register = (on, options) => {
     // Interrompu avant même le plan : il n'y a rien à suivre, le flow est abandonné.
     if (e.reason === 'aborted' && flow.phase === 'planning') {
       await update($, flowA, () => null)
+      await saveFlow($).catch(() => undefined)
       $.ui.toast('revo-flow : flow annulé')
       return next(e)
     }

@@ -1,5 +1,14 @@
 {
   "name": "revo-flow",
-  "owner": { "name": "Lilian Malinge" },
-  "plugins": [{ "name": "revo-flow", "source": "./" }]
+  "owner": {
+    "name": "Lilian Malinge"
+  },
+  "plugins": [
+    {
+      "name": "revo-flow",
+      "source": "./",
+      "version": "2.3.0",
+      "license": "MIT"
+    }
+  ]
 }

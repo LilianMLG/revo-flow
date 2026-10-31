@@ -85,6 +85,8 @@ export type Flow = {
   isApproved?: boolean
   /** Le plan en markdown sur le disque (~/.claude/revo-flow/plans/<titre>.md), une fois posé. */
   planFile?: string
+  /** Le rapport de fin de flow en markdown (~/.claude/revo-flow/rapports/<titre>.md), écrit quand la vérification est connue ; absent d'un flow arrêté. */
+  rapportFile?: string
   /** Arrêté par l'utilisateur (Tout arrêter) : sa fin n'est ni une conclusion, ni une fiche à apprendre. */
   isStopped?: boolean
 }

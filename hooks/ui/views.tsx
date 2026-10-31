@@ -80,6 +80,8 @@ export type PaneActions = {
   toggleCache(): unknown
   /** Ouvre le .txt de la dernière sortie complète de la vérification (bouton Détail). */
   openVerif(): unknown
+  /** Ouvre le rapport de fin de flow (bouton rapport.md). */
+  openRapport(): unknown
   /** Relance la vérification (bouton Relancer). */
   rerunVerif(): unknown
 }
@@ -691,6 +693,7 @@ export function DesktopPane(t: Elements['desktop'], d: ViewData, actions: PaneAc
               <Button key="approve" label="Lancer" onPress={() => actions.approvePlan()} />
               <Button key="cancel" plain label="Annuler" onPress={() => actions.cancelPlan()} />
               {flow.planFile && <Button key="plan-file" plain label="plan.md" onPress={() => actions.openPlan()} />}
+              {flow.rapportFile && <Button key="rapport-file" plain label="rapport.md" onPress={() => actions.openRapport()} />}
             </Box>
           </Box>
         )}
@@ -795,6 +798,12 @@ export function DesktopPane(t: Elements['desktop'], d: ViewData, actions: PaneAc
                 )
               })}
             <Button key="clear" plain label="vider la liste" onPress={() => actions.clear()} />
+          </Box>
+        )}
+
+        {d.flow?.rapportFile && (
+          <Box key="rapport" flexDirection="row" justifyContent="flex-end" width="100%">
+            <Button key="rapport-done" plain label="rapport.md" onPress={() => actions.openRapport()} />
           </Box>
         )}
 
@@ -1144,6 +1153,7 @@ export function TerminalPane(t: Elements['terminal'], d: ViewData, actions: Pane
             <Button key="approve" label="Lancer" onPress={() => actions.approvePlan()} />
             <Button key="cancel" plain label="Annuler" onPress={() => actions.cancelPlan()} />
             {flow.planFile && <Button key="plan-file" plain label="plan.md" onPress={() => actions.openPlan()} />}
+            {flow.rapportFile && <Button key="rapport-file" plain label="rapport.md" onPress={() => actions.openRapport()} />}
           </Box>
         </Box>
       )}
@@ -1180,6 +1190,12 @@ export function TerminalPane(t: Elements['terminal'], d: ViewData, actions: Pane
                 </Box>
               )
             })}
+        </Box>
+      )}
+
+      {d.flow?.rapportFile && (
+        <Box key="rapport" justifyContent="flex-end">
+          <Button key="rapport-done" plain label="rapport.md" onPress={() => actions.openRapport()} />
         </Box>
       )}
 
