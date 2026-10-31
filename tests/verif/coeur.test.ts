@@ -1,12 +1,12 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import type { ProjetVerif, VerifBase, VerifCommande, VerifErreur, VerifEtatCommande, VerifResultat } from '../../types/verif'
-import { MANIFESTES, commandLabel, commandsQuestion, detectCommands, flutterVersionTrap, fvmVersion, manifestPaths, needsConfirm } from '../../hooks/verif/detect'
+import { MANIFESTES, argvText, commandLabel, commandsQuestion, detectCommands, flutterVersionTrap, fvmVersion, manifestPaths, needsConfirm, withoutCrap } from '../../hooks/verif/detect'
 import { dartTests, globMatch, hasGenAnnotation, plan, relative, withShell } from '../../hooks/verif/scope'
 import { normalizeMessage, parseOutput, signatureKey, toRoot } from '../../hooks/verif/parse'
 import { addBase, baseFor, classify } from '../../hooks/verif/base'
 import { reportText, summaryLine } from '../../hooks/verif/report'
-import { durationOf, projectArgv, purgeOutputs, runBase, runGate, timeoutOf, type VerifIo } from '../../hooks/verif/runner'
+import { durationOf, fillSorties, projectArgv, purgeOutputs, runBase, runGate, timeoutOf, type VerifIo } from '../../hooks/verif/runner'
 import { OSES, WINDOWS, native, type Os } from '../helpers/os'
 
 const json = (x: unknown) => JSON.stringify(x)
@@ -33,7 +33,7 @@ describe('detectCommands', () => {
       '.gitlab-ci.yml': ['stages: [test]', 'lint:', '  stage: test', '  script:', '    - npm ci', '    - npm run lint', '    - npm run typecheck', '#    - npm run build'].join('\n'),
     }
     const files = ['nuxt.config.ts', '.eslintrc.cjs', 'components/Cart.vue', 'composables/useCart.ts', 'graphql/offers.graphql', 'tests/useCart.spec.ts']
-    const { commandes, pieges } = detectCommands({ stack: 'Nuxt 3, Pinia, Apollo, TypeScript, vitest', files, read })
+    const { commandes, pieges } = detectCommands({ crap: false, stack: 'Nuxt 3, Pinia, Apollo, TypeScript, vitest', files, read })
     expect(commandes.map(c => c.id)).toEqual(['codegen', 'eslint', 'typecheck', 'vitest'])
     expect(byId(commandes, 'eslint')).toMatchObject({ source: 'ci', portee: 'fichiers', format: 'eslint-json', argv: ['npx', 'eslint', '-f', 'json', '--ext', '.ts,.js,.vue', '{fichiers}'] })
     expect(byId(commandes, 'eslint')!.origine).toBe('.gitlab-ci.yml (script lint)')
@@ -46,14 +46,14 @@ describe('detectCommands', () => {
 
   test('Nuxt 3.14 + vue-tsc + config ESLint plate (lumos-front) : pas de --ext', () => {
     const read = { 'package.json': pkg({ lint: 'eslint .', typecheck: 'vue-tsc --noEmit', test: 'vitest run' }, { nuxt: '^3.14.0', 'vue-tsc': '^2.1.0', vitest: '^2.1.0', eslint: '^9.0.0' }) }
-    const { commandes } = detectCommands({ stack: 'Nuxt 3, vitest', files: ['eslint.config.mjs', 'nuxt.config.ts', 'pages/index.vue'], read })
+    const { commandes } = detectCommands({ crap: false, stack: 'Nuxt 3, vitest', files: ['eslint.config.mjs', 'nuxt.config.ts', 'pages/index.vue'], read })
     expect(byId(commandes, 'eslint')!.argv).toEqual(['npx', 'eslint', '-f', 'json', '{fichiers}'])
     expect(byId(commandes, 'typecheck')).toMatchObject({ source: 'script', origine: 'script typecheck', argv: ['npx', 'vue-tsc', '--noEmit'] })
   })
 
   test('Nuxt 2 + Jest 27 (back-office) : eslint du script, pas de typage, jest --findRelatedTests en JSON', () => {
     const read = { 'package.json': pkg({ lint: 'eslint --ext .js,.vue --ignore-path .gitignore .', test: 'jest', dev: 'nuxt' }, { nuxt: '^2.15.8', jest: '^27.5.1', eslint: '^7.32.0' }) }
-    const { commandes } = detectCommands({ stack: 'Nuxt 2, Vuex, Jest', files: ['nuxt.config.js', '.eslintrc.js', 'store/cart.js', 'test/store/cart.spec.js'], read })
+    const { commandes } = detectCommands({ crap: false, stack: 'Nuxt 2, Vuex, Jest', files: ['nuxt.config.js', '.eslintrc.js', 'store/cart.js', 'test/store/cart.spec.js'], read })
     expect(commandes.map(c => c.id)).toEqual(['eslint', 'jest'])
     expect(byId(commandes, 'eslint')!.argv).toEqual(['npx', 'eslint', '-f', 'json', '--ext', '.js,.vue', '--ignore-path', '.gitignore', '{fichiers}'])
     expect(byId(commandes, 'jest')).toMatchObject({ portee: 'lies', format: 'jest-json', argv: ['npx', 'jest', '--json', '--passWithNoTests', '--findRelatedTests', '{fichiers}'] })
@@ -68,7 +68,7 @@ describe('detectCommands', () => {
       ),
       'tsconfig.json': '{}',
     }
-    const { commandes } = detectCommands({ stack: 'NestJS, TypeScript, Jest', files: ['src/main.ts', '.eslintrc.js', 'tsconfig.json', 'nest-cli.json'], read })
+    const { commandes } = detectCommands({ crap: false, stack: 'NestJS, TypeScript, Jest', files: ['src/main.ts', '.eslintrc.js', 'tsconfig.json', 'nest-cli.json'], read })
     expect(byId(commandes, 'eslint')).toMatchObject({ source: 'deduit' })
     expect(byId(commandes, 'typecheck')).toMatchObject({ source: 'deduit', argv: ['npx', 'tsc', '--noEmit', '-p', 'tsconfig.json'] })
     expect(byId(commandes, 'jest')!.argv).not.toContain('./test/jest-e2e.json')
@@ -82,7 +82,7 @@ describe('detectCommands', () => {
       'tsconfig.json': '{}',
     }
     const files = ['app.arc', 'biome.json', 'tsconfig.json', 'src/http/get-index/index.ts', 'src/http/get-index/package.json', 'test/unit/index.test.ts', 'test/sandbox/http.test.ts']
-    const { commandes } = detectCommands({ stack: 'TypeScript, vitest', files, read })
+    const { commandes } = detectCommands({ crap: false, stack: 'TypeScript, vitest', files, read })
     expect(commandes.map(c => c.id)).toEqual(['biome', 'typecheck', 'vitest'])
     expect(byId(commandes, 'biome')).toMatchObject({ argv: ['npx', 'biome', 'check', '{fichiers}'], format: 'biome', source: 'script' })
     expect(byId(commandes, 'vitest')!.argv).toContain('--no-file-parallelism')
@@ -98,7 +98,7 @@ describe('detectCommands', () => {
       '.gitlab-ci.yml': ['analyze:', '  script:', '    - fvm flutter pub get', '    - fvm flutter analyze', '    - dart format --output=none --set-exit-if-changed lib test', 'test:', '  script:', '    - fvm flutter test --dart-define-from-file=env.test --coverage'].join('\r\n'),
     }
     const files = ['pubspec.yaml', 'lib/main.dart', 'test/main_test.dart', 'packages/core/pubspec.yaml', 'packages/core/lib/src/cart.dart', 'packages/core/test/src/cart_test.dart', 'integration_test/app_test.dart']
-    const { commandes, pieges } = detectCommands({ stack: 'Flutter, Riverpod', files, read, sondes: { '.dart_tool/package_config.json': true } })
+    const { commandes, pieges } = detectCommands({ crap: false, stack: 'Flutter, Riverpod', files, read, sondes: { '.dart_tool/package_config.json': true } })
     expect(commandes.map(c => c.id)).toEqual(['build-runner', 'dart-format', 'dart-analyze', 'flutter-test'])
     expect(byId(commandes, 'dart-analyze')).toMatchObject({ source: 'ci', outil: 'typage', argv: ['dart', 'analyze', '--format=machine', '--fatal-infos', '{fichiers}'] })
     expect(byId(commandes, 'dart-format')!.argv).toEqual(['dart', 'format', '--output=none', '--set-exit-if-changed', '{fichiers}'])
@@ -112,7 +112,7 @@ describe('detectCommands', () => {
       'pubspec.yaml': ['name: router_app', 'dependencies:', '  flutter:', '    sdk: flutter', '  supabase_flutter: ^2.0.0'].join('\n'),
       '.github/workflows/ci.yml': ['jobs:', '  test:', '    steps:', '      - run: flutter test --dart-define-from-file=env.test'].join('\n'),
     }
-    const { commandes, pieges } = detectCommands({ stack: 'Flutter, Supabase', files: ['pubspec.yaml', 'lib/main.dart', 'test/router_test.dart', '.github/workflows/ci.yml'], read })
+    const { commandes, pieges } = detectCommands({ crap: false, stack: 'Flutter, Supabase', files: ['pubspec.yaml', 'lib/main.dart', 'test/router_test.dart', '.github/workflows/ci.yml'], read })
     expect(commandes.map(c => c.id)).toEqual(['dart-analyze', 'flutter-test'])
     expect(byId(commandes, 'dart-analyze')!.argv).not.toContain('--fatal-infos')
     expect(byId(commandes, 'flutter-test')!.argv).toEqual(['flutter', 'test', '--machine', '{fichiers}'])
@@ -121,19 +121,19 @@ describe('detectCommands', () => {
 
   test('pièges : node_modules absent (sondes), .dart_tool absent ; rien sans sondes', () => {
     const read = { 'package.json': pkg({ test: 'NODE_ENV=test jest' }, { jest: '^29.0.0' }) }
-    const sans = detectCommands({ stack: 'Jest', files: [], read })
+    const sans = detectCommands({ crap: false, stack: 'Jest', files: [], read })
     expect(sans.pieges.some(p => p.includes('node_modules'))).toBe(false)
-    const avec = detectCommands({ stack: 'Jest', files: [], read, sondes: { 'node_modules/.package-lock.json': false } })
+    const avec = detectCommands({ crap: false, stack: 'Jest', files: [], read, sondes: { 'node_modules/.package-lock.json': false } })
     expect(avec.pieges.some(p => p.startsWith('node_modules absent'))).toBe(true)
     expect(avec.pieges.some(p => p.includes('NODE_ENV=test'))).toBe(true)
-    const dart = detectCommands({ stack: 'Flutter', files: ['pubspec.yaml'], read: { 'pubspec.yaml': 'name: a' }, sondes: { '.dart_tool/package_config.json': false } })
+    const dart = detectCommands({ crap: false, stack: 'Flutter', files: ['pubspec.yaml'], read: { 'pubspec.yaml': 'name: a' }, sondes: { '.dart_tool/package_config.json': false } })
     expect(dart.pieges.some(p => p.includes('flutter pub get'))).toBe(true)
   })
 
   test('Serverless + Mocha : eslint seul, aucun test ; projet inconnu : aucune commande', () => {
-    const { commandes } = detectCommands({ stack: 'inconnue', files: ['.eslintrc.json', 'handler.js'], read: { 'package.json': pkg({ test: 'mocha' }, { eslint: '^8.0.0', mocha: '^10.0.0' }) } })
+    const { commandes } = detectCommands({ crap: false, stack: 'inconnue', files: ['.eslintrc.json', 'handler.js'], read: { 'package.json': pkg({ test: 'mocha' }, { eslint: '^8.0.0', mocha: '^10.0.0' }) } })
     expect(commandes.map(c => c.id)).toEqual(['eslint'])
-    expect(detectCommands({ stack: 'Plugin Claude Code', files: ['hooks/a.ts'], read: {} }).commandes).toEqual([])
+    expect(detectCommands({ crap: false, stack: 'Plugin Claude Code', files: ['hooks/a.ts'], read: {} }).commandes).toEqual([])
   })
 
   test('manifestPaths : racine, paquets du monorepo et leur env.test, workflows GitHub ; pas les fonctions Architect', () => {
@@ -160,6 +160,7 @@ describe('detectCommands', () => {
 
   test('commandsQuestion : commande exacte, portée, source, déclencheur, exclusions et pièges ; sans JSON', () => {
     const { commandes } = detectCommands({
+      crap: false,
       stack: 'Nuxt 3, vitest',
       files: ['.eslintrc.cjs', 'a.vue'],
       read: { 'package.json': pkg({ lint: 'eslint .', codegen: 'graphql-codegen' }, { nuxt: '^3.9.0', vitest: '^1.0.0', typescript: '^5.0.0' }) },
@@ -818,6 +819,138 @@ for (const os of OSES) {
       expect(timeoutOf(10_000)).toBe(60_000)
       expect(timeoutOf(100_000)).toBe(300_000)
       expect(timeoutOf(900_000)).toBe(600_000)
+    })
+  })
+}
+
+// ── Score CRAP : détection et porte ───────────────────────────────────────
+
+describe('score CRAP : détection', () => {
+  test('vitest avec coverage-v8, jest, flutter test : flags de couverture avant les fichiers, commande crap en dernier ; dart test : rien', () => {
+    const vitest = detectCommands({ stack: 'vitest', files: [], read: { 'package.json': pkg({ test: 'vitest run' }, { vitest: '^2.0.0', '@vitest/coverage-v8': '^2.0.0' }) } })
+    expect(vitest.commandes.map(c => c.id)).toEqual(['vitest', 'crap'])
+    const argv = byId(vitest.commandes, 'vitest')!.argv
+    expect(argv.at(-1)).toBe('{fichiers}')
+    expect(argv).toContain('--coverage.reportsDirectory={sorties}/couverture')
+    expect(byId(vitest.commandes, 'crap')).toMatchObject({ outil: 'qualite', format: 'crap', argv: [], portee: 'fichiers', seuil: 30 })
+    expect(vitest.pieges).toEqual([])
+
+    const sans = detectCommands({ stack: 'vitest', files: [], read: { 'package.json': pkg({ test: 'vitest run' }, { vitest: '^2.0.0' }) } })
+    expect(sans.commandes.map(c => c.id)).toEqual(['vitest'])
+    expect(byId(sans.commandes, 'vitest')!.argv.some(t => t.includes('{sorties}'))).toBe(false)
+    expect(sans.pieges.some(p => p.includes('@vitest/coverage-v8'))).toBe(true)
+
+    const jest = detectCommands({ stack: 'Jest', files: [], read: { 'package.json': pkg({ test: 'jest' }, { jest: '^29.0.0' }) } })
+    expect(jest.commandes.map(c => c.id)).toEqual(['jest', 'crap'])
+    expect(byId(jest.commandes, 'jest')!.argv.slice(-2)).toEqual(['--findRelatedTests', '{fichiers}'])
+    expect(byId(jest.commandes, 'jest')!.argv).toContain('--coverageDirectory={sorties}/couverture')
+
+    const flutter = detectCommands({ stack: 'Flutter', files: ['pubspec.yaml', 'lib/main.dart', 'test/main_test.dart'], read: { 'pubspec.yaml': 'name: a\ndependencies:\n  flutter:\n    sdk: flutter\n' } })
+    expect(flutter.commandes.map(c => c.id)).toEqual(['dart-analyze', 'flutter-test', 'crap'])
+    expect(byId(flutter.commandes, 'flutter-test')!.argv.at(-1)).toBe('{fichiers}')
+    const dart = detectCommands({ stack: 'Dart', files: ['pubspec.yaml', 'lib/a.dart', 'test/a_test.dart'], read: { 'pubspec.yaml': 'name: a\n' } })
+    expect(dart.commandes.map(c => c.id)).toEqual(['dart-analyze', 'dart-test'])
+
+    const off = detectCommands({ crap: false, stack: 'Jest', files: [], read: { 'package.json': pkg({ test: 'jest' }, { jest: '^29.0.0' }) } })
+    expect(off.commandes.map(c => c.id)).toEqual(['jest'])
+    expect(withoutCrap(jest.commandes)).toEqual(off.commandes)
+  })
+
+  test('question, libellé et argv lisibles ; {sorties} remplacé à l’exécution au séparateur de l’hôte', () => {
+    const { commandes } = detectCommands({ stack: 'Jest', files: [], read: { 'package.json': pkg({ test: 'jest' }, { jest: '^29.0.0' }) } })
+    const crap = byId(commandes, 'crap')!
+    expect(commandLabel(crap)).toBe('crap · score CRAP sur les fonctions modifiées')
+    const q = commandsQuestion('app', commandes, [])
+    expect(q).toContain('crap · score CRAP sur les fonctions modifiées : complexité × couverture des tests liés, seuil 30')
+    expect(q).toContain('--coverageDirectory=<sorties>/couverture')
+    expect(argvText(['a', '{sorties}/x', '{fichiers}'])).toBe('a <sorties>/x <fichiers>')
+    expect(fillSorties({ os: 'windows', sorties: 'C:\\v\\f1' }, ['--coverage-path={sorties}/couverture/lcov.info', 'x'])).toEqual(['--coverage-path=C:\\v\\f1\\couverture\\lcov.info', 'x'])
+    expect(fillSorties({ os: 'posix', sorties: '/v/f1' }, ['--coverageDirectory={sorties}/couverture'])).toEqual(['--coverageDirectory=/v/f1/couverture'])
+  })
+})
+
+for (const os of OSES) {
+  describe(`score CRAP : porte (${os.nom})`, () => {
+    const { racine, abs } = projet(os)
+    // Deux fonctions de complexité 6 (cinq if) : sans test, CRAP 42 > 30.
+    const fn = (nom: string, extra = '') =>
+      [`export function ${nom}(a: number) {`, '  let n = 0', '  if (a > 1) n++', '  if (a > 2) n++', '  if (a > 3) n++', '  if (a > 4) n++', `  if (a > 5) n++${extra}`, '  return n', '}'].join('\n')
+    const avant = `${fn('vieux')}\n\n${fn('neuf')}\n`
+    const maintenant = `${fn('vieux')}\n\n${fn('neuf', ' // modifiée')}\n`
+    const JEST: VerifCommande[] = [
+      { id: 'jest', outil: 'tests', argv: ['npx', 'jest', '--json', '--coverage', '--coverageReporters=json', '--coverageDirectory={sorties}/couverture', '--findRelatedTests', '{fichiers}'], portee: 'lies', format: 'jest-json', source: 'deduit' },
+      { id: 'crap', outil: 'qualite', argv: [], portee: 'fichiers', format: 'crap', source: 'deduit', seuil: 30 },
+    ]
+    const jestOk = json({ success: true, testResults: [] })
+    /** Couverture istanbul : chaque ligne 1..19 instrumentée ; couvertes = lignes exécutées. */
+    const istanbul = (couvertes: (l: number) => boolean) => {
+      const statementMap: Record<string, { start: { line: number }; end: { line: number } }> = {}
+      const hits: Record<string, number> = {}
+      for (let l = 1; l <= 19; l++) {
+        statementMap[String(l)] = { start: { line: l }, end: { line: l } }
+        hits[String(l)] = couvertes(l) ? 1 : 0
+      }
+      return json({ [abs('src/calc.ts')]: { path: abs('src/calc.ts'), statementMap, s: hits } })
+    }
+    const ioCrap = (couverture: string | undefined) => {
+      const f = fakeIo(os, racine, argv => (argv[1] === 'jest' ? { exitCode: 0, stdout: jestOk } : { exitCode: 0 }))
+      const lus: string[] = []
+      const io: VerifIo = {
+        ...f.io,
+        async list(dir) {
+          return dir.endsWith('couverture') && couverture ? ['coverage-final.json'] : []
+        },
+        async read(path) {
+          lus.push(path)
+          if (path.endsWith('coverage-final.json')) return couverture!
+          if (path === abs('src/calc.ts')) return maintenant
+          throw new Error('absent')
+        },
+        async show(commit, rel) {
+          return commit === 'abc1234' && rel === 'src/calc.ts' ? avant : undefined
+        },
+      }
+      return { ...f, io, lus }
+    }
+
+    test('fonction modifiée non couverte : nouvelle, porte rouge ; fonction intacte : préexistante ; crap.txt écrit', async () => {
+      const { io, calls, writes, removed } = ioCrap(istanbul(() => false))
+      const { resultat } = await runGate(io, verifOf(JEST), { changed: ['src/calc.ts'], files: ['src/calc.ts', 'src/calc.test.ts'], commit: 'abc1234' })
+      expect(calls[0]!.argv).toContain(`--coverageDirectory=${[io.sorties, 'couverture'].join(os.sep)}`)
+      expect(removed).toEqual([[io.sorties, 'couverture'].join(os.sep)])
+      expect(resultat.etat).toBe('rouge')
+      expect(resultat.commandes.map(c => [c.id, c.etat])).toEqual([
+        ['jest', 'ok'],
+        ['crap', 'ko'],
+      ])
+      const crap = resultat.erreurs.filter(e => e.outil === 'crap')
+      expect(crap.map(e => [e.message.split(' :')[0], e.statut])).toEqual([
+        ['neuf', 'nouvelle'],
+        ['vieux', 'preexistante'],
+      ].sort((a, b) => (a[1]! < b[1]! ? -1 : 1)))
+      expect(resultat.commandes[1]).toMatchObject({ nouvelles: 1, preexistantes: 1, fichiers: 1 })
+      expect(writes.has([io.sorties, 'crap.txt'].join(os.sep))).toBe(true)
+    })
+
+    test('fonction modifiée couverte : vert ; sans rapport de couverture, sans tests lancés ou sans read/show : sautée', async () => {
+      const couverte = ioCrap(istanbul(l => l >= 11))
+      const vert = await runGate(couverte.io, verifOf(JEST), { changed: ['src/calc.ts'], files: [], commit: 'abc1234' })
+      expect(vert.resultat.etat).toBe('vert')
+      expect(vert.resultat.commandes[1]).toMatchObject({ id: 'crap', etat: 'ok', nouvelles: 0, preexistantes: 1 })
+
+      const sansRapport = ioCrap(undefined)
+      const r1 = await runGate(sansRapport.io, verifOf(JEST), { changed: ['src/calc.ts'], files: [], commit: 'abc1234' })
+      expect(r1.resultat.etat).toBe('vert')
+      expect(r1.resultat.commandes[1]).toMatchObject({ etat: 'saute' })
+      expect(r1.resultat.commandes[1]!.note).toMatch(/pas de couverture/)
+
+      const r2 = await runGate(couverte.io, verifOf([JEST[1]!]), { changed: ['src/calc.ts'], files: [], commit: 'abc1234' })
+      expect(r2.resultat.commandes[0]).toMatchObject({ etat: 'saute', note: 'pas de couverture : tests non lancés' })
+
+      const r3 = await runGate({ ...couverte.io, show: undefined }, verifOf(JEST), { changed: ['src/calc.ts'], files: [], commit: 'abc1234' })
+      expect(r3.resultat.commandes[1]).toMatchObject({ etat: 'saute' })
+      const r4 = await runGate(couverte.io, verifOf(JEST), { changed: ['src/calc.test.ts', 'README.md'], files: [], commit: 'abc1234' })
+      expect(r4.resultat.commandes.find(c => c.id === 'crap')).toMatchObject({ etat: 'saute', note: 'aucun fichier analysable' })
     })
   })
 }

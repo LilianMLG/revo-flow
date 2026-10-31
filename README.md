@@ -131,6 +131,16 @@ Depuis la v2, un flow ne finit plus « terminé » sur un lint, un typage ou un 
 
 **Mesure** : le journal du graphe note pour chaque flow l'état de la vérification, ses tentatives, ses erreurs nouvelles et sa durée. La section « Cache » du panneau en tire le taux d'échappement (flows observés rouges), la part de flows rouges au premier passage, les erreurs nouvelles attrapées, les flows acceptés non vérifiés et la durée moyenne de la porte.
 
+### Score CRAP
+
+Depuis la v2.1, la porte juge aussi la **qualité des fonctions que le flow touche**, avec le score CRAP (Savoia et Evans, 2007) : pour chaque fonction, `CRAP = cc² × (1 − cov)³ + cc`, où `cc` est la complexité cyclomatique et `cov` la part de ses lignes couverte par les tests (0 à 1). **Seuil : 30.** Une fonction entièrement couverte vaut sa complexité ; une fonction sans aucun test dépasse 30 dès une complexité de 6.
+
+- **Règle du scout** : seule une fonction **modifiée** par le flow (absente du commit de départ, ou dont le texte a changé) et au-delà du seuil est une erreur **nouvelle**, qui bloque la porte comme un lint rouge. Une fonction identique au commit de départ est **préexistante** : montrée à part, jamais bloquante. Un agent qui touche une fonction doit la laisser simple (complexité ≤ 5) ou la couvrir par un test lié ; celle qu'il ne touche pas n'est pas à lui. La consigne de chaque agent le lui dit.
+- **Couverture** : celle des tests liés déjà lancés par la porte, sans lancement de plus. `vitest related`, `jest --findRelatedTests` et `flutter test` reçoivent des flags de couverture qui écrivent dans le dossier de sorties du flow (`<sorties>/couverture`) ; la commande `crap` (outil `qualite`, en dernier) lit ces rapports (istanbul JSON ou lcov), les fonctions des fichiers modifiés (TypeScript, JavaScript, Vue, Dart ; ni tests ni Dart généré) et leur version au commit de départ (`git show`). Le détail par fonction est dans `crap.txt`.
+- **Ce qui bloque** : comme le reste de la porte, selon l'option `verif` (`bloquer`, `observer`, `off`) ; pas de mode à part. Le panneau affiche « 2 fonctions modifiées > 30 ».
+- **Option `crap`** (`/config`, oui par défaut) : `non` retire la commande `crap` et les flags de couverture, même des commandes déjà confirmées.
+- **Limites** : `dart test` pur n'est pas couvert (seul `flutter test` écrit un lcov) ; vitest demande `@vitest/coverage-v8` ou `@vitest/coverage-istanbul` (sans lui, un piège l'annonce à la confirmation et la commande `crap` n'est pas proposée) ; la couverture est celle des **tests liés** seulement, pas de toute la suite ; si les tests n'ont pas tourné ou n'ont écrit aucun rapport, la commande est sautée plutôt que de juger sans couverture ; la complexité est calculée par revo-flow (points de décision comptés dans le texte, sans compilateur) : approximative, mais stable d'un flow à l'autre, ce qui suffit à comparer.
+
 ## Options (`/config`)
 
 | Option | Défaut | Effet |
@@ -139,6 +149,7 @@ Depuis la v2, un flow ne finit plus « terminé » sur un lint, un typage ou un 
 | `conflits` | `avertir` | fichier déjà modifié par un autre agent encore au travail : `avertir` affiche un toast, `refuser` bloque la modification |
 | `notifier` | oui | notification système à la fin d'un flow et quand un agent échoue (un toast si elle ne peut pas partir) |
 | `verif` | `bloquer` | vérification des flows : `bloquer` refuse la fin d'un flow tant qu'une erreur nouvelle subsiste (3 tentatives), `observer` vérifie et affiche sans bloquer, `off` ne vérifie pas |
+| `crap` | oui | score CRAP dans la porte : une fonction modifiée par le flow au-delà de 30 (complexité × couverture des tests liés) est une erreur nouvelle ; `non` : ni commande `crap`, ni flags de couverture |
 | `cache` | oui | brief du cache projet au lancement, extrait de fiche dans le prompt de chaque agent et outil `cache` proposé ; `non` : ni brief, ni extrait, ni outil, la commande `cache` reste et les flows comptent dans la mesure « sans cache » |
 
 Sur l'app desktop, `/revo-flow` n'apparaît pas toujours dans le menu `/` : tape la commande en entier, elle fonctionne.
@@ -171,10 +182,11 @@ revo-flow/
 │   │   ├── graph.ts       graphe du cache, module pur
 │   │   └── store.ts       disque et git du cache
 │   └── verif/             le flow vérifié : détection, portée, lecture des sorties, base, rapport, exécution, garde-fous
+│       └── crap.ts        score CRAP : fonctions et complexité, lecture de la couverture, règle du scout
 ├── tests/                 lancés par claude plugin test .
 │   ├── flow.test.ts
 │   ├── cache/             graph.test.ts, store.test.ts
-│   ├── verif/             coeur.test.ts, garde.test.ts
+│   ├── verif/             coeur.test.ts, garde.test.ts, crap.test.ts
 │   ├── ui/                verif.test.ts
 │   └── helpers/os.ts      les deux machines simulées (Windows, macOS)
 ├── types/                 contrats : état du mod (index.d.ts), graphe du cache (cache.d.ts), vérification (verif.d.ts)

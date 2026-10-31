@@ -1,7 +1,7 @@
 {
   "name": "revo-flow",
-  "version": "2.0.0",
-  "description": "/revo-flow <demande> : l'orchestrateur lit les specs, fait un plan, répartit les tâches entre des sous-agents (modèle et effort choisis pour chacun) et affiche une barre de progression par agent dans le panneau latéral ; un cache par projet (graphe des fichiers et fiches de features apprises en fin de flow) lui évite de relire le code : /revo-flow cache. Un agent peut en attendre un autre (relancé quand il a fini) et reçoit l'extrait de fiche qui le concerne, qu'il vérifie et rafraîchit. Un flow vérifié : revo-flow apprend les commandes de vérification du projet (lint, typage, tests ciblés), les lance lui-même en fin de flow et refuse de le déclarer terminé tant qu'elles sont rouges (erreurs nouvelles seulement, base de référence prise pendant la planification) ; critères d'acceptation, vérificateur indépendant et tests gelés en option.",
+  "version": "2.1.0",
+  "description": "/revo-flow <demande> : l'orchestrateur lit les specs, fait un plan, répartit les tâches entre des sous-agents (modèle et effort choisis pour chacun) et affiche une barre de progression par agent dans le panneau latéral ; un cache par projet (graphe des fichiers et fiches de features apprises en fin de flow) lui évite de relire le code : /revo-flow cache. Un agent peut en attendre un autre (relancé quand il a fini) et reçoit l'extrait de fiche qui le concerne, qu'il vérifie et rafraîchit. Un flow vérifié : revo-flow apprend les commandes de vérification du projet (lint, typage, tests ciblés), les lance lui-même en fin de flow et refuse de le déclarer terminé tant qu'elles sont rouges (erreurs nouvelles seulement, base de référence prise pendant la planification) ; critères d'acceptation, vérificateur indépendant et tests gelés en option. Le score CRAP (complexité × couverture des tests liés) fait respecter la règle du scout : une fonction modifiée par le flow au-delà de 30 bloque la porte, une fonction ancienne qu'il ne touche pas jamais.",
   "author": {
     "name": "Lilian Malinge"
   },
@@ -46,6 +46,12 @@
         "observer",
         "off"
       ]
+    },
+    "crap": {
+      "type": "boolean",
+      "title": "Score CRAP",
+      "description": "Dans la porte de vérification, le score CRAP de chaque fonction modifiée par le flow : complexité² × (1 − couverture)³ + complexité, seuil 30. Seule une fonction touchée par le flow au-delà du seuil compte ; une fonction identique au commit de départ est préexistante et ne bloque pas. La couverture vient des tests liés déjà lancés par la porte (vitest, jest, flutter test ; pour vitest, @vitest/coverage-v8 ou @vitest/coverage-istanbul doit être installé ; dart test seul n'est pas couvert). Le blocage suit l'option « verif ». Désactivé : ni commande crap ni flags de couverture.",
+      "default": true
     }
   }
 }

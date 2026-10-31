@@ -380,3 +380,30 @@ l'orchestrateur, sans rien changer au flow. Ce qu'elle trouve rouge, c'est exact
 | Test faux gelé | Implémenteur bloqué | Dégel par l'orchestrateur, confirmé par l'utilisateur |
 | Agent qui contourne par Bash | Test modifié malgré le gel | Re-hash à chaque porte ; signalé, bloquant |
 | API qui change (accès anticipé) | Hooks cassés | Hooks en échec ouverts pour la porte, fermés pour le gel ; tests du module pur |
+
+## 16. Score CRAP (v2.1)
+
+Ajout du 2026-10-31 : la porte juge la qualité des fonctions que le flow touche, pas seulement leur correction.
+
+- **Formule** (Savoia et Evans, 2007), par fonction : `CRAP = cc² × (1 − cov)³ + cc`, `cc` la complexité cyclomatique,
+  `cov` la couverture de ses lignes (0 à 1). **Seuil 30** (`CRAP_SEUIL`, `seuil` de la commande).
+- **Règle du scout** (ratchet) : une fonction **modifiée** par le flow au-delà du seuil est « nouvelle » et bloque ; une
+  fonction identique au commit de départ est « préexistante ». Le classement est fait par `hooks/verif/crap.ts`
+  (texte actuel, texte au commit de départ par `git show`, couverture), sans passer par `classify` ni par la base de
+  référence : `runBase` ne fait rien pour `crap`.
+- **Couverture** : celle des tests liés que la porte lance déjà. `detectCommands` ajoute à `vitest related` (si
+  `@vitest/coverage-v8` ou `@vitest/coverage-istanbul` est installé, sinon un piège), à `jest --findRelatedTests` et à
+  `flutter test` les flags de `coverageArgs`, vers `{sorties}/couverture` ; le runner remplace le jeton `{sorties}` par le
+  dossier de sorties du flow, vide ce dossier avant chaque lancement de tests (relances comprises) et fusionne les
+  rapports lus après chacun. `dart test` pur : non supporté (pas de commande `crap` pour lui seul).
+- **Commande** : `{ id: 'crap', outil: 'qualite', format: 'crap', argv: [], portee: 'fichiers', seuil: 30 }`, en dernier
+  dans l'ordre (`qualite` après `tests`). Rien n'est lancé ; sautée si aucun fichier n'est analysable, si les tests n'ont
+  pas tourné ou n'ont écrit aucun rapport (jamais de jugement sur une couverture absente), ou si `VerifIo` n'a pas `read`
+  et `show`. Un fichier d'une langue dont les tests n'ont pas tourné n'est pas jugé. La copie partagée (vérification d'un
+  agent) s'applique comme au lint : seuls ses fichiers.
+- **Option `crap`** (booléen, vrai par défaut) : lue à chaque détection ; fausse, `verifOf` retire aussi la commande et
+  les flags de couverture des commandes déjà confirmées (`withoutCrap`). Le blocage suit le mode `verif`, sans mode à
+  part. Le vérificateur reçoit les commandes sans les flags de couverture.
+- **Journal** : `verif.crap = { fonctions, nouvelles, preexistantes }`, les fonctions au-delà du seuil à la dernière porte.
+- **Limites** : complexité comptée sur le texte (points de décision), approximative mais stable ; couverture des tests
+  liés seulement, pas de la suite entière.

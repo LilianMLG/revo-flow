@@ -290,11 +290,11 @@ export const allFinished = (flow: Flow) =>
  * désactivée), rien n'y parle du cache ni de son outil ; sans vérification (option verif à off), l'orchestrateur
  * vérifie lui-même comme en v1.5, et rien n'y parle de la porte, des critères ni de l'outil verif.
  */
-export function leadBrief(withCache: boolean, withVerif = true): string {
+export function leadBrief(withCache: boolean, withVerif = true, withCrap = true): string {
   const cache = (s: string) => (withCache ? s : '')
   const verif = (s: string) => (withVerif ? s : '')
   const end = withVerif
-    ? `4. Fin : quand tous ont fini, la porte revo-flow vérifie (lint, typage et tests liés sur les fichiers du flow, comparés à la base de référence) ; lis son rapport et décide : corrige toi-même, reprends l'agent avec SendMessage ou relance-le. Seules les erreurs nouvelles bloquent ; demande une exception (${VERIF_TOOL} action exception, avec motif) seulement pour une erreur qui ne relève pas de ce flow`
+    ? `4. Fin : quand tous ont fini, la porte revo-flow vérifie (lint, typage et tests liés${withCrap ? ' et score CRAP des fonctions modifiées' : ''} sur les fichiers du flow, comparés à la base de référence) ; lis son rapport et décide : corrige toi-même, reprends l'agent avec SendMessage ou relance-le. Seules les erreurs nouvelles bloquent ; demande une exception (${VERIF_TOOL} action exception, avec motif) seulement pour une erreur qui ne relève pas de ce flow`
     : `4. Fin : quand tous ont fini, vérifie l'ensemble (tests et lint ciblés) et corrige si besoin`
   return `# revo-flow — tu es l'orchestrateur de cette demande
 1. Plan : ${cache(`commence par le cache revo-flow ci-dessous s'il y en a un, une carte, pas la vérité : vérifie dans le code ce que tu affirmes ou changes. S'il connaît la feature, ne lis que les fichiers à modifier et ceux modifiés depuis l'apprentissage. Puis `)}lis toi-même la demande et les specs utiles, seulement le nécessaire, sans rien modifier. Pas de sous-agent avant le plan, sauf un éclaireur Explore (lecture seule, haiku ou sonnet) quand la lecture est large : revo-flow demande l'accord de l'utilisateur.
@@ -433,19 +433,23 @@ Le cache est une carte, pas la vérité : vérifie dans le code ce que tu modifi
   graphe: `Cache revo-flow (outil ${CACHE_TOOL}) : pas encore de fiche de feature pour ce projet ; action voisins (chemin) avant un grep « qui utilise X ».`,
 }
 
+/** La règle du scout du score CRAP, ajoutée à la consigne de vérification d'un agent quand l'option « crap » est active. */
+const SCOUT =
+  ' Règle du scout (score CRAP ≤ 30) : une fonction que tu modifies doit rester simple (complexité ≤ 5) ou être couverte par un test lié ; au-delà, la porte la refuse. Une fonction que tu ne touches pas n\'est pas à toi.'
+
 /**
  * Ajouté au prompt du sous-agent : ses tâches (celles déjà faites lors d'un lancement précédent cochées), comment
  * les signaler et, avec le cache, comment s'en servir. `others` : les noms des autres agents du plan, ceux qu'il
  * peut attendre (statut attente). `verif` : la porte est active, l'agent lance verif sur ses fichiers avant de finir
- * (sauf un agent en lecture seule : Explore ou vérificateur).
+ * (sauf un agent en lecture seule : Explore ou vérificateur) ; `crap` : avec la règle du scout du score CRAP.
  */
-export function agentBrief(a: FlowAgent, cache: AgentCache | boolean = 'fiches', others: readonly string[] = [], verif = true): string {
+export function agentBrief(a: FlowAgent, cache: AgentCache | boolean = 'fiches', others: readonly string[] = [], verif = true, crap = true): string {
   const mode = cache === true ? 'fiches' : cache
   const done = a.tasks.filter(t => t.status === 'completed').length
   const resume = done > 0 && done < a.tasks.length
   const check =
     verif && a.subagentType !== 'Explore' && !isVerifier(a)
-      ? `\nAvant de finir, appelle l'outil ${VERIF_TOOL} action lancer sur tes fichiers ; corrige ce qui est nouveau et à toi (les erreurs préexistantes ou d'un autre agent ne sont pas à toi).`
+      ? `\nAvant de finir, appelle l'outil ${VERIF_TOOL} action lancer sur tes fichiers ; corrige ce qui est nouveau et à toi (les erreurs préexistantes ou d'un autre agent ne sont pas à toi).${crap ? SCOUT : ''}`
       : ''
   return `# Tes tâches (revo-flow) — « ${a.name} »${a.role ? ` : ${a.role}` : ''}
 ${a.tasks.map((t, i) => `${i + 1}. ${t.title}${t.status === 'completed' ? ' ✓ déjà faite' : ''}`).join('\n')}

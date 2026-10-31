@@ -159,6 +159,14 @@ function verifCommandDetail(c: VerifEtatCommande): string {
   if (c.etat === 'en_cours') return 'en cours…'
   if (c.etat === 'erreur') return c.note ?? 'la commande a planté'
   if (c.etat === 'saute') return c.note ?? 'sautée'
+  if (c.outil === 'qualite') {
+    // Score CRAP : des fonctions au-delà du seuil, pas des erreurs.
+    const fns = [
+      ...(c.nouvelles > 0 ? [`${c.nouvelles} ${c.nouvelles > 1 ? 'fonctions modifiées' : 'fonction modifiée'} > 30`] : []),
+      ...(c.preexistantes > 0 ? [`${c.preexistantes} ${c.preexistantes > 1 ? 'préexistantes' : 'préexistante'}`] : []),
+    ]
+    if (fns.length > 0) return fns.join(' · ')
+  }
   const errs = [
     ...(c.nouvelles > 0 ? [`${c.nouvelles} ${c.nouvelles > 1 ? 'nouvelles' : 'nouvelle'}`] : []),
     ...(c.preexistantes > 0 ? [`${c.preexistantes} ${c.preexistantes > 1 ? 'préexistantes' : 'préexistante'}`] : []),

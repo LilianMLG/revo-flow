@@ -2,7 +2,8 @@
 // puis les outils présents. Pur : les manifestes lus viennent de l'appelant (chemin → texte, undefined = absent).
 // Rien de ce qui est proposé n'écrit : jamais lint:fix, format --write, -u ni build ; les formats machine sont préférés (JSON, machine).
 import type { ProjetVerif, VerifCommande, VerifOutil, VerifPortee, VerifSource } from '../../types/verif'
-import { FICHIERS, norm, toolOf } from './scope'
+import { CRAP_SEUIL, coverageArgs } from './crap'
+import { FICHIERS, SORTIES, norm, toolOf } from './scope'
 
 /** Chemins relatifs à lire s'ils existent ; leur hash git est gardé dans projet.verif.manifestes (un hash changé redemande la confirmation). */
 export const MANIFESTES: string[] = [
@@ -311,13 +312,29 @@ const valueOf = (argv: string[], flag: string): string | undefined => {
   return undefined
 }
 
-const ORDRE: VerifOutil[] = ['generation', 'format', 'lint', 'typage', 'tests']
+const ORDRE: VerifOutil[] = ['generation', 'format', 'lint', 'typage', 'tests', 'qualite']
+
+/** Le dossier de couverture des tests liés, sous les sorties du flow (jeton remplacé par le runner). */
+const COUVERTURE = `${SORTIES}/couverture`
+
+/** La commande du score CRAP : pas de lancement, elle lit la couverture écrite par les tests liés (runner.ts, crap.ts). */
+const CRAP_COMMANDE: VerifCommande = {
+  id: 'crap',
+  outil: 'qualite',
+  argv: [],
+  portee: 'fichiers',
+  format: 'crap',
+  source: 'deduit',
+  origine: `score CRAP : complexité × couverture des tests liés, seuil ${CRAP_SEUIL}, fonctions modifiées seulement`,
+  seuil: CRAP_SEUIL,
+}
 
 /**
  * Les commandes du projet et les pièges d'environnement. Ordre de confiance : CI (lignes qui appellent un outil ou un script connu),
  * scripts de package.json, outils présents (« déduit »). `sondes` : chemin de SONDES → existe (facultatif ; sans lui, aucun piège de dossier).
+ * `crap` (option du plugin, vrai par défaut) : les tests liés mesurent leur couverture et la commande « crap » suit les tests.
  */
-export function detectCommands(input: { stack: string; files: string[]; read: Record<string, string | undefined>; sondes?: Record<string, boolean> }): {
+export function detectCommands(input: { stack: string; files: string[]; read: Record<string, string | undefined>; sondes?: Record<string, boolean>; crap?: boolean }): {
   commandes: VerifCommande[]
   pieges: string[]
 } {
@@ -343,6 +360,13 @@ export function detectCommands(input: { stack: string; files: string[]; read: Re
 
   const commandes: VerifCommande[] = []
   const add = (c: Omit<VerifCommande, 'source'> & { source?: VerifSource }) => commandes.push({ source: 'deduit', ...c } as VerifCommande)
+  // Score CRAP : les flags de couverture d'un testeur qui sait la mesurer, puis une seule commande « crap » pour tout le projet.
+  const crap = input.crap !== false
+  const couverture = (outil: 'vitest' | 'jest' | 'flutter', mesure = true): string[] => {
+    if (!crap || !mesure) return []
+    if (!commandes.some(c => c.id === CRAP_COMMANDE.id)) add({ ...CRAP_COMMANDE })
+    return coverageArgs(outil, COUVERTURE)
+  }
   const from = (h: Hit | undefined, origine: string) => (h ? { source: h.source, origine: h.origine } : { source: 'deduit' as const, origine })
 
   // ── JavaScript / TypeScript ──
@@ -405,26 +429,33 @@ export function detectCommands(input: { stack: string; files: string[]; read: Re
         if (!exclus.includes(g)) exclus.push(g)
       }
     }
-    if (testeur === 'vitest')
+    if (testeur === 'vitest') {
+      // vitest ne mesure la couverture qu'avec son fournisseur installé : sans lui, pas de score CRAP (piège).
+      const fournisseur = has('@vitest/coverage-v8') || has('@vitest/coverage-istanbul')
+      if (crap && !fournisseur) pieges.push('score CRAP : installez @vitest/coverage-v8 (ou coverage-istanbul) pour mesurer la couverture des tests liés')
+      const cov = couverture('vitest', fournisseur)
       add({
         id: 'vitest',
         outil: 'tests',
-        argv: ['npx', 'vitest', 'related', '--run', '--reporter=json', '--passWithNoTests', ...(hTest ? keep(hTest.toks, GARDER.vitest!) : []), FICHIERS],
+        argv: ['npx', 'vitest', 'related', '--run', '--reporter=json', '--passWithNoTests', ...(hTest ? keep(hTest.toks, GARDER.vitest!) : []), ...cov, FICHIERS],
         portee: 'lies',
         format: 'vitest-json',
         ...from(hTest, 'vitest (dépendances)'),
         ...(exclus.length ? { exclus } : {}),
       })
-    else if (testeur === 'jest')
+    } else if (testeur === 'jest') {
+      // jest mesure la couverture sans dépendance de plus.
+      const cov = couverture('jest')
       add({
         id: 'jest',
         outil: 'tests',
-        argv: ['npx', 'jest', '--json', '--passWithNoTests', ...(hTest ? keep(hTest.toks, GARDER.jest!) : []), '--findRelatedTests', FICHIERS],
+        argv: ['npx', 'jest', '--json', '--passWithNoTests', ...(hTest ? keep(hTest.toks, GARDER.jest!) : []), ...cov, '--findRelatedTests', FICHIERS],
         portee: 'lies',
         format: 'jest-json',
         ...from(hTest, 'jest (dépendances)'),
         ...(exclus.length ? { exclus } : {}),
       })
+    }
 
     // Générateur GraphQL : déclenché par un .graphql modifié, avant le typage.
     const hGen = best('codegen')
@@ -467,9 +498,10 @@ export function detectCommands(input: { stack: string; files: string[]; read: Re
         opts = opts.filter((t, i) => t !== '--dart-define-from-file' && !t.startsWith('--dart-define-from-file=') && opts[i - 1] !== '--dart-define-from-file')
         pieges.push(`env.test absent : la CI le passe à flutter test (--dart-define-from-file) ; les tests liés tournent sans`)
       } else if (envFile === undefined && envTest) opts.unshift('--dart-define-from-file=env.test')
+      // flutter test écrit un lcov ; dart test pur ne sait pas (pas de score CRAP).
       add(
         viaFlutter
-          ? { id: 'flutter-test', outil: 'tests', argv: ['flutter', 'test', '--machine', ...opts, FICHIERS], portee: 'lies', format: 'flutter-json', ...from(hTest, 'test/') }
+          ? { id: 'flutter-test', outil: 'tests', argv: ['flutter', 'test', '--machine', ...opts, ...couverture('flutter'), FICHIERS], portee: 'lies', format: 'flutter-json', ...from(hTest, 'test/') }
           : { id: 'dart-test', outil: 'tests', argv: ['dart', 'test', '--reporter=json', FICHIERS], portee: 'lies', format: 'flutter-json', ...from(hTest, 'test/') },
       )
     }
@@ -498,6 +530,15 @@ export function detectCommands(input: { stack: string; files: string[]; read: Re
   return { commandes, pieges }
 }
 
+/**
+ * Les commandes confirmées, option « crap » coupée depuis : sans la commande « crap » ni les flags de couverture des tests liés
+ * (les commandes rangées dans projet.verif ne sont redétectées qu'au changement d'un manifeste).
+ */
+export function withoutCrap(commandes: VerifCommande[]): VerifCommande[] {
+  const flags = new Set((['vitest', 'jest', 'flutter'] as const).flatMap(t => coverageArgs(t, COUVERTURE)))
+  return commandes.filter(c => c.format !== 'crap').map(c => (c.outil === 'tests' && c.argv.some(t => flags.has(t)) ? { ...c, argv: c.argv.filter(t => !flags.has(t)) } : c))
+}
+
 /** Faut-il (re)demander la confirmation ? Absent, jamais confirmé par l'utilisateur, ou un manifeste ajouté, retiré ou dont le hash a changé. */
 export function needsConfirm(verif: ProjetVerif | undefined, hashes: Record<string, string>): boolean {
   if (!verif || !verif.confirme || verif.confirme.par !== 'utilisateur') return true
@@ -509,6 +550,8 @@ export function needsConfirm(verif: ProjetVerif | undefined, hashes: Record<stri
 
 /** Le nom court d'une commande, pour la question, le panneau et le rapport : 'eslint', 'nuxi typecheck', 'vitest related', 'flutter test'… */
 export function commandLabel(c: VerifCommande): string {
+  if (c.format === 'crap') return `${c.id} · score CRAP sur les fonctions modifiées`
+  if (!c.argv.length) return c.id
   const t = toolOf(c.argv)
   const i = c.argv.findIndex(x => x.toLowerCase() === t || x.endsWith(`/${t}`))
   const sub = c.argv[i + 1]
@@ -530,8 +573,12 @@ function sourceLabel(c: VerifCommande): string {
   return `déduit${c.origine ? ` (${c.origine})` : ''}`
 }
 
-/** argv lisible : '{fichiers}' devient '<fichiers>'. */
-export const argvText = (argv: string[]) => argv.map(t => (t === FICHIERS ? '<fichiers>' : /\s/.test(t) ? `"${t}"` : t)).join(' ')
+/** argv lisible : '{fichiers}' devient '<fichiers>', '{sorties}' devient '<sorties>'. */
+export const argvText = (argv: string[]) =>
+  argv
+    .map(t => (t === FICHIERS ? '<fichiers>' : t.split(SORTIES).join('<sorties>')))
+    .map(t => (/\s/.test(t) ? `"${t}"` : t))
+    .join(' ')
 
 /** Le texte de la question de confirmation (§6.4) : chaque commande exacte, sa portée, sa source ; puis les pièges. */
 export function commandsQuestion(nom: string, commandes: VerifCommande[], pieges: string[]): string {
@@ -543,6 +590,12 @@ export function commandsQuestion(nom: string, commandes: VerifCommande[], pieges
   }
   const lignes = [`revo-flow a trouvé ces vérifications pour ${nom} :`]
   for (const c of commandes) {
+    if (c.format === 'crap') {
+      // Rien à lancer : la ligne dit ce que fait la commande, pas un argv vide.
+      const qui = c.source === 'orchestrateur' ? ' · orchestrateur' : ''
+      lignes.push(`  · ${commandLabel(c)} : complexité × couverture des tests liés, seuil ${c.seuil ?? CRAP_SEUIL} ; seule une fonction modifiée au-delà bloque${qui}`)
+      continue
+    }
     const quand = c.declencheur ? `, si un fichier ${c.declencheur.replace(/^\*\*\//, '')} change` : ''
     lignes.push(`  · ${commandLabel(c)} (${PORTEE[c.portee]}${quand}) : ${argvText(c.argv)} · ${sourceLabel(c)}`)
     if (c.exclus?.length) lignes.push(`      tests exclus : ${c.exclus.join(', ')}`)

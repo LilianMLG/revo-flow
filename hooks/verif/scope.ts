@@ -9,6 +9,12 @@ export type Lancement = { id: string; cwd: string; argv: string[]; fichiers: str
 export const FICHIERS = '{fichiers}'
 
 /**
+ * Le jeton remplacé par le runner, à l'exécution, par le chemin absolu du dossier de sorties du flow
+ * (~/.claude/revo-flow/verif/<date>-<flow>) ; il peut être un préfixe (« {sorties}/couverture »). fill le laisse passer tel quel.
+ */
+export const SORTIES = '{sorties}'
+
+/**
  * Longueur max des fichiers d'un lancement, en caractères : `cmd /c` refuse une ligne de plus de 8 191 caractères sous Windows.
  * Au-delà, la commande est découpée en plusieurs lancements (même id).
  */

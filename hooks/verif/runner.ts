@@ -1,18 +1,25 @@
 // L'exécuteur de la porte (docs/rd-v2/conception.md §7, §10, §11) : lance chaque commande sur sa portée, lit la sortie, classe contre la base,
-// relance une fois seuls les tests rouges, apprend les durées et écrit la sortie complète en .txt.
+// relance une fois seuls les tests rouges, apprend les durées et écrit la sortie complète en .txt. Les tests liés écrivent leur couverture
+// dans <sorties>/couverture, lue après chaque lancement ; la commande « crap » (outil qualite, en dernier) en tire le score CRAP des fonctions.
 // Pas de `$` ici (le moteur ne le suit pas à travers un import) : register.tsx construit un VerifIo dont chaque méthode appelle $.process, $.fs, $.clock.
 import type { ProjetVerif, VerifBase, VerifCommande, VerifErreur, VerifEtatCommande, VerifResultat } from '../../types/verif'
 import { baseFor, classify } from './base'
+import { CRAP_SEUIL, analysable, coverageFiles, coverageFormatOf, coverageOf, crapErreurs, crapOf, crapText, langOf, mergeCoverage, type Couverture, type CrapFonction, type Lang } from './crap'
 import { parseOutput, signatureKey } from './parse'
 import { dureeText } from './report'
-import { FICHIERS, norm, plan, toolOf, withShell, type Lancement } from './scope'
+import { FICHIERS, SORTIES, isDart, norm, plan, toolOf, withShell, type Lancement } from './scope'
 
-/** Ce que la vérification demande au moteur. racine : chemin absolu du projet ; sorties : dossier absolu ~/.claude/revo-flow/verif/<flow>. */
+/**
+ * Ce que la vérification demande au moteur. racine : chemin absolu du projet ; sorties : dossier absolu ~/.claude/revo-flow/verif/<flow>.
+ * read : le texte d'un fichier (chemin hôte) ; show : le contenu d'un fichier (relatif à la racine) au commit donné, undefined s'il n'y était pas.
+ */
 export type VerifIo = {
   run(argv: string[], init: { cwd: string; timeoutMs: number }): Promise<{ exitCode: number; stdout: string; stderr: string }>
   write(path: string, text: string): Promise<void>
   list?(dir: string): Promise<string[]>
   remove?(path: string): Promise<void>
+  read?(path: string): Promise<string>
+  show?(commit: string, rel: string): Promise<string | undefined>
   now(): Promise<number>
   os: 'windows' | 'posix'
   racine: string
@@ -32,8 +39,10 @@ const MAX_PREEXISTANTES = 200
 const MAX_INSTABLES = 100
 /** Codes de sortie d'une commande introuvable (sh, cmd.exe). */
 const INTROUVABLE = new Set([127, 9009])
-/** Ordre d'exécution : la génération avant le typage, les tests en dernier. */
-const ORDRE = ['generation', 'format', 'lint', 'typage', 'tests']
+/** Ordre d'exécution : la génération avant le typage, les tests, puis la qualité (score CRAP, qui lit la couverture des tests). */
+const ORDRE = ['generation', 'format', 'lint', 'typage', 'tests', 'qualite']
+/** Le sous-dossier des sorties où les tests liés écrivent leur couverture (coverageArgs). */
+const COUVERTURE = 'couverture'
 
 /** Moyenne glissante des durées de la commande, en ms (undefined si jamais lancée). */
 export function durationOf(verif: ProjetVerif | undefined, id: string): number | undefined {
@@ -67,8 +76,17 @@ export function projectArgv(cmd: VerifCommande): string[] | undefined {
 
 type Exec = { l: Lancement; exitCode: number; stdout: string; stderr: string; dureeMs: number; echec?: string }
 
+/** Le jeton '{sorties}' (seul ou suivi d'un chemin à « / ») dans un argument : remplacé par le dossier des sorties, au séparateur de l'hôte. */
+const SORTIES_RE = new RegExp(`${SORTIES.replace(/[{}]/g, '\\$&')}((?:/[^\\s,;=]*)?)`, 'g')
+
+/** argv dont le jeton '{sorties}' est remplacé par le dossier des sorties du flow (chemin de l'hôte). */
+export function fillSorties(io: Pick<VerifIo, 'os' | 'sorties'>, argv: string[]): string[] {
+  return argv.map(t => (t.includes(SORTIES) ? t.replace(SORTIES_RE, (_, rest: string) => joinPath(io, io.sorties, rest.replace(/^\//, ''))) : t))
+}
+
 /** Un lancement : jamais d'exception, une erreur de run devient `echec`. */
-async function exec(io: VerifIo, l: Lancement, timeoutMs: number): Promise<Exec> {
+async function exec(io: VerifIo, lancement: Lancement, timeoutMs: number): Promise<Exec> {
+  const l = lancement.argv.some(t => t.includes(SORTIES)) ? { ...lancement, argv: fillSorties(io, lancement.argv) } : lancement
   const t0 = await io.now()
   try {
     const r = await io.run(withShell(l.argv, io.os), { cwd: joinPath(io, io.racine, l.cwd), timeoutMs })
@@ -112,12 +130,61 @@ function illisible(e: Exec, lues: number): string | undefined {
 
 type Portee = { changed: string[]; files: string[]; testsOf?: (p: string) => string[]; annotes?: string[] }
 type Etape = { etat: VerifEtatCommande; erreurs: VerifErreur[]; instables: string[]; lancee: boolean }
+/**
+ * La couverture de la porte, accumulée sur les lancements de tests : langs = langues dont les tests ont tourné avec la couverture,
+ * lus = rapports de couverture lus.
+ */
+type Cov = { couv: Couverture; langs: Set<Lang>; lus: number }
+
+/** La commande de tests mesure-t-elle la couverture (un argument porte '{sorties}') ? */
+const mesure = (cmd: VerifCommande) => cmd.outil === 'tests' && cmd.argv.some(t => t.includes(SORTIES))
+
+/** Avant un lancement de tests : le dossier de couverture d'un lancement précédent part, pour ne jamais relire un vieux rapport. */
+async function clearCoverage(io: VerifIo): Promise<void> {
+  try {
+    await io.remove?.(joinPath(io, io.sorties, COUVERTURE))
+  } catch {
+    // dossier verrouillé : le rapport suivant l'écrase de toute façon
+  }
+}
+
+/** Après un lancement de tests : les rapports de <sorties>/couverture, lus et fusionnés dans l'accumulateur. Sans list ni read, rien. */
+async function readCoverage(io: VerifIo, cwd: string, cov: Cov): Promise<void> {
+  if (!io.list || !io.read) return
+  const dir = joinPath(io, io.sorties, COUVERTURE)
+  let noms: string[]
+  try {
+    noms = (await io.list(dir)).map(n => n.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? '')
+  } catch {
+    return
+  }
+  for (const nom of coverageFiles(noms)) {
+    const format = coverageFormatOf(nom)
+    if (!format) continue
+    try {
+      const text = await io.read(joinPath(io, dir, nom))
+      cov.couv = mergeCoverage(cov.couv, coverageOf(text, format, { racine: io.racine, cwd }))
+      cov.lus++
+    } catch {
+      // rapport illisible : les autres suffisent
+    }
+  }
+}
 
 /** Une commande de la porte : lancements, lecture, classement, relance unique des tests rouges, sortie écrite. */
 /** filtre : la vérification d'un agent (seulement = ses fichiers, flow = tous les fichiers du flow). */
 type Filtre = { seulement: Set<string>; flow: Set<string> }
 
-async function runCommand(io: VerifIo, cmd: VerifCommande, portee: Portee, base: VerifBase | undefined, instables: string[], filtre: Filtre | undefined, onProgress?: (c: VerifEtatCommande) => void): Promise<Etape> {
+async function runCommand(
+  io: VerifIo,
+  cmd: VerifCommande,
+  portee: Portee,
+  base: VerifBase | undefined,
+  instables: string[],
+  filtre: Filtre | undefined,
+  cov: Cov,
+  onProgress?: (c: VerifEtatCommande) => void,
+): Promise<Etape> {
   const vide: VerifEtatCommande = { id: cmd.id, outil: cmd.outil, etat: 'saute', dureeMs: 0, nouvelles: 0, preexistantes: 0, instables: 0, fichiers: 0 }
   const lancements = plan(cmd, portee)
   if (!lancements.length) {
@@ -134,8 +201,12 @@ async function runCommand(io: VerifIo, cmd: VerifCommande, portee: Portee, base:
   const execs: { titre: string; e: Exec }[] = []
   let lues: Omit<VerifErreur, 'statut'>[] = []
   const pannes: string[] = []
+  const couverture = mesure(cmd)
+  if (couverture) cov.langs.add(isDart(cmd) ? 'dart' : 'ts')
   for (const l of lancements) {
+    if (couverture) await clearCoverage(io)
     const e = await exec(io, l, timeoutMs)
+    if (couverture) await readCoverage(io, l.cwd, cov)
     execs.push({ titre: `lancement${l.cwd ? ` dans ${l.cwd}` : ''}`, e })
     const errs = parseOutput(cmd.format, e, { outil: cmd.id, cwd: l.cwd, racine: io.racine, argv: l.argv })
     const panne = illisible(e, errs.length)
@@ -155,7 +226,9 @@ async function runCommand(io: VerifIo, cmd: VerifCommande, portee: Portee, base:
     const encore = new Set<string>()
     const relues = new Set<string>()
     for (const l of relance) {
+      if (couverture) await clearCoverage(io)
       const e = await exec(io, l, timeoutMs)
+      if (couverture) await readCoverage(io, l.cwd, cov)
       execs.push({ titre: `relance des tests rouges${l.cwd ? ` dans ${l.cwd}` : ''}`, e })
       const errs = parseOutput(cmd.format, e, { outil: cmd.id, cwd: l.cwd, racine: io.racine, argv: l.argv })
       if (illisible(e, errs.length)) continue
@@ -200,7 +273,66 @@ async function runCommand(io: VerifIo, cmd: VerifCommande, portee: Portee, base:
 }
 
 /**
- * La porte : chaque commande confirmée, dans l'ordre génération, format, lint, typage, tests. `seulement` : fichiers d'un agent (sa portée,
+ * Le score CRAP (commande de format 'crap', rien à lancer) : pour chaque fichier du flow analysable dont les tests ont mesuré la couverture,
+ * les fonctions au texte actuel, comparées au texte du commit de départ (io.show), avec la couverture accumulée par les tests liés.
+ * Une fonction modifiée au-delà du seuil est « nouvelle » (bloque), une fonction identique au départ « préexistante » : le statut vient de
+ * crapErreurs, sans classify. La copie partagée tient dans portee.changed (les fichiers de l'agent).
+ */
+async function runCrap(io: VerifIo, cmd: VerifCommande, portee: Portee, commit: string, cov: Cov, onProgress?: (c: VerifEtatCommande) => void): Promise<Etape> {
+  const vide: VerifEtatCommande = { id: cmd.id, outil: cmd.outil, etat: 'saute', dureeMs: 0, nouvelles: 0, preexistantes: 0, instables: 0, fichiers: 0 }
+  const saute = (note: string): Etape => {
+    const etat = { ...vide, note }
+    onProgress?.(etat)
+    return { etat, erreurs: [], instables: [], lancee: false }
+  }
+  const cibles = [...new Set(portee.changed.map(norm))].filter(analysable)
+  if (!cibles.length) return saute('aucun fichier analysable')
+  if (!io.read || !io.show) return saute('lecture des fichiers indisponible')
+  if (!commit) return saute('pas de commit de départ')
+  if (!cov.langs.size) return saute('pas de couverture : tests non lancés')
+  if (!cov.lus) return saute('pas de couverture : aucun rapport lu (voir la sortie des tests)')
+  // Un fichier d'une langue dont les tests n'ont pas tourné n'a pas de couverture mesurée : il n'est pas jugé.
+  const mesures = cibles.filter(p => cov.langs.has(langOf(p)!))
+  if (!mesures.length) return saute('pas de couverture : tests non lancés')
+  const t0 = await io.now()
+  onProgress?.({ ...vide, etat: 'en_cours', fichiers: mesures.length })
+  const seuil = cmd.seuil ?? CRAP_SEUIL
+  const resultats: { fichier: string; fns: CrapFonction[] }[] = []
+  const erreurs: VerifErreur[] = []
+  for (const p of mesures) {
+    let maintenant: string
+    try {
+      maintenant = await io.read(joinPath(io, io.racine, p))
+    } catch {
+      continue // supprimé ou illisible : rien à juger
+    }
+    const avant = await io.show(commit, p).catch(() => undefined)
+    const fns = crapOf(p, maintenant, avant, cov.couv, langOf(p)!)
+    resultats.push({ fichier: p, fns })
+    erreurs.push(...crapErreurs(p, fns, seuil))
+  }
+  const nouvelles = erreurs.filter(e => e.statut === 'nouvelle' || e.statut === 'nouvelle?').length
+  const etat: VerifEtatCommande = {
+    ...vide,
+    etat: nouvelles > 0 ? 'ko' : 'ok',
+    dureeMs: (await io.now()) - t0,
+    nouvelles,
+    preexistantes: erreurs.filter(e => e.statut === 'preexistante').length,
+    fichiers: resultats.length,
+  }
+  const chemin = joinPath(io, io.sorties, `${cmd.id}.txt`)
+  try {
+    await io.write(chemin, crapText(resultats, seuil))
+    etat.sortie = chemin
+  } catch {
+    etat.note = 'sortie complète non écrite'
+  }
+  onProgress?.(etat)
+  return { etat, erreurs, instables: [], lancee: true }
+}
+
+/**
+ * La porte : chaque commande confirmée, dans l'ordre génération, format, lint, typage, tests, qualité. `seulement` : fichiers d'un agent (sa portée,
  * copie partagée) ; sinon `changed`, les fichiers du flow. Rend le résultat et projet.verif mis à jour (durées, instables).
  * Rouge : au moins une erreur nouvelle (ou « nouvelle ? ») ; erreur : aucune nouvelle mais une commande illisible ; sinon vert.
  */
@@ -218,8 +350,9 @@ export async function runGate(
   const erreurs: VerifErreur[] = []
   const appris: string[] = []
   const durees = new Map<string, number>()
+  const cov: Cov = { couv: new Map(), langs: new Set(), lus: 0 }
   for (const cmd of ordre) {
-    const r = await runCommand(io, cmd, portee, base, verif.instables, filtre, input.onProgress)
+    const r = cmd.format === 'crap' ? await runCrap(io, cmd, portee, input.commit, cov, input.onProgress) : await runCommand(io, cmd, portee, base, verif.instables, filtre, cov, input.onProgress)
     etats.push(r.etat)
     erreurs.push(...r.erreurs)
     appris.push(...r.instables)

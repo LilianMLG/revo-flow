@@ -133,7 +133,8 @@ import {
   type ViewData,
 } from './ui/views'
 import { addBase, baseFor } from './verif/base'
-import { MANIFESTES, SONDES, commandsQuestion, detectCommands, flutterVersionTrap, fvmVersion, manifestPaths, needsConfirm } from './verif/detect'
+import { CRAP_SEUIL } from './verif/crap'
+import { MANIFESTES, SONDES, commandsQuestion, detectCommands, flutterVersionTrap, fvmVersion, manifestPaths, needsConfirm, withoutCrap } from './verif/detect'
 import {
   TESTER_BRIEF,
   VERIFIER_PROMPT,
@@ -176,7 +177,7 @@ const verifA = atom({ plugin: 'revo-flow', key: 'verif' } as const, null)
 const verifFlowA = atom({ plugin: 'revo-flow', key: 'verifFlow' } as const, null)
 
 /** Les options du plugin (userConfig), fixées pour ce chargement : un changement recharge le module. */
-const opts = { validerPlan: true, conflits: 'avertir' as 'avertir' | 'refuser', notifier: true, cache: true, verif: 'bloquer' as VerifMode }
+const opts = { validerPlan: true, conflits: 'avertir' as 'avertir' | 'refuser', notifier: true, cache: true, verif: 'bloquer' as VerifMode, crap: true }
 
 /** Les agents prévus déjà attribués à un appel Agent : deux lancements en parallèle ne prennent jamais le même. */
 const claimed = new Set<string>()
@@ -380,10 +381,15 @@ async function registerVerifTool($: $) {
             type: 'object',
             properties: {
               id: { type: 'string' },
-              outil: { type: 'string', enum: ['lint', 'typage', 'tests', 'format', 'generation'] },
-              argv: { type: 'array', items: { type: 'string' }, description: 'La commande mot à mot, sans shell ; "{fichiers}" = les fichiers du flow' },
+              outil: { type: 'string', enum: ['lint', 'typage', 'tests', 'format', 'generation', 'qualite'] },
+              argv: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'La commande mot à mot, sans shell ; "{fichiers}" = les fichiers du flow, "{sorties}" = le dossier des sorties du flow ; vide pour la commande crap',
+              },
               portee: { type: 'string', enum: ['fichiers', 'lies', 'projet'] },
-              format: { type: 'string', enum: ['eslint-json', 'tsc', 'vitest-json', 'jest-json', 'biome', 'dart-machine', 'flutter-json', 'texte'] },
+              format: { type: 'string', enum: ['eslint-json', 'tsc', 'vitest-json', 'jest-json', 'biome', 'dart-machine', 'flutter-json', 'texte', 'crap'] },
+              seuil: { type: 'number', description: 'Commande crap (outil qualite, format crap) : le seuil du score CRAP, 30 par défaut' },
               declencheur: { type: 'string', description: 'Motif glob : la commande ne tourne que si un fichier du flow y correspond' },
               exclus: { type: 'array', items: { type: 'string' } },
             },
@@ -1366,7 +1372,11 @@ async function persistVerif($: $, g: Gate) {
 }
 
 /** Les commandes confirmées du projet, telles que le graphe gardé les porte. */
-const verifOf = (g: Gate): ProjetVerif | undefined => graphCache.get(g.ref.cle)?.graph.projet.verif
+/** projet.verif du graphe ; option « crap » coupée, sans la commande crap ni les flags de couverture (confirmées avant le changement d'option). */
+const verifOf = (g: Gate): ProjetVerif | undefined => {
+  const v = graphCache.get(g.ref.cle)?.graph.projet.verif
+  return v && !opts.crap ? { ...v, commandes: withoutCrap(v.commandes) } : v
+}
 
 /** Modifie projet.verif du graphe et l'enregistre ; jamais d'exception (la vérification ne doit pas gêner le flow). */
 async function saveVerif($: $, ref: ProjectRef, change: (v: ProjetVerif | undefined) => ProjetVerif) {
@@ -1404,6 +1414,9 @@ async function verifIoOf($: $, g: Gate): Promise<VerifIo> {
       return { exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr }
     },
     write: (path, text) => $.fs.write(path, text),
+    read: path => $.fs.read(path),
+    // Le fichier au commit de départ (score CRAP) : undefined s'il n'y était pas (ou si git échoue).
+    show: async (commit, rel) => (await gitOut($, racine, ['show', `${commit}:${normalizePath(rel).replace(/^\.\//, '')}`])) || undefined,
     list: async dir => (await $.fs.list(dir)).map(e => e.name),
     remove: async path => {
       const p = normalizePath(path)
@@ -1536,11 +1549,14 @@ function mergeCommands(found: VerifCommande[], prev: VerifCommande[] | undefined
 
 /** La liste des commandes pour l'orchestrateur (Ajuster) : une ligne chacune, puis comment la corriger. */
 function adjustNote(nom: string, commandes: VerifCommande[], note?: string): string {
-  const rows = commandes.map(c => `- ${c.id} (${c.outil}, portée ${c.portee}, format ${c.format}, source ${c.source}) : ${c.argv.join(' ')}${c.exclus?.length ? ` · exclus : ${c.exclus.join(', ')}` : ''}`)
+  const rows = commandes.map(
+    c =>
+      `- ${c.id} (${c.outil}, portée ${c.portee}, format ${c.format}, source ${c.source}) : ${c.format === 'crap' ? `score CRAP, seuil ${c.seuil ?? CRAP_SEUIL}, rien à lancer` : c.argv.join(' ')}${c.exclus?.length ? ` · exclus : ${c.exclus.join(', ')}` : ''}`,
+  )
   return [
     `revo-flow : l'utilisateur veut ajuster les commandes de vérification de ${nom}${note ? ` (« ${note} »)` : ''} :`,
     ...rows,
-    `Corrige-les avec l'outil ${VERIF_TOOL} action commandes : commandes = la liste complète corrigée [{id, outil (lint, typage, tests, format, generation), argv (sans shell ; "{fichiers}" = les fichiers du flow), portee (fichiers, lies, projet), format}] ; ou commande = l'id et exclus = les motifs de tests à exclure. La question sera reposée à l'utilisateur. Sans réponse de sa part, pas de vérification pour ce flow.`,
+    `Corrige-les avec l'outil ${VERIF_TOOL} action commandes : commandes = la liste complète corrigée [{id, outil (lint, typage, tests, format, generation, qualite), argv (sans shell ; "{fichiers}" = les fichiers du flow, "{sorties}" = le dossier des sorties), portee (fichiers, lies, projet), format, seuil (crap)}] ; la commande crap (outil qualite, format crap, argv vide) lit la couverture que les tests liés écrivent dans {sorties}/couverture : garde leurs flags de couverture. Ou commande = l'id et exclus = les motifs de tests à exclure. La question sera reposée à l'utilisateur. Sans réponse de sa part, pas de vérification pour ce flow.`,
   ].join('\n')
 }
 
@@ -1607,7 +1623,7 @@ async function startVerif($: $, flowId: string): Promise<string | undefined> {
   }
   // Les pièges d'environnement (node_modules absent, pub get pas fait) : seule la présence de ces chemins compte.
   const sondes = Object.fromEntries(await Promise.all(SONDES.map(async p => [p, await io.fs.exists(`${normalizePath(ref.racine)}/${p}`).catch(() => false)] as const)))
-  const found = detectCommands({ stack: graph.projet.stack, files, read: readMap, sondes })
+  const found = detectCommands({ stack: graph.projet.stack, files, read: readMap, sondes, crap: opts.crap })
   // Flutter du poste différent de celui de .fvm : un piège affiché avec la question (§6.5).
   const fvm = fvmVersion(readMap)
   if (fvm) {
@@ -2043,7 +2059,14 @@ function verifJournal(g: Gate): VerifJournal {
     triches: g.triches.length,
     ...(g.accepte && !green ? { accepte: true } : {}),
     ...(g.criteres.length ? { criteres: { total: g.criteres.length, ok } } : {}),
+    ...crapJournal(r),
   }
+}
+
+/** Le score CRAP de la dernière porte, pour le journal : fonctions au-dessus du seuil, touchées par le flow ou non ; rien si la commande n'a pas jugé. */
+function crapJournal(r: VerifResultat | undefined): Pick<VerifJournal, 'crap'> {
+  const c = r?.commandes.find(x => x.outil === 'qualite' && (x.etat === 'ok' || x.etat === 'ko'))
+  return c ? { crap: { fonctions: c.nouvelles + c.preexistantes, nouvelles: c.nouvelles, preexistantes: c.preexistantes } } : {}
 }
 
 /** Le segment de la notification de fin : « vérifié ✓ », « non vérifié (typecheck ✗) », « non vérifié (erreur de revo-flow) ». */
@@ -2106,15 +2129,15 @@ const isGelActive = () => !!gate && (gate.gel.length > 0 || testerAgents.size > 
 
 const GEL_ERROR = 'revo-flow : le contrôle des tests gelés a échoué ; modification refusée par prudence, réessaie.'
 
-/** Les commandes confirmées du projet, telles que le vérificateur peut les lancer (argv). */
-const confirmedArgv = () => (gate ? (verifOf(gate)?.commandes ?? []).map(c => c.argv) : [])
+/** Les commandes confirmées du projet, telles que le vérificateur peut les lancer (argv) : sans la commande crap ni les flags de couverture ('{sorties}'). */
+const confirmedArgv = () => (gate ? withoutCrap(verifOf(gate)?.commandes ?? []).map(c => c.argv) : [])
 
 /** La consigne de tâche du vérificateur : critères, git diff --stat du flow, commandes confirmées, triches repérées. */
 async function verifierBrief($: $): Promise<string | undefined> {
   const g = gate
   if (!g) return undefined
   const stat = g.commit ? await gitOut($, g.ref.racine, ['diff', '--stat', g.commit, '--']) : ''
-  return verifierTask(g.criteres, stat, verifOf(g)?.commandes ?? [], g.triches)
+  return verifierTask(g.criteres, stat, withoutCrap(verifOf(g)?.commandes ?? []), g.triches)
 }
 
 /** La réponse du vérificateur : un verdict par critère (parseVerdicts), dans le panneau ; une réponse sans aucun verdict lisible ne remplace pas la précédente. */
@@ -2211,15 +2234,19 @@ async function lancerTool($: $, g: Gate, who: string, e: Record<string, unknown>
 function commandOf(raw: unknown, known: VerifCommande[]): VerifCommande | string {
   const o = typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : {}
   const id = text(o.id)
-  const outils: VerifOutil[] = ['lint', 'typage', 'tests', 'format', 'generation']
+  const outils: VerifOutil[] = ['lint', 'typage', 'tests', 'format', 'generation', 'qualite']
   const portees: VerifPortee[] = ['fichiers', 'lies', 'projet']
-  const formats: VerifFormat[] = ['eslint-json', 'tsc', 'vitest-json', 'jest-json', 'biome', 'dart-machine', 'flutter-json', 'texte']
+  const formats: VerifFormat[] = ['eslint-json', 'tsc', 'vitest-json', 'jest-json', 'biome', 'dart-machine', 'flutter-json', 'texte', 'crap']
   const argv = Array.isArray(o.argv) ? o.argv.filter((x): x is string => typeof x === 'string' && x.length > 0) : []
   if (!id) return 'une commande sans « id »'
-  if (!outils.includes(text(o.outil) as VerifOutil)) return `« ${id} » : outil doit être lint, typage, tests, format ou generation`
-  if (!argv.length) return `« ${id} » : argv vide (la commande mot à mot, sans shell)`
-  if (!portees.includes(text(o.portee) as VerifPortee)) return `« ${id} » : portee doit être fichiers, lies ou projet`
+  if (!outils.includes(text(o.outil) as VerifOutil)) return `« ${id} » : outil doit être lint, typage, tests, format, generation ou qualite`
   const format = formats.includes(text(o.format) as VerifFormat) ? (text(o.format) as VerifFormat) : 'texte'
+  // Le score CRAP ne lance rien (il lit la couverture des tests liés) : outil qualite et format crap vont ensemble, argv vide permis.
+  const crap = format === 'crap'
+  if (crap !== (text(o.outil) === 'qualite')) return `« ${id} » : le score CRAP s'écrit outil qualite et format crap, les deux ensemble`
+  if (!argv.length && !crap) return `« ${id} » : argv vide (la commande mot à mot, sans shell)`
+  if (!portees.includes(text(o.portee) as VerifPortee)) return `« ${id} » : portee doit être fichiers, lies ou projet`
+  const seuil = typeof o.seuil === 'number' && Number.isFinite(o.seuil) && o.seuil > 0 ? o.seuil : undefined
   const same = known.find(k => k.id === id)
   const unchanged = same && same.argv.join('\u0000') === argv.join('\u0000') && same.portee === text(o.portee)
   return {
@@ -2232,6 +2259,8 @@ function commandOf(raw: unknown, known: VerifCommande[]): VerifCommande | string
     ...(text(o.declencheur) ? { declencheur: text(o.declencheur) } : {}),
     ...(same?.dureeMs !== undefined ? { dureeMs: same.dureeMs } : {}),
     ...(texts(o.exclus).length ? { exclus: texts(o.exclus) } : same?.exclus?.length ? { exclus: same.exclus } : {}),
+    ...(same?.origine ? { origine: same.origine } : {}),
+    ...(crap ? { seuil: seuil ?? same?.seuil ?? CRAP_SEUIL } : {}),
   }
 }
 
@@ -2903,6 +2932,8 @@ function readOptions(o: PluginOptions) {
   opts.cache = o.cache !== false
   // La porte de vérification (v2) : bloquer par défaut ; observer la fait tourner sans jamais bloquer ; off la retire.
   opts.verif = o.verif === 'observer' || o.verif === 'off' ? o.verif : 'bloquer'
+  // Le score CRAP (v2.1) dans la porte : actif par défaut ; il bloque selon le mode verif.
+  opts.crap = o.crap !== false
 }
 
 // ── Les hooks ────────────────────────────────────────────────────────────
@@ -3037,7 +3068,7 @@ export const register: Register = (on, options) => {
     $.clock.after(0, () => void $.prompt.submit({ text: args, asUser: true }).catch(() => undefined))
     return {
       text: `revo-flow : ${modelLabel(model)} lit la demande et les specs, puis prépare le plan et l’équipe d’agents…`,
-      context: [leadBrief(opts.cache, opts.verif !== 'off'), ...(brief ? [brief] : []), ...(verifNote ? [verifNote] : [])],
+      context: [leadBrief(opts.cache, opts.verif !== 'off', opts.crap), ...(brief ? [brief] : []), ...(verifNote ? [verifNote] : [])],
     }
   })
 
@@ -3246,7 +3277,7 @@ export const register: Register = (on, options) => {
     const criteres = gate?.flowId === flow.id ? gate.criteres : []
     const tester = isTester(a) ? `\n\n${TESTER_BRIEF}${criteres.length ? `\n\nCritères d'acceptation du plan :\n${criteres.map(c => `- ${c.id} : ${c.texte}`).join('\n')}` : ''}` : ''
     const verifier = isVerifier(a) ? await verifierBrief($).catch(() => undefined) : undefined
-    const prompt = `${e.prompt}\n\n${agentBrief(a, await agentCacheMode($), others, isVerifOn)}${tester}${verifier ? `\n\n${verifier}` : ''}${extract ? `\n\n${extract.text}` : ''}`
+    const prompt = `${e.prompt}\n\n${agentBrief(a, await agentCacheMode($), others, isVerifOn, opts.crap)}${tester}${verifier ? `\n\n${verifier}` : ''}${extract ? `\n\n${extract.text}` : ''}`
     const r = await next({ ...e, model: MODELS[a.model].id, prompt, ...(isVerifier(a) ? { subagentType: VERIFIER_TYPE } : {}) })
     if (r.deny !== undefined || !r.agentId) {
       claimed.delete(a.key)
