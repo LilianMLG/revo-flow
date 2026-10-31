@@ -4,6 +4,10 @@
 
 Mod Claude Code qui orchestre une demande avec une équipe de sous-agents, et montre l'avancement de chacun.
 
+![Un flow revo-flow avec preuve web : plan, agents, porte de vérification, le vérificateur ouvre l'app dans Chrome, verdict](docs/demo-preuve-web.gif)
+
+*Un flow complet avec la preuve web de la v3, rejoué avec les dessins du panneau : plan, agents, porte, le vérificateur ouvre l'app sur localhost, verdict.*
+
 ## Installation
 
 Rien à télécharger : Claude Code récupère le dépôt tout seul depuis GitHub. Deux façons, au choix.
