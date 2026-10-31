@@ -3,7 +3,7 @@ import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { rapportMarkdown, type RapportInput } from '../hooks/rapport'
-import type { Entry, Flow, Lead } from '../types'
+import type { Entry, Flow, Lead, WebView } from '../types'
 import { OSES, WINDOWS, diskKey, native, type Os } from './helpers/os'
 
 const rootOf = (os: Os) => native(os, 'Documents', 'Front', 'ui-vel')
@@ -309,6 +309,7 @@ test('rapportMarkdown : rapport complet, les six sections', () => {
       { id: 'C2', verdict: 'ko', preuve: 'total inchangé' },
     ],
     cache: { injecte: 1200, evites: 8400, net: 7200, lus: 3, completude: 1 },
+    web: { etat: 'arrete', commande: 'npm run dev', url: 'http://localhost:3000', captures: [] },
   })
   for (const s of SECTIONS) expect(md).toContain(s)
   expect(md).not.toMatch(/\*Absent/)
@@ -427,4 +428,42 @@ test('flow arrêté : pas de rapport', async ($, on) => {
   await w.clock.settle()
   expect(w.notified.join('\n')).toMatch(/arrêté/)
   expect(Object.keys(w.disk).filter(k => k.includes('/rapports/'))).toEqual([])
+})
+
+// ── La preuve web dans la section critères ───────────────────────────────
+
+const CRITERES = [
+  { id: 'C1', texte: 'Le champ code promo s’affiche' },
+  { id: 'C2', texte: 'Un code expiré affiche une erreur' },
+] as never
+const VERDICTS = [
+  { id: 'C1', verdict: 'ok', preuve: 'capture-1', web: true },
+  { id: 'C2', verdict: 'ok', preuve: 'test' },
+] as never
+const WIN_CAPTURE = 'C:\\r\\sorties\\capture-2.png.txt'
+const WEB: WebView = { etat: 'pret', commande: 'npm run dev', url: 'http://localhost:3000', captures: ['/r/sorties/capture-1.png', WIN_CAPTURE] }
+const avecWeb = (web?: WebView) => rapportMarkdown({ ...BASE, criteres: CRITERES, verdicts: VERDICTS, web })
+
+test('rapportMarkdown : preuve web prête, deux captures et un verdict web', () => {
+  const md = avecWeb(WEB)
+  expect(md).toContain('ok ✓ · preuve web')
+  expect(md).toContain('**C2** Un code expiré affiche une erreur : ok ✓\n')
+  expect(md).toContain(`**Preuve web** : serveur « npm run dev » sur http://localhost:3000 (démarré par revo-flow), 2 captures : [capture-1.png](</r/sorties/capture-1.png>), [capture-2.png.txt](<${WIN_CAPTURE}>)`)
+  expect(avecWeb({ ...WEB, existant: true, captures: [] })).toContain('(déjà en marche), aucune capture')
+  expect(avecWeb({ ...WEB, etat: 'arrete' })).toContain('**Preuve web** : serveur « npm run dev »')
+})
+
+test('rapportMarkdown : preuve web refusée, en erreur, en cours ou absente', () => {
+  expect(avecWeb({ etat: 'refuse', captures: [] })).toContain('**Preuve web** : serveur non démarré (choix de l’utilisateur) : les critères web sont non vérifiables')
+  expect(avecWeb({ etat: 'erreur', captures: [], note: 'port occupé' })).toContain('**Preuve web** : le serveur n’a pas démarré : port occupé')
+  expect(avecWeb({ etat: 'demarrage', captures: [] })).toContain('**Preuve web** : serveur en cours de démarrage')
+  expect(avecWeb({ etat: 'question', captures: [] })).toContain('serveur en cours de démarrage')
+  expect(avecWeb(undefined)).toContain('**Preuve web** : *Absent : le vérificateur n’a pas demandé le navigateur.*')
+  expect(avecWeb({ etat: 'non-demande', captures: [] })).toContain('le vérificateur n’a pas demandé le navigateur')
+})
+
+test('rapportMarkdown : sans critères, rien n’est ajouté pour le web', () => {
+  const md = rapportMarkdown({ ...BASE, web: WEB })
+  expect(md).not.toContain('Preuve web')
+  expect(md).toContain("*Absent : le plan n'avait pas de critères.*")
 })

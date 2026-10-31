@@ -23,6 +23,9 @@ import type {
   VerifPortee,
   VerifResultat,
   VerifView,
+  WebEtat,
+  WebServeur,
+  WebView,
 } from '../types/verif'
 import {
   agentExtract,
@@ -156,6 +159,22 @@ import {
 import { reportText, summaryLine } from './verif/report'
 import { purgeOutputs, runBase, runGate, type VerifIo } from './verif/runner'
 import { hasGenAnnotation, withShell } from './verif/scope'
+import {
+  WEB_ATTENTE_MS,
+  WEB_MANIFESTES,
+  capturePath,
+  commandeText,
+  detectDevServer,
+  extractPng,
+  isScreenshotCall,
+  isWebTool,
+  portFatalInOutput,
+  sansAnsi,
+  urlFromOutput,
+  verifierWebTask,
+  webToolDenial,
+  type WebDispo,
+} from './verif/web'
 import { SNAPSHOT_PREFIX, isBeforeLaunch, isUnfinished, readSnapshot, resumeQuestion, resumedFlow, snapshotKey, snapshotOf, type FlowSnapshot } from './reprise'
 
 type $ = EngineInterface
@@ -182,7 +201,16 @@ const verifA = atom({ plugin: 'revo-flow', key: 'verif' } as const, null)
 const verifFlowA = atom({ plugin: 'revo-flow', key: 'verifFlow' } as const, null)
 
 /** Les options du plugin (userConfig), fixées pour ce chargement : un changement recharge le module. */
-const opts = { validerPlan: true, conflits: 'avertir' as 'avertir' | 'refuser', notifier: true, cache: true, verif: 'bloquer' as VerifMode, crap: true, agents: true }
+const opts = {
+  validerPlan: true,
+  conflits: 'avertir' as 'avertir' | 'refuser',
+  notifier: true,
+  cache: true,
+  verif: 'bloquer' as VerifMode,
+  crap: true,
+  agents: true,
+  web: 'extension' as 'extension' | 'devtools' | 'off',
+}
 
 /** Les agents installés sur ce Claude Code (projet, dossier personnel, plugins), lus au lancement du flow ; vide sans l'option agents. */
 let agentsInstalles: AgentDef[] = []
@@ -414,11 +442,11 @@ async function registerVerifTool($: $) {
   await $.tool.register({
     name: 'verif',
     description:
-      "revo-flow : la vérification du flow (lint, typage, tests liés ; comparée à la base de référence, seules les erreurs nouvelles comptent). Actions : lancer (sur tes fichiers modifiés, ou ceux de « fichiers » → les erreurs nouvelles de tes fichiers ; pour l'orchestrateur, tout le flow) ; resultat (le dernier rapport de la porte de fin) ; commandes (orchestrateur : commandes = la liste complète corrigée, ou commande + exclus = motifs de tests à exclure ; toujours reposée à l'utilisateur) ; exception (orchestrateur, motif → l'utilisateur décide de terminer non vérifié ou non) ; degeler (orchestrateur, fichiers + motif → l'utilisateur décide de dégeler des tests gelés).",
+      "revo-flow : la vérification du flow (lint, typage, tests liés ; comparée à la base de référence, seules les erreurs nouvelles comptent). Actions : lancer (sur tes fichiers modifiés, ou ceux de « fichiers » → les erreurs nouvelles de tes fichiers ; pour l'orchestrateur, tout le flow) ; resultat (le dernier rapport de la porte de fin) ; commandes (orchestrateur : commandes = la liste complète corrigée, ou commande + exclus = motifs de tests à exclure ; toujours reposée à l'utilisateur) ; exception (orchestrateur, motif → l'utilisateur décide de terminer non vérifié ou non) ; degeler (orchestrateur, fichiers + motif → l'utilisateur décide de dégeler des tests gelés) ; web : (vérificateur) demande le serveur de dev pour la preuve web → l’URL à utiliser, ou pourquoi non.",
     inputSchema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['lancer', 'resultat', 'commandes', 'exception', 'degeler'] },
+        action: { type: 'string', enum: ['lancer', 'resultat', 'commandes', 'exception', 'degeler', 'web'] },
         fichiers: { type: 'array', items: { type: 'string' }, description: 'lancer : tes fichiers (défaut : ceux que tu as modifiés) ; degeler : les tests gelés à dégeler' },
         commandes: {
           type: 'array',
@@ -452,22 +480,36 @@ async function registerVerifTool($: $) {
   })
 }
 
+/** Le nom du serveur MCP Chrome DevTools déclaré pour le vérificateur (option web devtools) : ses outils sont mcp__chrome-devtools__*. */
+const DEVTOOLS_MCP = 'chrome-devtools'
+
 /**
  * Le vérificateur (lot 2) : Sonnet medium, lecture seule (Edit, Write et NotebookEdit retirés ; son Bash est filtré dans
  * tool.call), prompt calibré. Proposé au modèle seulement pendant un flow vérifié (agent.offer).
  */
 async function registerVerifier($: $) {
   if (opts.verif === 'off') return
+  const spec = {
+    name: 'verifier',
+    description:
+      'revo-flow : vérificateur en lecture seule. Juge chaque critère d’acceptation du plan (ok, ko, non vérifiable) avec une preuve exécutée. À lancer quand les implémenteurs ont fini.',
+    prompt: VERIFIER_PROMPT,
+    disallowedTools: ['Edit', 'Write', 'NotebookEdit'],
+    model: 'sonnet' as const,
+    effort: 'medium' as const,
+  }
+  // Option web devtools : le serveur MCP Chrome DevTools (navigateur isolé) est déclaré pour le vérificateur seul (AgentSpec.mcpServers,
+  // cc:512) ; refusé par cette version de Claude Code, le vérificateur est enregistré sans lui (l'extension reste possible).
+  if (opts.web === 'devtools') {
+    try {
+      await $.agent.register({ ...spec, mcpServers: { [DEVTOOLS_MCP]: { command: 'npx', args: ['-y', 'chrome-devtools-mcp@latest', '--isolated'] } } } as never)
+      return
+    } catch {
+      // repli ci-dessous
+    }
+  }
   try {
-    await $.agent.register({
-      name: 'verifier',
-      description:
-        'revo-flow : vérificateur en lecture seule. Juge chaque critère d’acceptation du plan (ok, ko, non vérifiable) avec une preuve exécutée. À lancer quand les implémenteurs ont fini.',
-      prompt: VERIFIER_PROMPT,
-      disallowedTools: ['Edit', 'Write', 'NotebookEdit'],
-      model: 'sonnet',
-      effort: 'medium',
-    })
+    await $.agent.register(spec)
   } catch {
     // sans agent.register (API plus ancienne), pas de vérificateur : la porte mécanique reste la référence
   }
@@ -621,6 +663,9 @@ async function finishFlow($: $) {
   const lead = await read($, leadA)
   const cost = lead.costUsd + flow.agents.reduce((sum, a) => sum + a.costUsd, 0)
   const files = (await read($, entries)).length
+  // Le serveur de dev de la preuve web s'arrête avec le flow, avant le journal (verifJournal) et le rapport : ils le disent arrêté,
+  // captures comprises.
+  await stopWeb($, gate?.flowId === flow.id ? gate : undefined)
   const g = gate && gate.flowId === flow.id && !flow.isStopped && gate.mode !== 'off' ? gate : undefined
   // La porte de l'état final : déjà prête (porte bloquante passée au Stop), ou lancée maintenant en fond.
   const pending = g ? ensureGate($).catch(() => undefined) : undefined
@@ -1431,6 +1476,28 @@ type Gate = {
   decisions: Map<string, 'accepte' | 'refuse'>
   criteres: Critere[]
   verdicts?: CritereVerdict[]
+  /** La preuve web (v3) : le serveur de dev demandé par le vérificateur ; absente tant qu'il ne l'a pas demandé. */
+  web?: GateWeb
+}
+/**
+ * Le serveur de dev de la preuve web : etat et url suivent son démarrage ; existant = déjà en marche (revo-flow ne l'arrête pas) ;
+ * sortie = la fin de ce qu'il a écrit (8 000 caractères) ; attente = la dernière demande (un second appel l'attend), enCours tant
+ * qu'elle n'a pas rendu ; stop arrête ce que revo-flow a lancé, jamais un serveur existant ; commande = celle de la vue restaurée
+ * après un rechargement du mod (le serveur détecté est perdu) ; prises = les numéros de capture déjà donnés.
+ */
+type GateWeb = {
+  serveur?: WebServeur
+  etat: WebEtat
+  url?: string
+  existant?: boolean
+  captures: string[]
+  sortie: string
+  note?: string
+  commande?: string
+  attente?: Promise<void>
+  enCours?: boolean
+  stop?: () => Promise<void>
+  prises?: number
 }
 let gate: Gate | undefined
 /** Les sous-agents vérificateurs (revo-flow:verifier) : leur Bash est filtré, leur réponse donne les verdicts. */
@@ -1664,6 +1731,8 @@ function adjustNote(nom: string, commandes: VerifCommande[], note?: string): str
  * référence part ensuite en fond. Rend la note pour l'orchestrateur quand l'utilisateur veut ajuster. Jamais d'exception.
  */
 async function startVerif($: $, flowId: string): Promise<string | undefined> {
+  // La porte du flow remplacé : son serveur de dev ne lui survit pas.
+  await stopWeb($, gate)
   gate = undefined
   verifStatus = undefined
   await update($, verifA, () => null)
@@ -2158,7 +2227,16 @@ function verifJournal(g: Gate): VerifJournal {
     ...(g.accepte && !green ? { accepte: true } : {}),
     ...(g.criteres.length ? { criteres: { total: g.criteres.length, ok } } : {}),
     ...crapJournal(r),
+    ...webJournal(g),
   }
+}
+
+/** La preuve web du flow, pour le journal : son état, ses captures, et les verdicts appuyés sur le navigateur (dont ko). */
+function webJournal(g: Gate): Pick<VerifJournal, 'web'> {
+  const w = g.web
+  if (!w || w.etat === 'non-demande') return {}
+  const web = (g.verdicts ?? []).filter(v => v.web)
+  return { web: { etat: w.etat, captures: w.captures.length, verdicts: web.length, ko: web.filter(v => v.verdict === 'ko').length } }
 }
 
 /** Le score CRAP de la dernière porte, pour le journal : fonctions au-dessus du seuil, touchées par le flow ou non ; rien si la commande n'a pas jugé. */
@@ -2230,12 +2308,14 @@ const GEL_ERROR = 'revo-flow : le contrôle des tests gelés a échoué ; modifi
 /** Les commandes confirmées du projet, telles que le vérificateur peut les lancer (argv) : sans la commande crap ni les flags de couverture ('{sorties}'). */
 const confirmedArgv = () => (gate ? withoutCrap(verifOf(gate)?.commandes ?? []).map(c => c.argv) : [])
 
-/** La consigne de tâche du vérificateur : critères, git diff --stat du flow, commandes confirmées, triches repérées. */
+/** La consigne de tâche du vérificateur : critères, git diff --stat du flow, commandes confirmées, triches repérées, preuve web. */
 async function verifierBrief($: $): Promise<string | undefined> {
   const g = gate
   if (!g) return undefined
   const stat = g.commit ? await gitOut($, g.ref.racine, ['diff', '--stat', g.commit, '--']) : ''
-  return verifierTask(g.criteres, stat, withoutCrap(verifOf(g)?.commandes ?? []), g.triches)
+  const graph = opts.web === 'off' ? null : await graphOf($, g.ref).catch(() => null)
+  const web = verifierWebTask(await webDispo($, g.ref, graph))
+  return verifierTask(g.criteres, stat, withoutCrap(verifOf(g)?.commandes ?? []), g.triches, web)
 }
 
 /** La réponse du vérificateur : un verdict par critère (parseVerdicts), dans le panneau ; une réponse sans aucun verdict lisible ne remplace pas la précédente. */
@@ -2280,7 +2360,31 @@ async function restoreVerif($: $) {
     criteres: saved.criteres,
     ...(saved.accepte ? { accepte: true, libre: true } : {}),
   }
-  await update($, verifA, v => (v ? { ...v, base: v.base === 'en_cours' ? 'absente' : v.base, etat: v.etat === 'en_cours' || v.etat === 'base' ? 'attente' : v.etat } : v))
+  // La preuve web : un serveur en question, en démarrage ou prêt est mort avec le module (arrete) ; les captures restent.
+  const view = await read($, verifA)
+  const live = (s: WebEtat) => s === 'question' || s === 'demarrage' || s === 'pret'
+  const web = view?.web ? { ...view.web, etat: live(view.web.etat) ? ('arrete' as const) : view.web.etat } : undefined
+  if (web) {
+    gate.web = {
+      etat: web.etat,
+      captures: [...web.captures],
+      sortie: '',
+      ...(web.url ? { url: web.url } : {}),
+      ...(web.existant ? { existant: true } : {}),
+      ...(web.note ? { note: web.note } : {}),
+      ...(web.commande ? { commande: web.commande } : {}),
+    }
+  }
+  await update($, verifA, v =>
+    v
+      ? {
+          ...v,
+          base: v.base === 'en_cours' ? 'absente' : v.base,
+          etat: v.etat === 'en_cours' || v.etat === 'base' ? 'attente' : v.etat,
+          ...(web ? { web } : {}),
+        }
+      : v,
+  )
 }
 
 /** Un `verif lancer` d'un agent : seulement ses fichiers (ceux qu'il a modifiés, ou ceux qu'il donne), rapport limité à eux. */
@@ -2389,7 +2493,10 @@ async function commandesTool($: $, g: Gate, e: Record<string, unknown>): Promise
   return `revo-flow verif : ${plural(list.length, 'commande')} confirmée${list.length > 1 ? 's' : ''} par l’utilisateur et enregistrée${list.length > 1 ? 's' : ''} pour ${g.ref.nom}.`
 }
 
-/** L'outil verif : lancer, resultat, commandes, exception, degeler. Les trois dernières sont réservées à l'orchestrateur. */
+/**
+ * L'outil verif : lancer, resultat, commandes, exception, degeler, web. commandes, exception et degeler sont réservées à l'orchestrateur,
+ * web au vérificateur (et à l'orchestrateur).
+ */
 async function verifTool($: $, e: Record<string, unknown> & { agentId?: string }): Promise<string> {
   const action = text(e.action).toLowerCase()
   const g = gate
@@ -2443,9 +2550,391 @@ async function verifTool($: $, e: Record<string, unknown> & { agentId?: string }
       await setView($, g, { geles: g.gel.map(x => ({ p: x.p })) })
       return `revo-flow verif : ${targets.map(x => x.p).join(', ')} dégelé${targets.length > 1 ? 's' : ''} par l’utilisateur.`
     }
+    case 'web': {
+      const isAllowed = who === 'lead' || (!!e.agentId && verifierAgents.has(e.agentId))
+      if (!isAllowed) return 'revo-flow verif : l’action web est réservée au vérificateur.'
+      return webTool($, g, flow.isStopped === true)
+    }
     default:
-      return `revo-flow verif : action « ${action} » inconnue (lancer, resultat, commandes, exception, degeler).`
+      return `revo-flow verif : action « ${action} » inconnue (lancer, resultat, commandes, exception, degeler, web).`
   }
+}
+
+// ── Preuve web (v3, docs/rd-v2/execution.md §2) ──────────────────────────
+
+/** La sortie du serveur de dev gardée pour y lire l'URL (et la dernière ligne quand il meurt) : les 8 000 derniers caractères. */
+const WEB_SORTIE_MAX = 8000
+/** Une capture affichée dans le panneau au plus à cette taille de texte base64 (Image accepte 2 Mio). */
+const CAPTURE_MAX = 1_500_000
+/** La note d'une preuve web sans serveur de dev détecté : la réponse au vérificateur le dit à part. */
+const NO_DEV_SERVER = 'aucun serveur de dev détecté'
+
+/** La preuve web de la porte, créée à la première demande. */
+function webOf(g: Gate): GateWeb {
+  if (!g.web) g.web = { etat: 'non-demande', captures: [], sortie: '' }
+  return g.web
+}
+
+/** Ce que le panneau et le rapport montrent de la preuve web (VerifView.web). */
+function webView(g: Gate): WebView {
+  const w = webOf(g)
+  const commande = w.serveur ? commandeText(w.serveur) : w.commande
+  return {
+    etat: w.etat,
+    ...(commande ? { commande } : {}),
+    ...(w.url ? { url: w.url } : {}),
+    ...(w.existant ? { existant: true } : {}),
+    captures: [...w.captures],
+    ...(w.note ? { note: w.note } : {}),
+  }
+}
+
+/** Change la preuve web (en place : le serveur en fond garde la même référence) et la pousse dans la vue de la porte. */
+async function setWeb($: $, g: Gate, patch: Partial<GateWeb>) {
+  Object.assign(webOf(g), patch)
+  await setView($, g, { web: webView(g) }).catch(() => undefined)
+}
+
+/**
+ * Les lectures de la preuve web (WebDispo) : le serveur de dev détecté et la présence de REVO_WEB_LOGIN, jamais sa valeur ailleurs.
+ * deja : les fichiers déjà lus par l'appelant (chemin relatif → texte), qui ne sont pas relus.
+ */
+async function webDispo($: $, ref: ProjectRef | undefined, graph: Graph | null | undefined, deja?: Record<string, string | undefined>): Promise<WebDispo> {
+  if (opts.web === 'off') return { option: 'off', login: false }
+  const serveur = ref ? await devServerOf($, ref, graph, deja) : undefined
+  const login = Boolean(await $.env.get('REVO_WEB_LOGIN').catch(() => undefined))
+  return { option: opts.web, ...(serveur ? { serveur } : {}), login }
+}
+
+/**
+ * Le serveur de dev du projet (detectDevServer) : package.json, .env et les nuxt.config.* / vite.config.* de la racine, lus par ioOf ;
+ * un chemin présent dans deja (déjà lu, même absent) n'est pas relu.
+ */
+async function devServerOf($: $, ref: ProjectRef, graph: Graph | null | undefined, deja: Record<string, string | undefined> = {}): Promise<WebServeur | undefined> {
+  try {
+    const files = Object.keys(graph?.fichiers ?? {})
+    const paths = [...new Set([...WEB_MANIFESTES, ...files.filter(p => /^(nuxt|vite)\.config\.[a-z]+$/i.test(p))])]
+    const io = ioOf($)
+    const root = normalizePath(ref.racine)
+    const texts = await Promise.all(
+      paths.map(p => (p in deja ? Promise.resolve(deja[p]) : io.fs.read(`${root}/${p}`).then(t => (typeof t === 'string' ? t : undefined), () => undefined))),
+    )
+    const stack = graph?.projet.stack
+    return detectDevServer({ files, read: Object.fromEntries(paths.map((p, i) => [p, texts[i]])), ...(stack ? { stack } : {}) })
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Le port est-il déjà pris par un serveur à l'écoute ? Windows : netstat -ano (IPv4 et IPv6), une ligne TCP dont l'adresse locale
+ * finit en :<port>, à l'écoute ; ailleurs : lsof -nP -iTCP:<port> -sTCP:LISTEN, sortie non vide. Une commande qui échoue vaut « libre ».
+ */
+async function portTaken($: $, port: number): Promise<boolean> {
+  try {
+    if (await isWindows($)) {
+      const r = await $.process.run(['netstat', '-ano'], { timeoutMs: 10_000 })
+      return r.stdout.split(/\r?\n/).some(line => {
+        const cols = line.trim().split(/\s+/)
+        return cols[0]?.toUpperCase() === 'TCP' && !!cols[1]?.endsWith(`:${port}`) && (/LISTENING/i.test(line) || /^(0\.0\.0\.0|\[::\]|\*):[0*]$/.test(cols[2] ?? ''))
+      })
+    }
+    const r = await $.process.run(['lsof', '-nP', `-iTCP:${port}`, '-sTCP:LISTEN'], { timeoutMs: 10_000 })
+    return r.exitCode === 0 && r.stdout.trim().length > 0
+  } catch {
+    return false
+  }
+}
+
+/** La réponse de `verif web` au vérificateur, selon l'état de la preuve web. */
+function webAnswer(w: GateWeb): string {
+  const commande = w.serveur ? commandeText(w.serveur) : (w.commande ?? 'serveur de dev')
+  if (w.etat === 'pret' && w.url) {
+    return `revo-flow verif : serveur prêt sur ${w.url} (${commande}, ${w.existant ? 'déjà en marche' : 'démarré par revo-flow'}) — navigue seulement sur cette origine ; cite dans chaque preuve l’URL, l’élément vu, le nombre d’erreurs console et de réponses 4xx/5xx ; une capture par critère (computer screenshot).`
+  }
+  if (w.etat === 'refuse') return 'revo-flow verif : l’utilisateur ne démarre pas le serveur : preuve web non vérifiable, dis-le dans tes preuves.'
+  if (w.etat === 'erreur' && w.note === NO_DEV_SERVER) {
+    return 'revo-flow verif : aucun serveur de dev détecté (pas de script dev dans package.json) : preuve web impossible, juge non vérifiable.'
+  }
+  if (w.etat === 'erreur') return `revo-flow verif : le serveur n’a pas démarré (${w.note ?? 'erreur inconnue'}) : preuve web non vérifiable.`
+  return 'revo-flow verif : le serveur de dev est arrêté : preuve web non vérifiable.'
+}
+
+/**
+ * `verif web` : le serveur de dev de la preuve web. Un second appel attend la demande en cours et rend la même réponse ; prêt,
+ * refusé ou en erreur, la réponse reste ; arrêté (fin de flow puis agent relancé, rechargement du mod), la demande repart, sauf
+ * pour un flow arrêté par l'utilisateur.
+ */
+async function webTool($: $, g: Gate, isStopped: boolean): Promise<string> {
+  if (opts.web === 'off') return 'revo-flow verif : preuve web désactivée (option web) ; juge non vérifiable ce qui demande le navigateur.'
+  const w = webOf(g)
+  if (!w.enCours && (w.etat === 'non-demande' || (w.etat === 'arrete' && !isStopped))) {
+    w.enCours = true
+    w.attente = startWeb($, g, w)
+      .catch(async err => {
+        if (w.etat === 'question' || w.etat === 'demarrage' || w.etat === 'non-demande') await setWeb($, g, { etat: 'erreur', note: errText(err) })
+      })
+      .finally(() => {
+        w.enCours = false
+      })
+  }
+  await w.attente
+  return webAnswer(w)
+}
+
+/**
+ * Détecte le serveur de dev, puis demande à l'utilisateur : port déjà pris, utiliser le serveur en marche (revo-flow n'arrête rien) ;
+ * sinon, démarrer la commande. Rend quand l'issue est connue (pret, refuse ou erreur). Échap et -p : pas cette fois.
+ */
+async function startWeb($: $, g: Gate, w: GateWeb): Promise<void> {
+  Object.assign(w, { url: undefined, existant: undefined, note: undefined, sortie: '', stop: undefined })
+  const graph = await graphOf($, g.ref).catch(() => null)
+  const serveur = await devServerOf($, g.ref, graph)
+  if (!serveur) return setWeb($, g, { etat: 'erreur', note: NO_DEV_SERVER })
+  w.serveur = serveur
+  const port = serveur.port
+  const no = { headless: 'Pas cette fois', dismissed: 'Pas cette fois' }
+  if (port !== undefined && (await portTaken($, port))) {
+    await setWeb($, g, { etat: 'question' })
+    const url = `http://localhost:${port}`
+    const { answer } = await askGate(
+      $,
+      g,
+      `Le port ${port} est déjà pris : un serveur tourne sans doute. Utiliser ${url} pour la preuve web ? (revo-flow n’arrête rien)`,
+      ['Utiliser', 'Pas cette fois'],
+      no,
+      'Preuve web : utiliser le serveur déjà en marche ?',
+    )
+    // Arrêtée pendant la question (fin de flow, porte remplacée) : rien ne change.
+    if (w.etat !== 'question') return
+    return setWeb($, g, answer === 'Utiliser' ? { etat: 'pret', existant: true, url } : { etat: 'refuse' })
+  }
+  await setWeb($, g, { etat: 'question' })
+  const commande = commandeText(serveur)
+  const { answer } = await askGate(
+    $,
+    g,
+    `Démarrer « ${commande} » pour ${g.ref.nom}${port !== undefined ? ` (port ${port})` : ''} ? Le vérificateur l’ouvrira dans le navigateur pour la preuve web.`,
+    ['Démarrer', 'Pas cette fois'],
+    no,
+    'Preuve web : démarrer le serveur de dev ?',
+  )
+  if (w.etat !== 'question') return
+  if (answer !== 'Démarrer') return setWeb($, g, { etat: 'refuse' })
+  await setWeb($, g, { etat: 'demarrage' })
+  await spawnServer($, g, w, serveur)
+}
+
+/** L'itérateur de ce que rend $.process.spawn : un itérable asynchrone, ou déjà un itérateur. */
+function iteratorOf(proc: unknown): AsyncIterator<unknown> | undefined {
+  if (!proc || (typeof proc !== 'object' && typeof proc !== 'function')) return undefined
+  const o = proc as { [Symbol.asyncIterator]?: () => AsyncIterator<unknown>; next?: unknown }
+  if (typeof o[Symbol.asyncIterator] === 'function') return o[Symbol.asyncIterator]!()
+  return typeof o.next === 'function' ? (o as AsyncIterator<unknown>) : undefined
+}
+
+/** Le texte d'un morceau de sortie de $.process.spawn : une chaîne, ou un objet dont text, data, chunk ou line est une chaîne ou des octets. */
+function chunkText(c: unknown): string {
+  const decode = (v: unknown): string | undefined => {
+    if (typeof v === 'string') return v
+    if (v instanceof Uint8Array) {
+      try {
+        return new TextDecoder().decode(v)
+      } catch {
+        return ''
+      }
+    }
+    return undefined
+  }
+  const direct = decode(c)
+  if (direct !== undefined) return direct
+  if (!c || typeof c !== 'object') return ''
+  const o = c as Record<string, unknown>
+  for (const k of ['text', 'data', 'chunk', 'line']) {
+    const t = decode(o[k])
+    if (t !== undefined) return k === 'line' && !t.endsWith('\n') ? `${t}\n` : t
+  }
+  return ''
+}
+
+/** La dernière ligne non vide d'une sortie, sans les codes de couleur ANSI. */
+function lastLine(out: string): string {
+  const lines = sansAnsi(out)
+    .split(/\r?\n/)
+    .map(l => l.trim())
+    .filter(Boolean)
+  return (lines.at(-1) ?? 'sans sortie').slice(0, 200)
+}
+
+/**
+ * Lance le serveur de dev ($.process.spawn, cmd /c sous Windows) et lit sa sortie en fond (une boucle sur l'itérateur, comme
+ * for await) : URL annoncée → pret ; port pris dans la sortie, processus mort ou 90 s sans URL → erreur (le processus est arrêté).
+ * Rend quand l'issue est connue ; la lecture continue ensuite (quitter la boucle tuerait le serveur). Jamais d'exception.
+ */
+async function spawnServer($: $, g: Gate, w: GateWeb, serveur: WebServeur): Promise<void> {
+  const os = (await isWindows($)) ? 'windows' : 'posix'
+  let proc: unknown
+  try {
+    proc = await $.process.spawn({ argv: withShell(serveur.argv, os), cwd: g.ref.racine })
+  } catch (err) {
+    return setWeb($, g, { etat: 'erreur', note: `lancement impossible : ${errText(err)}` })
+  }
+  const it = iteratorOf(proc)
+  if (!it) return setWeb($, g, { etat: 'erreur', note: 'lancement impossible : sortie du serveur illisible' })
+  let isStopped = false
+  // Fermer l'itérateur tue le processus (cc:3603-3605), kill en plus s'il existe ; rien n'est attendu : un itérateur dont un next()
+  // est en suspens peut ne rendre la main qu'à la sortie suivante, et l'arrêt ne doit jamais retenir la fin du flow.
+  const stop = async () => {
+    if (isStopped) return
+    isStopped = true
+    const call = (target: unknown, name: 'return' | 'kill') => {
+      try {
+        const fn = (target as Record<string, unknown> | null)?.[name]
+        if (typeof fn === 'function') void Promise.resolve(fn.call(target)).catch(() => undefined)
+      } catch {
+        // déjà fermé
+      }
+    }
+    call(it, 'return')
+    if (proc !== it) call(proc, 'return')
+    call(proc, 'kill')
+  }
+  w.stop = stop
+  // Arrêtée pendant le lancement (fin de flow, porte remplacée) : le serveur ne reste pas.
+  if (w.etat !== 'demarrage') {
+    await stop()
+    return
+  }
+  await new Promise<void>(resolve => {
+    let isSettled = false
+    let timer: { cancel?: () => void } | undefined
+    const settle = async (patch: Partial<GateWeb>, kill = false) => {
+      if (isSettled) return
+      isSettled = true
+      timer?.cancel?.()
+      if (kill) await stop()
+      await setWeb($, g, patch)
+      resolve()
+    }
+    timer = $.clock.after(WEB_ATTENTE_MS, () => void settle({ etat: 'erreur', note: `pas d’URL annoncée en ${Math.round(WEB_ATTENTE_MS / 1000)} s` }, true)) as unknown as
+      | { cancel?: () => void }
+      | undefined
+    void (async () => {
+      try {
+        for (;;) {
+          const r = await it.next()
+          if (r.done) break
+          w.sortie = (w.sortie + chunkText(r.value)).slice(-WEB_SORTIE_MAX)
+          if (isSettled) continue
+          const url = urlFromOutput(w.sortie)
+          if (url) await settle({ etat: 'pret', url })
+          // « Port 3000 is in use, trying another one » n'est pas fatal : l'URL qui suit l'emporte (le délai couvre le reste).
+          else if (portFatalInOutput(w.sortie)) await settle({ etat: 'erreur', note: portNote(serveur) }, true)
+        }
+      } catch {
+        // la sortie est perdue : le processus aussi
+      }
+      if (isStopped) return
+      isStopped = true
+      const note = `le serveur s’est arrêté : ${lastLine(w.sortie)}`
+      if (!isSettled) await settle({ etat: 'erreur', note })
+      // Mort après avoir annoncé son URL : la preuve web n'a plus de serveur, les outils du navigateur sont refusés.
+      else if (w.etat === 'pret' && !w.existant) await setWeb($, g, { etat: 'erreur', note })
+    })().catch(() => undefined)
+  })
+}
+
+/** La note d'un port pris annoncé par le serveur lui-même (EADDRINUSE…). */
+const portNote = (s: WebServeur) => (s.port !== undefined ? `port ${s.port} déjà pris` : 'port déjà pris')
+
+/**
+ * Arrête le serveur de dev lancé par revo-flow (jamais un serveur déjà en marche) : fin de flow, Tout arrêter, flow abandonné, porte
+ * remplacée. Prêt, en question ou en démarrage : arrete ; refuse, erreur et non-demande restent. Jamais d'exception.
+ */
+async function stopWeb($: $, g: Gate | undefined) {
+  const w = g?.web
+  if (!g || !w) return
+  try {
+    if (!w.existant) await w.stop?.()
+  } catch {
+    // arrêt au mieux : le serveur meurt aussi avec le module
+  }
+  w.stop = undefined
+  if (w.etat === 'refuse' || w.etat === 'erreur' || w.etat === 'non-demande') return
+  w.etat = 'arrete'
+  await setView($, g, { web: webView(g) }).catch(() => undefined)
+}
+
+/** La dernière capture déjà lue (base64), pour ne lire qu'une fois le fichier de chaque capture. */
+let shownCapture: { path: string; png: string | undefined } | undefined
+
+/** La dernière capture de la preuve web pour le panneau terminal (Image) : son .png.txt, lu une fois, ignoré au-delà de 1,5 Mo. */
+async function lastCapture($: $, v: VerifView | null): Promise<ViewData['capture']> {
+  const last = v?.web?.captures.at(-1)
+  if (!last) return undefined
+  const path = last.endsWith('.txt') ? last : `${last}.txt`
+  if (shownCapture?.path !== path) {
+    let png: string | undefined
+    try {
+      const t = await $.fs.read(path)
+      png = typeof t === 'string' && t.length > 0 && t.length <= CAPTURE_MAX ? t.trim() : undefined
+    } catch {
+      png = undefined
+    }
+    shownCapture = { path, png }
+  }
+  return shownCapture.png ? { png: shownCapture.png, nom: baseName(path).replace(/\.txt$/, '') } : undefined
+}
+
+/**
+ * Une capture d'écran du vérificateur pendant la preuve web : le PNG du résultat (extractPng), en base64 dans les sorties du flow
+ * (capture-n.png.txt : $.fs n'écrit que du texte), puis décodé à côté en capture-n.png au mieux (certutil, base64 -d) ; le .png est
+ * retenu s'il existe, sinon le .txt. Jamais d'exception.
+ */
+async function keepCapture($: $, ran: unknown) {
+  try {
+    const g = gate
+    const flow = await read($, flowA)
+    const w = g?.web
+    if (!g || !w || !flow || flow.id !== g.flowId || w.etat !== 'pret') return
+    const b64 = extractPng(ran)
+    if (!b64) return
+    // Le numéro est pris avant toute attente : deux captures en même temps n'écrivent pas le même fichier.
+    w.prises = Math.max(w.prises ?? 0, w.captures.length) + 1
+    const txt = capturePath((await verifIoOf($, g)).sorties, w.prises)
+    await $.fs.write(txt, b64)
+    let kept = txt
+    const png = txt.replace(/\.txt$/, '')
+    // Sans shell : certutil (-f : écrase un fichier resté d'un essai précédent) ; ailleurs base64 de macOS, sinon openssl (-A : base64
+    // sur une seule ligne). Le premier qui écrit le .png l'emporte.
+    const tries = (await isWindows($))
+      ? [['certutil', '-f', '-decode', txt, png]]
+      : [
+          ['base64', '-d', '-i', txt, '-o', png],
+          ['openssl', 'base64', '-d', '-A', '-in', txt, '-out', png],
+        ]
+    for (const argv of tries) {
+      try {
+        const r = await $.process.run(argv, { timeoutMs: 15_000 })
+        if (r.exitCode === 0 && (await $.fs.exists(png).catch(() => false))) {
+          kept = png
+          break
+        }
+      } catch {
+        // essai suivant ; à défaut le .txt suffit : le panneau et le rapport le lisent
+      }
+    }
+    w.captures.push(kept)
+    await setView($, g, { web: webView(g) })
+  } catch {
+    // une capture perdue ne gêne jamais l'outil
+  }
+}
+
+/** Bouton « capture » du panneau : ouvre la dernière capture (le .png, sinon son .txt), comme le rapport. */
+async function openCapture($: $) {
+  const last = (await read($, verifA))?.web?.captures.at(-1)
+  if (last) await openFile($, last, 'la capture')
 }
 
 // ── Commande cache ───────────────────────────────────────────────────────
@@ -2655,6 +3144,8 @@ async function isPaneShown($: $) {
 const openPane = ($: $) => $.ui.open({ id: PANE, title: 'revo-flow', columns: 56 })
 
 async function viewData($: $): Promise<ViewData> {
+  const verif = await read($, verifA)
+  const capture = await lastCapture($, verif)
   return {
     flow: await read($, flowA),
     lead: await read($, leadA),
@@ -2669,7 +3160,8 @@ async function viewData($: $): Promise<ViewData> {
     sessionCostUsd: await read($, sessionCostA),
     cache: await read($, cacheStatsA),
     cacheOpen: await read($, cacheOpenA),
-    verif: await read($, verifA),
+    verif,
+    ...(capture ? { capture } : {}),
   }
 }
 
@@ -2687,6 +3179,7 @@ function paneActions($: $): PaneActions {
     toggleCache: () => update($, cacheOpenA, v => !v),
     openVerif: () => openVerif($),
     rerunVerif: () => rerunVerif($),
+    openCapture: () => openCapture($),
   }
 }
 
@@ -2857,6 +3350,7 @@ async function stopAgent($: $, key: string, isQuiet = false) {
 async function stopAll($: $) {
   await setFlow($, f => ({ ...f, isStopped: true }))
   for (const a of (await read($, flowA))?.agents ?? []) if (a.status === 'running') await stopAgent($, a.key, true)
+  await stopWeb($, gate)
   const turnId = leadTurnId
   leadTurnId = undefined
   if (turnId) {
@@ -3010,6 +3504,8 @@ async function resumeFlow($: $, snap: FlowSnapshot) {
 /** Abandonner : le flow entre au journal comme arrêté, à l'heure de son dernier instantané, et l'instantané est effacé. */
 async function abandonFlow($: $, snap: FlowSnapshot) {
   const flow: Flow = { ...snap.flow, isStopped: true, endedAt: Math.max(snap.savedAt, snap.flow.startedAt) }
+  // Le serveur de la preuve web est mort avec la session ; au cas où la porte de ce flow serait encore en mémoire, rien ne reste.
+  if (gate?.flowId === flow.id) await stopWeb($, gate)
   await journalize($, flow, snap.lead, snap.entries.length).catch(() => undefined)
   await $.store.delete(snapshotKey(flow.id))
   $.ui.toast(`revo-flow : flow « ${flow.title} » abandonné, inscrit au journal comme arrêté`)
@@ -3097,6 +3593,7 @@ async function writeRapport($: $, flow: Flow, lead: Lead, verifP: Promise<VerifJ
     criteres: g?.criteres,
     verdicts: g?.verdicts,
     cache: (await read($, cacheStatsA))?.flow,
+    ...(g?.web ? { web: webView(g) } : {}),
   })
   const path = `${normalizePath(home)}/.claude/revo-flow/rapports/${slug(flow.title) || 'rapport'}.md`
   await $.fs.write(path, text)
@@ -3161,6 +3658,9 @@ function readOptions(o: PluginOptions) {
   opts.crap = o.crap !== false
   // Les agents installés (v2.2) proposés à l'orchestrateur : actifs par défaut.
   opts.agents = (o as { agents?: unknown }).agents !== false
+  // La preuve web (v3) : l'extension Claude in Chrome par défaut ; devtools ajoute le serveur MCP Chrome DevTools au vérificateur.
+  const web = (o as { web?: unknown }).web
+  opts.web = web === 'devtools' || web === 'off' ? web : 'extension'
 }
 
 /**
@@ -3212,6 +3712,7 @@ async function doctorCommand($: $): Promise<string> {
     stats: computeStats(graph, null, ref.nom),
     journal: graph.journal?.length ?? 0,
     pieges,
+    web: await webDispo($, ref, graph, readMap),
   })
 }
 
@@ -3280,6 +3781,7 @@ export const register: Register = (on, options) => {
         isStopped = answer !== 'Garder les agents'
       } else isStopped = flow !== null && leadTurnId !== undefined
       if (isStopped) await stopAll($)
+      else await stopWeb($, gate)
       await update($, flowA, () => null)
       // Plus de flow : plus d'instantané à reprendre.
       await saveFlow($).catch(() => undefined)
@@ -3763,8 +4265,16 @@ export const register: Register = (on, options) => {
   on('tool.call', async ($, e, next) => {
     const tool = String(e.tool)
     if (tool === PLAN_TOOL || tool === STEP_TOOL || tool === VERIF_TOOL) return next(e)
+    const input = e as unknown as Record<string, unknown>
+    const isVerifierCall = !!e.agentId && verifierAgents.has(e.agentId)
+    // La preuve web (v3) : le navigateur du vérificateur ne sert que pendant la preuve web, et seulement sur l'origine du serveur prêt.
+    if (isVerifierCall && isWebTool(tool)) {
+      const flow = await read($, flowA)
+      const deny = webToolDenial(tool, input, gate?.web && flow && gate.flowId === flow.id ? { etat: gate.web.etat, url: gate.web.url } : undefined)
+      if (deny) return { deny }
+    }
     // Le vérificateur est en lecture seule : son Bash ne passe que pour des lectures et les commandes confirmées (§8).
-    if (tool === 'Bash' && e.agentId && verifierAgents.has(e.agentId)) {
+    if (tool === 'Bash' && isVerifierCall) {
       const command = text((e as unknown as { command?: unknown }).command)
       if (!verifierBashAllowed(command, confirmedArgv())) {
         return {
@@ -3772,10 +4282,14 @@ export const register: Register = (on, options) => {
         }
       }
     }
+    // Une capture d'écran du vérificateur pendant la preuve web est rangée avec les sorties du flow (au mieux, jamais bloquant).
+    const kept = async <R extends { deny?: unknown; isError?: boolean }>(ran: R): Promise<R> => {
+      if (isVerifierCall && ran.deny === undefined && ran.isError !== true && isScreenshotCall(tool, input)) await keepCapture($, ran)
+      return ran
+    }
     const flow = await read($, flowA)
     const who = flow && flow.phase !== 'done' ? whoIs(flow, e.agentId) : undefined
-    if (!who) return next(e)
-    const input = e as unknown as Record<string, unknown>
+    if (!who) return kept(await next(e))
     const label = describeCall(tool, input)
     const isEdit = tool === 'Edit' || tool === 'Write' || tool === 'NotebookEdit'
     const path = isEdit ? String(input.file_path ?? input.notebook_path ?? '') : ''
@@ -3824,8 +4338,13 @@ export const register: Register = (on, options) => {
     } catch {
       // idem
     }
-    return ran
-  })
+    return kept(ran)
+  }).catch(($, e, next) =>
+    // Un plantage du hook : l'outil passe, sauf un outil navigateur du vérificateur (la preuve web se ferme par prudence).
+    e.agentId && verifierAgents.has(e.agentId) && isWebTool(String(e.tool))
+      ? { deny: 'revo-flow : le contrôle de la preuve web a échoué ; outil navigateur refusé par prudence, réessaie.' }
+      : next(e),
+  )
 
   on('session.measure', async ($, e, next) => {
     if (e.changed.includes('rateLimits')) await update($, limits, () => e.rateLimits.map(l => ({ ...l })))

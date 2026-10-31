@@ -1,6 +1,6 @@
 // Le rapport de flow (docs/rd-v3 §2.4) : un markdown écrit en fin de flow, à côté du plan, qui sert de description de MR.
 // Pur : une mise en forme de ce que le flow sait déjà (agents, fichiers, porte, critères, cache), aucune collecte.
-import type { CacheStats, Critere, CritereVerdict, Entry, Flow, Lead, VerifErreur, VerifJournal, VerifResultat } from '../types'
+import type { CacheStats, Critere, CritereVerdict, Entry, Flow, Lead, VerifErreur, VerifJournal, VerifResultat, WebView } from '../types'
 import { MODELS, euros, fmt, fmtDuration, total } from './lib'
 import { dureeText } from './verif/report'
 
@@ -25,6 +25,8 @@ export type RapportInput = {
   verdicts?: readonly CritereVerdict[]
   /** CacheStats.flow : tokens injectés et évités par le cache pendant ce flow ; absent sans cache. */
   cache?: CacheStats['flow']
+  /** La preuve web du vérificateur (serveur de dev, captures) ; absente sans navigateur. */
+  web?: WebView
 }
 
 const plural = (n: number, un: string, plusieurs: string) => `${n} ${n > 1 ? plusieurs : un}`
@@ -105,18 +107,31 @@ function gateSection(verif: VerifJournal | undefined, porte: RapportPorte | unde
   return out
 }
 
+/** Le paragraphe « Preuve web » : le serveur et les captures (liens vers les fichiers), ou pourquoi il n'y en a pas. */
+function webParagraph(web: WebView | undefined): string {
+  const w = web
+  if (!w || w.etat === 'non-demande') return `**Preuve web** : ${ABSENT}le vérificateur n’a pas demandé le navigateur.*`
+  if (w.etat === 'refuse') return '**Preuve web** : serveur non démarré (choix de l’utilisateur) : les critères web sont non vérifiables'
+  if (w.etat === 'erreur') return `**Preuve web** : le serveur n’a pas démarré : ${w.note ?? 'erreur inconnue'}`
+  if (w.etat === 'demarrage' || w.etat === 'question') return '**Preuve web** : serveur en cours de démarrage'
+  const liens = w.captures.map(c => `[${c.split(/[\\/]/).pop()}](<${c}>)`)
+  const nb = liens.length ? `${plural(liens.length, 'capture', 'captures')} : ${liens.join(', ')}` : 'aucune capture'
+  const serveur = `serveur${w.commande ? ` « ${w.commande} »` : ''}${w.url ? ` sur ${w.url}` : ''}`
+  return `**Preuve web** : ${serveur} (${w.existant ? 'déjà en marche' : 'démarré par revo-flow'}), ${nb}`
+}
+
 /** 4. Les critères d'acceptation et le verdict du vérificateur, avec la preuve de chacun. */
-function criteriaSection(criteres: readonly Critere[] | undefined, verdicts: readonly CritereVerdict[] | undefined): string[] {
+function criteriaSection(criteres: readonly Critere[] | undefined, verdicts: readonly CritereVerdict[] | undefined, web?: WebView): string[] {
   const out = [`## Critères d'acceptation`, '']
   if (!criteres?.length) return [...out, `${ABSENT}le plan n'avait pas de critères.*`, '']
   const ok = verdicts?.filter(v => v.verdict === 'ok').length ?? 0
   out.push(verdicts?.length ? `**${ok}/${criteres.length} critères ok**` : '*Pas de verdict du vérificateur.*', '')
   for (const c of criteres) {
     const v = verdicts?.find(x => x.id === c.id)
-    out.push(`- **${c.id}** ${c.texte} : ${v ? VERDICT[v.verdict] : 'sans verdict'}`)
+    out.push(`- **${c.id}** ${c.texte} : ${v ? `${VERDICT[v.verdict]}${v.web ? ' · preuve web' : ''}` : 'sans verdict'}`)
     if (v?.preuve) out.push(`  > ${v.preuve.replace(/\s*\n\s*/g, ' ')}`)
   }
-  return [...out, '']
+  return [...out, '', webParagraph(web), '']
 }
 
 /** 5. Le score CRAP : les fonctions au-dessus du seuil, touchées par le flow (nouvelles) ou non (préexistantes). */
@@ -146,7 +161,7 @@ function costSection(flow: Flow, lead: Lead, date: string | undefined, cache: Ca
 
 /** Le rapport de flow en markdown : six sections, chacune dite absente en une ligne quand elle n'a rien à montrer. */
 export function rapportMarkdown(input: RapportInput): string {
-  const { flow, lead, entries, verif, porte, criteres, verdicts, cache, date } = input
+  const { flow, lead, entries, verif, porte, criteres, verdicts, cache, date, web } = input
   const where = [flow.project, flow.branch].filter(Boolean).join(' · ')
   const head = [`# Rapport : ${flow.title}`, '']
   if (where) head.push(`**Projet** : ${where}  `)
@@ -156,7 +171,7 @@ export function rapportMarkdown(input: RapportInput): string {
     ...planSection(flow),
     ...filesSection(flow, entries),
     ...gateSection(verif, porte),
-    ...criteriaSection(criteres, verdicts),
+    ...criteriaSection(criteres, verdicts, web),
     ...crapSection(verif, porte),
     ...costSection(flow, lead, date, cache),
   ]

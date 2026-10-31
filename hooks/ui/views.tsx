@@ -65,6 +65,8 @@ export type ViewData = {
   cacheOpen: boolean
   /** La vérification du flow (porte de fin) ; null sans projet vérifié. */
   verif: VerifView | null
+  /** La dernière capture de la preuve web (base64 PNG nue) et son nom (« capture-2.png ») ; remplie par register.tsx. */
+  capture?: { png: string; nom: string }
 }
 
 /** Ce que les boutons du panneau déclenchent : branchés par register.tsx. */
@@ -84,6 +86,8 @@ export type PaneActions = {
   openRapport(): unknown
   /** Relance la vérification (bouton Relancer). */
   rerunVerif(): unknown
+  /** Ouvre la dernière capture de la preuve web (bouton capture). */
+  openCapture: () => void
 }
 
 const MODEL_COLOR = { haiku: PALETTE.haiku, sonnet: PALETTE.sonnet, opus: PALETTE.opus } as const
@@ -214,6 +218,20 @@ export function verifCriteriaText(v: VerifView): string | undefined {
   return parts.join(' · ')
 }
 
+/** La ligne de la preuve web (« preuve web : http://localhost:3000 (serveur démarré) · 2 captures ») ; undefined quand il n'y a rien à dire. */
+export function webLine(v: VerifView): { mark: string; tone: VerifTone; text: string } | undefined {
+  const w = v.web
+  if (!w) return undefined
+  const n = w.captures.length
+  const captures = n > 0 ? ` · ${n} capture${n > 1 ? 's' : ''}` : ''
+  if (w.etat === 'demarrage') return { mark: '…', tone: 'dim', text: `preuve web : démarrage de « ${w.commande ?? 'le serveur de dev'} »` }
+  if (w.etat === 'pret') return { mark: '✓', tone: 'ok', text: `preuve web : ${w.url ?? 'serveur prêt'} (${w.existant ? 'serveur déjà en marche' : 'serveur démarré'})${captures}` }
+  if (w.etat === 'refuse') return { mark: '–', tone: 'dim', text: 'preuve web : serveur non démarré (votre choix)' }
+  if (w.etat === 'erreur') return { mark: '⚠', tone: 'warn', text: `preuve web : ${w.note ?? 'erreur'}` }
+  if (w.etat === 'arrete') return { mark: '·', tone: 'dim', text: `preuve web : serveur arrêté${captures}` }
+  return undefined
+}
+
 /** Les remarques sous les commandes, une par ligne : base, tests gelés, triches, critères, question en attente. */
 export function verifNotes(v: VerifView): { mark: string; tone: VerifTone; text: string }[] {
   const notes: { mark: string; tone: VerifTone; text: string }[] = []
@@ -223,6 +241,8 @@ export function verifNotes(v: VerifView): { mark: string; tone: VerifTone; text:
   for (const t of v.triches) notes.push({ mark: t.bloquant ? '✗' : '⚠', tone: t.bloquant ? 'ko' : 'warn', text: `${t.bloquant ? 'triche' : 'à surveiller'} : ${t.motif} (${t.fichier})` })
   const crit = verifCriteriaText(v)
   if (crit) notes.push({ mark: v.criteres && v.criteres.verdicts.some(x => x.verdict === 'ko') ? '✗' : '✓', tone: v.criteres && v.criteres.verdicts.some(x => x.verdict === 'ko') ? 'ko' : 'ok', text: crit })
+  const web = webLine(v)
+  if (web) notes.push(web)
   if (v.enAttente) notes.push({ mark: '?', tone: 'warn', text: `en attente de votre réponse : ${v.enAttente}` })
   return notes
 }
@@ -828,7 +848,9 @@ export function DesktopPane(t: Elements['desktop'], d: ViewData, actions: PaneAc
               {notes.map((n, i) => (
                 <Svg key={`n${i}`} source={verifNoteSvg({ ...n, width: inner })} alt={n.text} width={inner} />
               ))}
+              {d.capture && <Text key="capture-nom" dimColor>{d.capture.nom}</Text>}
               <Box flexDirection="row" justifyContent="flex-end" gap={2} width="100%">
+                {v.web?.captures.length ? <Button key="verif-capture" plain label="capture" onPress={() => actions.openCapture()} /> : null}
                 {v.detail && <Button key="verif-detail" plain label="Détail" onPress={() => actions.openVerif()} />}
                 {v.mode !== 'off' && <Button key="verif-rerun" plain label="Relancer" onPress={() => actions.rerunVerif()} />}
               </Box>
@@ -955,7 +977,7 @@ export function MobilePane(t: Elements['mobile'], d: ViewData, actions: PaneActi
  * n/total et la tâche en cours), une troisième pour l'action en direct quand il est actif, puis ses tokens ; un terminé tient en une ligne de barre sans titre.
  */
 export function TerminalPane(t: Elements['terminal'], d: ViewData, actions: PaneActions) {
-  const { Box, Text, Button } = t
+  const { Box, Text, Button, Image } = t
   const flow = d.flow
   const all = cards(d)
   const day = d.tokens ? total(d.tokens.day) : 0
@@ -1116,6 +1138,13 @@ export function TerminalPane(t: Elements['terminal'], d: ViewData, actions: Pane
           <Text color={n.tone === 'ko' || n.tone === 'warn' ? VERIF_TEXT_COLOR[n.tone] : undefined} dimColor={n.tone === 'dim'}>{n.text}</Text>
         </Text>
       ))}
+      {d.capture && Image ? <Image key="capture" source={{ png: d.capture.png }} alt={d.capture.nom} /> : null}
+      {d.capture && !Image ? <Text key="capture-nom" dimColor>{`  ${d.capture.nom}`}</Text> : null}
+      {v.web?.captures.length ? (
+        <Box key="capture-actions" gap={2}>
+          <Button key="verif-capture" plain label="capture" onPress={() => actions.openCapture()} />
+        </Box>
+      ) : null}
     </Box>
   )
 

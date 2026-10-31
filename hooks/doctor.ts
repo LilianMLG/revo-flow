@@ -8,6 +8,7 @@ import { CRAP_SEUIL } from './verif/crap'
 import { commandLabel } from './verif/detect'
 import { baseFor } from './verif/base'
 import { durationOf } from './verif/runner'
+import { commandeText, type WebDispo } from './verif/web'
 
 /** Largeur de la colonne des titres (« Stack », « Typage »…) : la maquette aligne le reste dessous. */
 const TITRE = 13
@@ -43,6 +44,8 @@ export type DoctorInput = {
   agents: AgentDef[]
   /** Les pièges d'environnement, déjà complets (detectCommands, flutterVersionTrap). */
   pieges: string[]
+  /** La preuve web : option, serveur de dev détecté, REVO_WEB_LOGIN défini ; absent = rubrique non affichée. */
+  web?: WebDispo
 }
 
 const LIBELLE: Record<VerifOutil, string> = { generation: 'Génération', format: 'Format', lint: 'Lint', typage: 'Typage', tests: 'Tests', qualite: 'CRAP' }
@@ -172,6 +175,19 @@ function agentsLine(input: DoctorInput): string {
   return ligne('Agents', `${input.agents.length} installés (${detail}), proposés au plan`)
 }
 
+/** La rubrique Web : la commande du serveur de dev et son port, les outils du vérificateur, la connexion de test. */
+function webLines(w: WebDispo): string[] {
+  if (w.option === 'off') return [ligne('Web', 'preuve web désactivée (option web)')]
+  const s = w.serveur
+  if (!s) return [ligne('Web', 'aucun serveur de dev détecté (pas de script dev) : pas de preuve web')]
+  const outils = w.option === 'devtools' ? 'extension Claude in Chrome, ou Chrome DevTools MCP (npx chrome-devtools-mcp)' : 'extension Claude in Chrome'
+  const port = s.port ? `port ${s.port}` : 'port inconnu (lu dans la sortie)'
+  const login = w.login
+    ? 'REVO_WEB_LOGIN défini : le serveur de dev connaît le compte de test (revo-flow ne le lit jamais)'
+    : 'REVO_WEB_LOGIN absent : si l’app demande une connexion, définissez-la pour le serveur de dev ; revo-flow ne la lit jamais'
+  return [ligne('Web', `${commandeText(s)} · ${port} · ${s.origine} · preuve web au vérificateur sur votre accord · outils : ${outils}`), suite(login)]
+}
+
 /**
  * Le texte de /revo-flow doctor. Sans projet : le dit, et dit que la porte ne fera rien. Avec un projet : stack, porte, une ligne par
  * commande, CRAP, base de référence, cache, agents, pièges.
@@ -195,6 +211,7 @@ export function doctorText(input: DoctorInput): string {
   lignes.push(baseLine(input))
   lignes.push(cacheLine(input))
   lignes.push(agentsLine(input))
+  if (input.web) lignes.push(...webLines(input.web))
   if (input.pieges.length === 0) lignes.push(ligne('Pièges', 'aucun'))
   else input.pieges.forEach((p, i) => lignes.push(i === 0 ? ligne('Pièges', p) : suite(p)))
   return lignes.join('\n')

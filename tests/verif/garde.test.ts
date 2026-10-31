@@ -377,6 +377,29 @@ describe('VERIFIER_PROMPT et verifierTask', () => {
     expect(nue).toContain('(aucun fichier modifié)')
     expect(nue).not.toContain('Triches')
   })
+
+  test('preuve web : section du prompt, exemple 4, règle 3 ouverte, "web" accepté dans le bloc json', () => {
+    expect(VERIFIER_PROMPT).toContain('## Preuve web')
+    expect(VERIFIER_PROMPT).toContain('Exemple 4, « ok » par preuve web')
+    expect(VERIFIER_PROMPT).toContain(
+      '{"id":"C2","verdict":"ok","preuve":"http://localhost:3000/panier → read_page : « Total TTC 12,00 € » présent après ajout de l’option ; console : 0 erreur ; réseau : 0 réponse 4xx/5xx ; capture 1","web":true}',
+    )
+    expect(VERIFIER_PROMPT).toContain('capture prise, ça a l’air bon')
+    expect(VERIFIER_PROMPT).toContain('sauf si ta tâche t’ouvre la preuve web : alors demande le serveur et navigue, voir « Preuve web » ;')
+    expect(VERIFIER_PROMPT).toContain('mcp__revo-flow__verif')
+    expect(VERIFIER_PROMPT).toContain('"web": true')
+  })
+
+  test('verifierTask : le paragraphe web ajouté tel quel, après les triches, avant la consigne finale', () => {
+    const web = '## Preuve web\nCe projet a un serveur de dev : `npm run dev`.'
+    const triches = [{ motif: 'test isolé (.only)', fichier: 'a.test.ts', bloquant: false }]
+    const t = verifierTask(CRITERES, ' a.ts | 1 +', [], triches, web)
+    expect(t).toContain(web)
+    expect(t.indexOf('test isolé (.only)')).toBeLessThan(t.indexOf('## Preuve web'))
+    expect(t.indexOf('## Preuve web')).toBeLessThan(t.indexOf('Rends le bloc json'))
+    expect(verifierTask(CRITERES, '', [])).not.toContain('Preuve web')
+    expect(verifierTask(CRITERES, '', [], [], web)).toContain(web)
+  })
 })
 
 describe('parseVerdicts', () => {
@@ -402,6 +425,16 @@ describe('parseVerdicts', () => {
     const v = parseVerdicts(text, CRITERES)
     expect(v[0]).toEqual({ id: 'C1', verdict: 'non-verifiable', preuve: 'verdict « ok » sans preuve exécutée' })
     expect(v.length).toBe(3)
+  })
+
+  test('web: true gardé quand le verdict le porte, absent sinon', () => {
+    const text =
+      '```json\n[{"id":"C1","verdict":"ok","preuve":"http://localhost:3000 → read_page : « Code expiré » ; capture 1","web":true},{"id":"C2","verdict":"ko","preuve":"p","web":false},{"id":"C3","verdict":"ok","preuve":"","web":true}]\n```'
+    const v = parseVerdicts(text, CRITERES)
+    expect(v[0]).toEqual({ id: 'C1', verdict: 'ok', preuve: 'http://localhost:3000 → read_page : « Code expiré » ; capture 1', web: true })
+    expect(v[1]).toEqual({ id: 'C2', verdict: 'ko', preuve: 'p' })
+    expect('web' in v[1]!).toBe(false)
+    expect(v[2]).toEqual({ id: 'C3', verdict: 'non-verifiable', preuve: 'verdict « ok » sans preuve exécutée', web: true })
   })
 
   test('réponse illisible : tout non vérifiable, jamais d’exception', () => {

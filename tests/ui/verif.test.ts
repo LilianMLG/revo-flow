@@ -10,8 +10,9 @@ import {
   verifNotes,
   verifShown,
   verifTone,
+  webLine,
 } from '../../hooks/ui/views'
-import type { VerifEtatCommande, VerifView } from '../../types/verif'
+import type { VerifEtatCommande, VerifView, WebView } from '../../types/verif'
 
 const cmd = (o: Partial<VerifEtatCommande> & { id: string }): VerifEtatCommande => ({
   outil: 'lint',
@@ -161,5 +162,36 @@ describe('dessins', () => {
     expect(barSvg(stages, o)).toContain('vérif ✓ 3/3')
     expect(barSvg(stages, { ...o, width: 380 })).not.toContain('vérif ✓ 3/3')
     expect(barSvg(stages, { title: 'T', width: 800, percent: 50, agents: 1 })).not.toContain('vérif')
+  })
+})
+
+const web = (o: Partial<WebView> = {}): WebView => ({ etat: 'pret', commande: 'npm run dev', url: 'http://localhost:3000', captures: [], ...o })
+
+describe('webLine : la preuve web', () => {
+  test('rien sans web, non demandé ou en question', () => {
+    expect(webLine(view())).toBeUndefined()
+    expect(webLine(view({ web: web({ etat: 'non-demande' }) }))).toBeUndefined()
+    expect(webLine(view({ web: web({ etat: 'question' }) }))).toBeUndefined()
+  })
+
+  test('chaque état', () => {
+    expect(webLine(view({ web: web({ etat: 'demarrage' }) }))).toEqual({ mark: '…', tone: 'dim', text: 'preuve web : démarrage de « npm run dev »' })
+    expect(webLine(view({ web: web() }))).toEqual({ mark: '✓', tone: 'ok', text: 'preuve web : http://localhost:3000 (serveur démarré)' })
+    expect(webLine(view({ web: web({ existant: true, captures: ['/a/capture-1.png', '/a/capture-2.png.txt'] }) }))).toEqual({
+      mark: '✓',
+      tone: 'ok',
+      text: 'preuve web : http://localhost:3000 (serveur déjà en marche) · 2 captures',
+    })
+    expect(webLine(view({ web: web({ captures: ['/a/capture-1.png'] }) }))!.text).toMatch(/ · 1 capture$/)
+    expect(webLine(view({ web: web({ etat: 'refuse' }) }))).toEqual({ mark: '–', tone: 'dim', text: 'preuve web : serveur non démarré (votre choix)' })
+    expect(webLine(view({ web: web({ etat: 'erreur', note: 'port 3000 occupé' }) }))).toEqual({ mark: '⚠', tone: 'warn', text: 'preuve web : port 3000 occupé' })
+    expect(webLine(view({ web: web({ etat: 'arrete', captures: ['/a/c1.png', '/a/c2.png'] }) }))).toEqual({ mark: '·', tone: 'dim', text: 'preuve web : serveur arrêté · 2 captures' })
+    expect(webLine(view({ web: web({ etat: 'arrete' }) }))!.text).toBe('preuve web : serveur arrêté')
+  })
+
+  test('verifNotes : après les critères, avant la question en attente', () => {
+    const n = verifNotes(view({ criteres: { total: 1, ok: 1, verdicts: [] }, web: web(), enAttente: 'Continuer ?' }))
+    expect(n.map(x => x.text.split(' ')[0])).toEqual(['Critères', 'preuve', 'en'])
+    expect(verifNotes(view({ web: web({ etat: 'non-demande' }) }))).toEqual([])
   })
 })

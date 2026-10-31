@@ -430,6 +430,7 @@ export function detectCheats(diff: string, gel: TestGele[] = []): Triche[] {
 /**
  * Le prompt système de revo-flow:verifier (§3 : Sonnet medium proposé). Calibré par trois exemples notés, un par
  * verdict, avec le contre-exemple classique (« ok » sur simple lecture du code) : sans eux, le modèle valide trop.
+ * v3 : un quatrième exemple, « ok » par preuve web (contre-exemple : la capture seule), et la section « Preuve web ».
  */
 export const VERIFIER_PROMPT = [
   'Tu es le vérificateur de revo-flow. Tu arrives en contexte neuf : tu n’as pas écrit ce code et tu ne dois rien à ceux qui l’ont écrit.',
@@ -438,7 +439,7 @@ export const VERIFIER_PROMPT = [
   '## Règles',
   '1. Une preuve s’exécute, elle ne se déclare pas. Un « ok » exige une commande que TU as lancée pendant cette vérification et un extrait de sa sortie qui montre le critère tenu (le test nommé qui passe, la sortie attendue). Lire le code ne suffit jamais pour un « ok ». Ce que les agents affirment dans leurs réponses ne compte pas.',
   '2. « ko » : la commande et l’extrait qui montrent l’échec, ou le fichier et la ligne qui contredisent le critère, avec la raison.',
-  '3. « non-verifiable » : aucune commande permise ne peut le montrer (serveur, émulateur, navigateur, service externe, donnée absente). Dis ce qui manquerait et ce que tu as pu vérifier à côté. Entre « ok » et « non-verifiable », dans le doute, choisis « non-verifiable » : ne devine jamais un « ok ».',
+  '3. « non-verifiable » : aucune commande permise ne peut le montrer (serveur, émulateur, navigateur, service externe, donnée absente) — sauf si ta tâche t’ouvre la preuve web : alors demande le serveur et navigue, voir « Preuve web » ; dis ce qui manquerait et ce que tu as pu vérifier à côté. Entre « ok » et « non-verifiable », dans le doute, choisis « non-verifiable » : ne devine jamais un « ok ».',
   '4. Lecture seule : tu ne modifies, ne crées ni ne supprimes aucun fichier, et tu ne corriges rien. Bash est filtré : les commandes confirmées données dans ta tâche, et les lectures git diff, git show, git log, git status, cat, ls, head, tail, grep, wc, sed -n \'10,40p\'. Pas d’enchaînement (;, &&, |), pas de redirection (>, <), pas de $( ) ni de backticks. Une commande refusée : prends une autre lecture, ne cherche pas à contourner.',
   '5. Triche : un test sauté (.skip, .only, xit), une assertion retirée, un @ts-ignore, un eslint-disable ou un as any ajouté pour faire passer, une config de lint ou de test assouplie : cite-le dans la preuve du critère concerné et juge « ko ».',
   '6. Méthode : lis le diff (git diff, git diff --stat), puis pour chaque critère trouve le test ou la sortie qui le couvre, lance la commande, lis la sortie, puis juge.',
@@ -457,12 +458,24 @@ export const VERIFIER_PROMPT = [
   '{"id":"C3","verdict":"non-verifiable","preuve":"Demande un appareil et le service de push ; aucune commande confirmée ne l’exerce. À côté : npx vitest run tests/notif/envoi.test.ts → 2 passed, l’appel à l’API d’envoi est fait."}',
   'Juste : la limite est dite, ce qui a été vérifié à côté est cité, sans conclure « ok ».',
   '',
+  'Exemple 4, « ok » par preuve web. Critère C2 : « Le panier affiche le total TTC après ajout d’une option. »',
+  '{"id":"C2","verdict":"ok","preuve":"http://localhost:3000/panier → read_page : « Total TTC 12,00 € » présent après ajout de l’option ; console : 0 erreur ; réseau : 0 réponse 4xx/5xx ; capture 1","web":true}',
+  'Juste : l’URL visitée, le texte vu sur la page, la console et le réseau comptés, la capture citée, le verdict marqué "web": true.',
+  'Mal jugé, pour le même critère : {"id":"C2","verdict":"ok","preuve":"capture prise, ça a l’air bon","web":true} : une capture n’est pas un fait ; sans texte lu, console ni réseau, c’était « non-verifiable ».',
+  '',
+  '## Preuve web',
+  'Seulement si ta tâche l’ouvre (paragraphe « Preuve web » de la tâche) :',
+  '- Demande le serveur avec l’outil mcp__revo-flow__verif, action "web" : revo-flow demande à l’utilisateur, démarre le serveur et te rend l’URL, ou te dit pourquoi non (alors le critère est non vérifiable).',
+  '- Reste sur l’origine donnée : n’ouvre aucune autre adresse, le navigateur de l’utilisateur n’est pas à toi. N’entre aucun identifiant.',
+  '- Faits exigés pour un « ok » ou un « ko » web : l’URL visitée, l’élément ou le texte vu (read_page, find), le nombre d’erreurs console et de réponses réseau 4xx/5xx, et « capture n ». Une capture par critère jugé ; une capture seule ne prouve rien.',
+  '- Marque ces verdicts "web": true. Tu n’arrêtes pas le serveur : revo-flow le fait.',
+  '',
   '## Réponse',
   'Quelques lignes au plus, puis un seul bloc json : un tableau, un objet par critère, dans l’ordre des critères.',
   '```json',
   '[{"id":"C1","verdict":"ok","preuve":"<commande> → <extrait de sortie>"}]',
   '```',
-  'verdict vaut "ok", "ko" ou "non-verifiable" ; preuve : une ou deux phrases, 400 caractères au plus, avec la commande et l’extrait. Un critère sans verdict compte comme non vérifiable ; un « ok » sans preuve aussi.',
+  'verdict vaut "ok", "ko" ou "non-verifiable" ; preuve : une ou deux phrases, 400 caractères au plus, avec la commande et l’extrait. "web": true, facultatif, marque un verdict appuyé sur la preuve web. Un critère sans verdict compte comme non vérifiable ; un « ok » sans preuve aussi.',
 ].join('\n')
 
 /** Le diff --stat donné au vérificateur : 60 lignes au plus. */
@@ -470,9 +483,10 @@ const STAT_MAX = 60
 
 /**
  * La tâche donnée au vérificateur : les critères, les fichiers du flow (git diff --stat), les commandes confirmées
- * qu'il peut lancer (argv exact ; « {fichiers} » = un ou plusieurs chemins) et, facultatif, les triches déjà repérées.
+ * qu'il peut lancer (argv exact ; « {fichiers} » = un ou plusieurs chemins) et, facultatifs, les triches déjà repérées
+ * et le paragraphe « Preuve web » (web.ts, verifierWebTask), ajouté tel quel avant la consigne finale.
  */
-export function verifierTask(criteres: Critere[], diffStat: string, commandes: VerifCommande[], triches: Triche[] = []): string {
+export function verifierTask(criteres: Critere[], diffStat: string, commandes: VerifCommande[], triches: Triche[] = [], web?: string): string {
   const stat = (typeof diffStat === 'string' ? diffStat : '').split(/\r?\n/).filter(l => l.trim() !== '')
   const statLignes = stat.length > STAT_MAX ? [...stat.slice(0, STAT_MAX), `… et ${stat.length - STAT_MAX} autres lignes (git diff --stat)`] : stat
   const cmds = (Array.isArray(commandes) ? commandes : []).filter(c => Array.isArray(c?.argv) && c.argv.length > 0)
@@ -495,6 +509,7 @@ export function verifierTask(criteres: Critere[], diffStat: string, commandes: V
     ...(triches.length
       ? ['', 'Triches repérées par revo-flow dans le diff (à confirmer et à citer dans la preuve) :', ...triches.map(t => `- ${t.motif} : ${t.fichier}${t.extrait ? ` (${t.extrait})` : ''}`)]
       : []),
+    ...(typeof web === 'string' && web.trim() !== '' ? ['', web] : []),
     '',
     `Rends le bloc json avec un verdict pour ${ids}.`,
   ].join('\n')
@@ -537,7 +552,8 @@ const idDe = (x: unknown) => {
 /**
  * Lit la réponse du vérificateur : le dernier bloc json lisible (```json ou ```), sinon le tableau ou l'objet du texte.
  * Un verdict par critère, dans l'ordre des critères : critère absent → non-verifiable ; « ok » sans preuve →
- * non-verifiable (une preuve s'exécute, §1) ; verdict inconnu → non-verifiable ; ids inconnus ignorés.
+ * non-verifiable (une preuve s'exécute, §1) ; verdict inconnu → non-verifiable ; ids inconnus ignorés. « web: true »
+ * est gardé quand l'objet le porte (preuve web, v3), absent sinon.
  */
 export function parseVerdicts(text: string, criteres: Critere[]): CritereVerdict[] {
   const t = typeof text === 'string' ? text : ''
@@ -557,9 +573,10 @@ export function parseVerdicts(text: string, criteres: Critere[]): CritereVerdict
     const brut = sansAccents(String(e.verdict ?? e.statut ?? '').trim().toLowerCase())
     const preuve = String(e.preuve ?? e.proof ?? e.evidence ?? '').trim().slice(0, PREUVE_MAX)
     const verdict = VERDICT_OK.has(brut) ? 'ok' : VERDICT_KO.has(brut) ? 'ko' : 'non-verifiable'
+    const web = e.web === true ? { web: true } : {}
     parId.set(
       id,
-      verdict === 'ok' && !preuve ? { id, verdict: 'non-verifiable', preuve: 'verdict « ok » sans preuve exécutée' } : { id, verdict, preuve },
+      verdict === 'ok' && !preuve ? { id, verdict: 'non-verifiable', preuve: 'verdict « ok » sans preuve exécutée', ...web } : { id, verdict, preuve, ...web },
     )
   }
   const absent = entrees ? 'pas de verdict du vérificateur pour ce critère' : 'réponse du vérificateur illisible (pas de bloc json)'

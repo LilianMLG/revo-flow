@@ -7,6 +7,7 @@ import { detectCommands } from '../hooks/verif/detect'
 import { computeStats } from '../hooks/cache/graph'
 import type { AgentDef } from '../types/agents'
 import type { Graph } from '../types/cache'
+import type { WebDispo } from '../hooks/verif/web'
 import type { ProjetVerif, VerifCommande } from '../types/verif'
 import { OSES, diskKey, native, type Os } from './helpers/os'
 
@@ -137,6 +138,33 @@ describe('doctorText : projet reconnu', () => {
   test('verif en observateur ou coupée : la ligne Porte le dit', () => {
     expect(find(doctorText(complet({ mode: 'observer' })), 'Porte')).toMatch(/observer \(affiche, ne bloque jamais\)/)
     expect(find(doctorText(complet({ mode: 'off' })), 'Porte')).toBe('Porte        désactivée (option verif) : aucune vérification ne sera lancée')
+  })
+})
+
+describe('doctorText : la rubrique Web', () => {
+  const web = (o: Partial<WebDispo> = {}): WebDispo => ({ option: 'extension', login: false, ...o })
+  const serveur = (port?: number, argv = ['npm', 'run', 'dev']) => ({ argv, ...(port ? { port } : {}), origine: 'script dev' })
+
+  test('sans l’entrée web, pas de rubrique', () => {
+    expect(find(doctorText(complet()), 'Web')).toBeUndefined()
+  })
+
+  test('option coupée, ou pas de serveur de dev', () => {
+    expect(find(doctorText(complet({ web: web({ option: 'off' }) })), 'Web')).toBe('Web          preuve web désactivée (option web)')
+    expect(find(doctorText(complet({ web: web() })), 'Web')).toBe('Web          aucun serveur de dev détecté (pas de script dev) : pas de preuve web')
+  })
+
+  test('Nuxt en npm, port 3000, REVO_WEB_LOGIN absent', () => {
+    const t = doctorText(complet({ web: web({ serveur: serveur(3000) }) }))
+    expect(find(t, 'Web')).toBe('Web          npm run dev · port 3000 · script dev · preuve web au vérificateur sur votre accord · outils : extension Claude in Chrome')
+    expect(lines(t)[lines(t).indexOf(find(t, 'Web')!) + 1]).toBe(`${' '.repeat(13)}REVO_WEB_LOGIN absent : si l’app demande une connexion, définissez-la pour le serveur de dev ; revo-flow ne la lit jamais`)
+    expect(lines(t).findIndex(l => l.startsWith('Web'))).toBeGreaterThan(lines(t).findIndex(l => l.startsWith('Agents')))
+  })
+
+  test('pnpm, port inconnu, REVO_WEB_LOGIN défini, outils devtools', () => {
+    const t = doctorText(complet({ web: web({ option: 'devtools', login: true, serveur: serveur(undefined, ['pnpm', 'run', 'dev']) }) }))
+    expect(find(t, 'Web')).toBe('Web          pnpm run dev · port inconnu (lu dans la sortie) · script dev · preuve web au vérificateur sur votre accord · outils : extension Claude in Chrome, ou Chrome DevTools MCP (npx chrome-devtools-mcp)')
+    expect(t).toContain('REVO_WEB_LOGIN défini : le serveur de dev connaît le compte de test (revo-flow ne le lit jamais)')
   })
 })
 

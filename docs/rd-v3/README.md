@@ -9,6 +9,8 @@
 > Question posée : « quelle prochaine version serait vraiment intéressante, et le mod est-il assez complet pour
 > avoir des utilisateurs, en vue d'une pub sur LinkedIn ? »
 
+> Lot B livré en v3.0 le 2026-10-31 : voir §3
+
 ## Verdict
 
 **Le mod est fonctionnellement prêt. Ce qui lui manque pour avoir des utilisateurs n'est pas une feature, c'est tout
@@ -182,6 +184,16 @@ Ce que cette étude ajoute :
 | Compte de test (question 6 de la R&D v2) | Jamais stocké par le mod. Une variable d'environnement nommée dans `doctor` (« preuve web : connexion requise, `REVO_WEB_LOGIN` absent ») |
 | Capture | Texte base64 dans `~/.claude/revo-flow/verif/<flow>/`, affichée dans le terminal par `Image` ; jointe au rapport de flow (A4) comme lien |
 | Mesure | Comme pour la porte : compter d'abord les flows où la preuve web trouve ce que la porte n'a pas vu. Si c'est rare, le lot s'arrête là |
+
+### Décisions à la livraison (v3.0)
+
+- **Option `web`** (`extension` par défaut, `devtools`, `off`) plutôt qu'un `mcpServers` au niveau du plugin : le serveur MCP Chrome DevTools ne part que pour le vérificateur, et seulement si l'utilisateur le choisit.
+- **Action `web` de l'outil `verif`**, réservée au vérificateur et à l'orchestrateur : détection du serveur de dev, dialogue, démarrage, URL.
+- **Port déjà pris** : revo-flow propose le serveur existant (« Utiliser http://localhost:3000 ? ») et ne tue rien ; un serveur qu'il n'a pas démarré n'est jamais arrêté.
+- **Outils navigateur refusés** hors preuve web et hors de l'origine accordée.
+- **Captures** : texte base64 (`capture-n.png.txt`) dans le dossier des sorties du flow, décodage en PNG au mieux (`certutil` ou `base64`), lien dans le rapport de flow.
+- **`REVO_WEB_LOGIN`** : seule sa présence est signalée (doctor, consigne du vérificateur) ; le mod ne lit ni ne stocke aucun identifiant.
+- **Journal `web`** (état, captures, verdicts web, ko web) pour la mesure : combien de flows où la preuve web trouve ce que la porte n'a pas vu.
 
 Pourquoi c'est la bonne feature pour une v3 : c'est la plus démonstrative (une capture dans un rapport, c'est un
 post à soi tout seul), aucun orchestrateur open source ne la fait proprement, et elle réutilise le vérificateur et

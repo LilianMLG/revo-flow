@@ -59,7 +59,7 @@ Sans `/revo-flow`, le mod ne fait rien : pas même un outil déclaré (`plan`, `
 | `/revo-flow panneau` | affiche ou masque le panneau latéral |
 | `/revo-flow historique [n]` | les n derniers flows (10 par défaut) : date, durée, coût, agents, échecs et relances, puis par modèle le coût moyen d'un agent, son taux d'échec et ses relances |
 | `/revo-flow stop` | arrête vraiment : les agents en cours (TaskStop) et le tour de l'orchestrateur, après confirmation (Échap : rien ne change), puis retire la barre et le panneau |
-| `/revo-flow doctor` | ce que le mod a trouvé sur le projet courant : stack, commandes de vérification, base de référence, cache, agents installés, pièges ; lecture seule, rien n'est lancé ni modifié |
+| `/revo-flow doctor` | ce que le mod a trouvé sur le projet courant : stack, commandes de vérification, base de référence, cache, agents installés, preuve web (ligne `Web` : commande et port détectés, d'où ils viennent, outils, état de `REVO_WEB_LOGIN` ; ou « aucun serveur de dev détecté (pas de script dev) : pas de preuve web » ; ou « preuve web désactivée (option web) »), pièges ; lecture seule, rien n'est lancé ni modifié |
 | `/revo-flow version` | la version du mod |
 | `/revo-flow cache` | le graphe du projet courant : panneau (section « Cache » dépliée) et texte dans le terminal |
 | `/revo-flow cache <projet>` | le graphe de n'importe quel projet de `Documents/Front` ou `Documents/Back` (`reservation-tool`, `back/graphql`) |
@@ -89,7 +89,7 @@ En fin de flow, revo-flow écrit un rapport markdown dans `~/.claude/revo-flow/r
 1. la demande et le plan (agents, modèles, efforts, tâches faites) ;
 2. les fichiers modifiés, par agent ;
 3. le verdict de la porte : commandes lancées, durée, erreurs nouvelles, exceptions accordées ;
-4. les critères et le verdict du vérificateur, avec la preuve de chacun ;
+4. les critères et le verdict du vérificateur, avec la preuve de chacun ; une preuve web y est liée (« Preuve web : serveur « npm run dev » sur http://localhost:3000, 2 captures : … », chemins des `capture-n.png`) ;
 5. le score CRAP des fonctions modifiées ;
 6. durée, coût, tokens évités par le cache.
 
@@ -144,6 +144,7 @@ Depuis la v2, un flow ne finit plus « terminé » sur un lint, un typage ou un 
 | `commandes` | orchestrateur seul : une liste de commandes corrigée, ou des tests à exclure ; toujours reposée à l'utilisateur |
 | `exception` | orchestrateur seul : terminer malgré le rouge, avec un motif ; toujours reposée à l'utilisateur |
 | `degeler` | orchestrateur seul : rouvrir un test gelé, avec un motif ; toujours reposée à l'utilisateur |
+| `web` | vérificateur et orchestrateur : démarre (ou reprend) le serveur de dev du projet pour la preuve web et rend l'URL ; toujours demandée à l'utilisateur ; voir « Preuve web » |
 
 **Critères d'acceptation, vérificateur, tests gelés** (sur décision de l'orchestrateur, jamais automatiques ; ≈ 0,5 à 1,3 € de plus par flow) :
 
@@ -158,6 +159,21 @@ Depuis la v2, un flow ne finit plus « terminé » sur un lint, un typage ou un 
 **Affichage** : section « Vérification » du panneau (une ligne par commande : état, fichiers, erreurs nouvelles, durée ; tentative n/3 ; tests gelés ; triches ; critères ; boutons **Détail**, qui ouvre la sortie complète, et **Relancer**), segment de bande `vérif ✓ 3/3`, `vérif ✗ typecheck (2)` ou `vérif …`, notification de fin « vérifié ✓ » ou « non vérifié (typecheck ✗) », colonne « vérif » de l'historique (`✓`, `✗ accepté`, `✗`, `✗ erreur`, `observé`, `—`). Les sorties complètes sont dans `~/.claude/revo-flow/verif/<date>-<flow>/` (les 20 derniers flows gardés).
 
 **Mesure** : le journal du graphe note pour chaque flow l'état de la vérification, ses tentatives, ses erreurs nouvelles et sa durée. La section « Cache » du panneau en tire le taux d'échappement (flows observés rouges), la part de flows rouges au premier passage, les erreurs nouvelles attrapées, les flows acceptés non vérifiés et la durée moyenne de la porte.
+
+### Preuve web
+
+Depuis la v3.0, le vérificateur peut **voir l'application tourner**. C'est ce que ni le lint, ni le typage, ni les tests unitaires ne voient : page blanche, erreur d'hydratation, erreur console, appel réseau en 4xx ou 5xx, composant absent, texte de traduction manquant. Elle n'est lancée que pour un flow avec des critères, quand le vérificateur la demande (≈ 0,2 à 0,6 $ et 1 à 3 min de plus).
+
+- **Déroulé** : le vérificateur appelle l'action `web` de l'outil `verif`. revo-flow détecte le serveur de dev : script `dev` de `package.json`, sinon un `start` qui lance `nuxt`, `next dev`, `vite`, `astro dev` ou `ng serve` ; gestionnaire d'après le lockfile (npm, pnpm, yarn, bun) ; port lu dans le script, `.env` (`PORT=`), `nuxt.config.*` (`devServer.port`), `vite.config.*` (`server.port`), sinon le défaut du framework (Nuxt et Next 3000, Vite 5173, Astro 4321, Angular 4200). Un dialogue demande « Démarrer « npm run dev » pour <projet> (port 3000) ? » : **Démarrer** ou **Pas cette fois**. Sans personne à qui demander (`claude -p`) ou sur Échap : pas cette fois. Sur **Démarrer**, le serveur part (`cmd /c` sous Windows), revo-flow lit sa sortie jusqu'à l'URL (« Local: http://localhost:3000 »), 90 s au plus ; port pris ou serveur mort, il le dit.
+- **Port déjà pris** : revo-flow demande « Utiliser http://localhost:3000 pour la preuve web ? » et ne tue rien.
+- **Navigation** : le vérificateur reçoit l'URL et navigue avec l'extension **Claude in Chrome** (`navigate`, `read_page`, `find`, `computer` pour la capture, `read_console_messages`, `read_network_requests`), **seulement sur cette origine** : une autre origine est refusée (le navigateur de l'utilisateur n'est pas à lui), et tout outil navigateur est refusé tant qu'aucun serveur n'est accordé.
+- **Ce qu'est une preuve** : l'URL visitée, l'élément ou le texte vu, le nombre d'erreurs console et de réponses 4xx/5xx, et « capture n ». Une capture seule n'est pas une preuve. Le verdict du critère porte `"web": true`.
+- **Captures** : chaque capture d'écran du vérificateur est rangée avec les sorties du flow, `~/.claude/revo-flow/verif/<date>-<flow>/capture-n.png.txt` (texte base64), décodée en `capture-n.png` quand `certutil` ou `base64` est là. Le panneau les montre (bouton **capture**) et le rapport de flow les lie.
+- **Fin** : le serveur démarré par revo-flow est toujours arrêté en fin de flow (ou par **Tout arrêter**). Un serveur qui tournait déjà n'est jamais touché.
+- **Connexion** : revo-flow ne stocke ni ne lit aucun compte de test. Si l'application demande une connexion, définis la variable d'environnement `REVO_WEB_LOGIN` pour ton serveur de dev (c'est lui qui la lit) ; revo-flow signale seulement si elle est définie ou absente (`/revo-flow doctor`, consigne du vérificateur). Le vérificateur n'entre jamais d'identifiant : une page de connexion sans la variable donne « non vérifiable ».
+- **Option `web`** (`/config`) : `extension` (défaut) : comme ci-dessus ; `devtools` : en plus, le serveur MCP **Chrome DevTools** (`npx chrome-devtools-mcp@latest --isolated`) est déclaré pour le vérificateur, en repli quand l'extension n'est pas là (`navigate_page`, `take_snapshot`, `take_screenshot`, `list_console_messages`, `list_network_requests`) ; `off` : aucune preuve web, l'action `web` répond que c'est désactivé.
+- **Mesure** : le journal du graphe note la preuve web de chaque flow (état, captures, verdicts web, ko web), pour compter d'abord « combien de flows où la preuve web trouve ce que la porte n'a pas vu ».
+- **Limites** : l'extension Claude in Chrome est requise (ou l'option `devtools`) ; seuls les serveurs Nuxt, Next, Vite, Astro et Angular sont reconnus ; une application sans script `dev` n'a pas de preuve web ; pas de test mobile (un seul navigateur, une seule taille) ; un `build` n'est pas servi.
 
 ### Score CRAP
 
@@ -190,6 +206,7 @@ Depuis la v2.2, revo-flow découvre les agents déjà installés sur ton Claude 
 | `verif` | `bloquer` | vérification des flows : `bloquer` refuse la fin d'un flow tant qu'une erreur nouvelle subsiste (3 tentatives), `observer` vérifie et affiche sans bloquer, `off` ne vérifie pas |
 | `crap` | oui | score CRAP dans la porte : une fonction modifiée par le flow au-delà de 30 (complexité × couverture des tests liés) est une erreur nouvelle ; `non` : ni commande `crap`, ni flags de couverture |
 | `cache` | oui | brief du cache projet au lancement, extrait de fiche dans le prompt de chaque agent et outil `cache` proposé ; `non` : ni brief, ni extrait, ni outil, la commande `cache` reste et les flows comptent dans la mesure « sans cache » |
+| `web` | `extension` | preuve web du vérificateur (v3.0) : `extension` démarre le serveur de dev du projet après confirmation et navigue avec Claude in Chrome ; `devtools` déclare en plus le MCP Chrome DevTools en repli ; `off` : aucune preuve web |
 | `agents` | oui | catalogue des agents installés (projet, dossier personnel, plugins activés) proposé à l'orchestrateur ; un sous-agent du plan peut en prendre le type, avec son modèle et son effort ; `non` : rien n'est lu ni proposé, `general-purpose` comme avant |
 
 Sur l'app desktop, `/revo-flow` n'apparaît pas toujours dans le menu `/` : tape la commande en entier, elle fonctionne.
@@ -227,14 +244,15 @@ revo-flow/
 │   │   ├── graph.ts       graphe du cache, module pur
 │   │   └── store.ts       disque et git du cache
 │   └── verif/             le flow vérifié : détection, portée, lecture des sorties, base, rapport, exécution, garde-fous
-│       └── crap.ts        score CRAP : fonctions et complexité, lecture de la couverture, règle du scout
+│       ├── crap.ts        score CRAP : fonctions et complexité, lecture de la couverture, règle du scout
+│       └── web.ts         preuve web : détection du serveur de dev, URL, port, filtre des outils navigateur, captures, consigne du vérificateur
 ├── tests/                 lancés par claude plugin test .
 │   ├── flow.test.ts
 │   ├── doctor.test.ts
 │   ├── rapport.test.ts
 │   ├── agents/            catalogue.test.ts
 │   ├── cache/             graph.test.ts, store.test.ts
-│   ├── verif/             coeur.test.ts, garde.test.ts, crap.test.ts
+│   ├── verif/             coeur.test.ts, garde.test.ts, crap.test.ts, web.test.ts, web-flow.test.ts
 │   ├── ui/                verif.test.ts
 │   └── helpers/os.ts      les deux machines simulées (Windows, macOS)
 ├── types/                 contrats : état du mod (index.d.ts), graphe du cache (cache.d.ts), vérification (verif.d.ts), agents installés (agents.d.ts)

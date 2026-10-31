@@ -223,10 +223,35 @@ export type VerifEtatCommande = {
 }
 /** Un critère d'acceptation du plan (lot 2) : C1 à C8, vérifiable. */
 export type Critere = { id: string; texte: string }
-export type CritereVerdict = { id: string; verdict: 'ok' | 'ko' | 'non-verifiable'; preuve: string }
+export type CritereVerdict = {
+  id: string
+  verdict: 'ok' | 'ko' | 'non-verifiable'
+  preuve: string
+  /** Le verdict s'appuie sur la preuve web (navigateur). */
+  web?: boolean
+}
 export type Triche = { motif: string; fichier: string; extrait?: string; bloquant: boolean }
 /** Un fichier de test gelé à la fin du testeur : chemin relatif à la racine, hash git, auteur (clé de l'agent). */
 export type TestGele = { p: string; h: string; par: string }
+// Lot 3 : preuve à l'exécution web (docs/rd-v3/README.md §3)
+/** Le serveur de dev d'un projet web (hooks/verif/web.ts, detectDevServer) : argv sans shell, port attendu, d'où il vient (« script dev », « script start »). */
+export type WebServeur = { argv: string[]; port?: number; origine: string }
+/** L'état de la preuve web d'un flow. */
+export type WebEtat = 'non-demande' | 'question' | 'demarrage' | 'pret' | 'refuse' | 'erreur' | 'arrete'
+/** La preuve web telle que le panneau, le rapport et le journal la voient. */
+export type WebView = {
+  etat: WebEtat
+  /** « npm run dev », telle qu'un humain la tape. */
+  commande?: string
+  /** L'origine du serveur accordée au vérificateur : « http://localhost:3000 ». */
+  url?: string
+  /** Un serveur déjà à l'écoute, réutilisé sur accord : revo-flow ne l'arrête pas. */
+  existant?: boolean
+  /** Chemins absolus des captures écrites, dans l'ordre (capture-1.png.txt, ou capture-1.png quand le décodage a marché). */
+  captures: string[]
+  /** La raison d'un refus ou d'une erreur, en une phrase. */
+  note?: string
+}
 /** Le champ verif du journal (graphe et store). */
 export type VerifJournal = {
   etat: 'verifie' | 'non-verifie' | 'observe' | 'off' | 'erreur'
@@ -242,6 +267,8 @@ export type VerifJournal = {
   criteres?: { total: number; ok: number }
   /** Score CRAP à la dernière porte : fonctions au-dessus du seuil (fonctions = nouvelles + preexistantes), touchées par le flow (nouvelles) ou non (preexistantes). */
   crap?: { fonctions: number; nouvelles: number; preexistantes: number }
+  /** La preuve web (v3) : son état, les captures écrites, les verdicts marqués web (web: true) et ceux parmi eux qui sont ko. */
+  web?: { etat: WebEtat; captures: number; verdicts: number; ko: number }
 }
 /** Ce que le panneau et la bande montrent (atom `verif` de register.tsx). */
 export type VerifView = {
@@ -260,6 +287,8 @@ export type VerifView = {
   enAttente?: string
   /** Chemin du .txt de la dernière sortie complète (bouton Détail). */
   detail?: string
+  /** La preuve web du flow (v3). */
+  web?: WebView
 }
 
 /**

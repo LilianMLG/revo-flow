@@ -1,8 +1,8 @@
 {
   "name": "revo-flow",
-  "version": "2.3.0",
+  "version": "3.0.0",
   "license": "MIT",
-  "description": "/revo-flow <demande> : l'orchestrateur lit les specs, fait un plan, répartit les tâches entre des sous-agents (modèle et effort choisis pour chacun) et affiche une barre de progression par agent dans le panneau latéral ; un cache par projet (graphe des fichiers et fiches de features apprises en fin de flow) lui évite de relire le code : /revo-flow cache. Un agent peut en attendre un autre (relancé quand il a fini) et reçoit l'extrait de fiche qui le concerne, qu'il vérifie et rafraîchit. Un flow vérifié : revo-flow apprend les commandes de vérification du projet (lint, typage, tests ciblés), les lance lui-même en fin de flow et refuse de le déclarer terminé tant qu'elles sont rouges (erreurs nouvelles seulement, base de référence prise pendant la planification) ; critères d'acceptation, vérificateur indépendant et tests gelés en option. Le score CRAP (complexité × couverture des tests liés) fait respecter la règle du scout : une fonction modifiée par le flow au-delà de 30 bloque la porte, une fonction ancienne qu'il ne touche pas jamais. Les agents installés sur votre Claude Code (projet, dossier personnel, plugins activés) sont proposés à l'orchestrateur : un sous-agent peut en prendre le type, avec son modèle et son effort. /revo-flow doctor montre ce que le mod a détecté sur le projet (stack, commandes de vérification, base de référence, cache, agents installés) et ce qu'il y fera ; un flow interrompu par un redémarrage peut être repris ou abandonné ; chaque flow laisse un rapport en markdown (plan, fichiers, verdict de la porte, critères, CRAP, coût).",
+  "description": "/revo-flow <demande> : l'orchestrateur lit les specs, fait un plan, répartit les tâches entre des sous-agents (modèle et effort choisis pour chacun) et affiche une barre de progression par agent dans le panneau latéral ; un cache par projet (graphe des fichiers et fiches de features apprises en fin de flow) lui évite de relire le code : /revo-flow cache. Un agent peut en attendre un autre (relancé quand il a fini) et reçoit l'extrait de fiche qui le concerne, qu'il vérifie et rafraîchit. Un flow vérifié : revo-flow apprend les commandes de vérification du projet (lint, typage, tests ciblés), les lance lui-même en fin de flow et refuse de le déclarer terminé tant qu'elles sont rouges (erreurs nouvelles seulement, base de référence prise pendant la planification) ; critères d'acceptation, vérificateur indépendant et tests gelés en option. Le score CRAP (complexité × couverture des tests liés) fait respecter la règle du scout : une fonction modifiée par le flow au-delà de 30 bloque la porte, une fonction ancienne qu'il ne touche pas jamais. Les agents installés sur votre Claude Code (projet, dossier personnel, plugins activés) sont proposés à l'orchestrateur : un sous-agent peut en prendre le type, avec son modèle et son effort. /revo-flow doctor montre ce que le mod a détecté sur le projet (stack, commandes de vérification, base de référence, cache, agents installés) et ce qu'il y fera ; un flow interrompu par un redémarrage peut être repris ou abandonné ; chaque flow laisse un rapport en markdown (plan, fichiers, verdict de la porte, critères, CRAP, coût). Preuve web : sur un critère observable, le vérificateur demande le serveur de dev, revo-flow le démarre sur votre accord et lui donne l'URL ; il navigue (console, réseau, capture par critère), les captures vont dans le rapport, le serveur est arrêté en fin de flow.",
   "author": {
     "name": "Lilian Malinge"
   },
@@ -59,6 +59,17 @@
       "title": "Agents installés",
       "description": "Au lancement de /revo-flow, les agents installés sur votre Claude Code (projet, dossier personnel, plugins activés) sont proposés à l'orchestrateur ; un sous-agent du plan peut prendre le type de l'un d'eux quand son rôle correspond, avec le modèle et l'effort de sa définition. Désactivé : rien n'est lu ni proposé, general-purpose comme avant.",
       "default": true
+    },
+    "web": {
+      "type": "string",
+      "title": "Preuve web",
+      "description": "extension : pendant un flow, le vérificateur peut demander le serveur de dev du projet (npm run dev…) ; revo-flow vous demande avant de le démarrer, lui donne l'URL, et il navigue avec l'extension Claude in Chrome (console, réseau, captures) ; les captures sont rangées avec les sorties du flow et le serveur est arrêté à la fin. devtools : même chose, avec en plus le serveur MCP Chrome DevTools (npx chrome-devtools-mcp) déclaré pour le vérificateur, quand l'extension n'est pas là. off : aucune preuve web.",
+      "default": "extension",
+      "options": [
+        "extension",
+        "devtools",
+        "off"
+      ]
     }
   }
 }
