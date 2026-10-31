@@ -97,7 +97,9 @@ function world(on: On, os: Os = WINDOWS) {
     return out('feat/promo\n')
   })
   on('fs.stat', () => ({ value: { realPath: rootOf(os), kind: 'directory' } }) as never)
-  on('fs.list', () => ({ value: [] }) as never)
+  // Les dossiers listés (fs.list), par clé diskKey : vides sauf ceux que le test remplit (agents installés).
+  const lists: Record<string, { name: string; kind: string }[]> = {}
+  on('fs.list', (_$, e) => ({ value: lists[diskKey(e.path)] ?? [] }) as never)
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.usage', () => ({ value: { rateLimits: [], context: { window: 200000 } } }) as never)
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
@@ -199,8 +201,11 @@ function world(on: On, os: Os = WINDOWS) {
   const status: Record<string, string> = {}
   on('agent.list', () => ({ value: Object.entries(status).map(([id, st]) => ({ id, description: id, type: 'general-purpose', status: st })) }) as never)
   const prompts: string[] = []
+  // Le type et le modèle de chaque lancement, tels que revo-flow les transmet.
+  const spawned: { description: string; subagentType?: string | undefined; model?: string | undefined }[] = []
   on('agent.spawn', (_$, e) => {
     prompts.push(e.prompt)
+    spawned.push({ description: e.description, subagentType: e.subagentType, model: e.model })
     const agentId = `a-${e.description.split(' ')[0]!.toLowerCase()}`
     status[agentId] = 'running'
     return { model: e.model ?? 'inherit', agentId } as never
@@ -216,6 +221,8 @@ function world(on: On, os: Os = WINDOWS) {
     sent,
     opened,
     prompts,
+    spawned,
+    lists,
     status,
     ctl,
     asked,
@@ -1847,4 +1854,131 @@ test('historique : la colonne vérif (✓, ✗ accepté, observé, —)', () => 
   expect(h).toMatch(/Flow 4 .* · vérif —/)
   expect(verifMark({ ...base, etat: 'erreur' })).toBe('✗ erreur')
   expect(verifMark({ ...base, etat: 'non-verifie' })).toBe('✗')
+})
+
+// ── Les agents installés (catalogue) ─────────────────────────────────────
+
+/** Un agent installé dans le projet : `.claude/agents/<nom>.md`, listé et lisible sur le disque en mémoire. */
+function installAgent(w: ReturnType<typeof world>, nom: string, front: string, os: Os = WINDOWS) {
+  const dir = native(os, 'Documents', 'Front', 'ui-vel', '.claude', 'agents')
+  w.lists[diskKey(dir)] = [...(w.lists[diskKey(dir)] ?? []), { name: `${nom}.md`, kind: 'file' }]
+  w.disk[diskKey(`${dir}${os.sep}${nom}.md`)] = `---\nname: ${nom}\n${front}\n---\nTu relis le code.\n`
+}
+
+test('leadBrief : avec des agents installés, l’étape Équipe propose leur type ; sans, le texte ne change pas', () => {
+  const avec = leadBrief(true, true, true, true)
+  expect(avec).toMatch(/type \(general-purpose par défaut, Explore pour de la lecture seule, ou le type d'un agent installé du catalogue ci-dessous/)
+  expect(avec).toMatch(/revo-flow lui laisse alors le modèle et l'effort de sa définition, donne quand même modele et effort pour l'estimation/)
+  expect(leadBrief(true, true, true, false)).toBe(LEAD_BRIEF)
+  expect(LEAD_BRIEF).not.toMatch(/catalogue|agent installé/)
+  expect(leadBrief(false, false, false)).not.toMatch(/catalogue/)
+})
+
+test('parsePlan : un type d’agent installé passe tel quel, « verifier » reste le vérificateur ; le type s’affiche hors general-purpose', () => {
+  const parsed = parsePlan({
+    titre: 'Types',
+    agents: [
+      { nom: 'Code', type: 'savvy-flow:savvy-medium', modele: 'sonnet', effort: 'medium', taches: ['Coder'] },
+      { nom: 'Juge', type: 'verifier', modele: 'sonnet', effort: 'medium', taches: ['Juger'] },
+      { nom: 'Juge 2', type: 'revo-flow:verifier', modele: 'sonnet', effort: 'medium', taches: ['Juger'] },
+      { nom: 'Front', modele: 'haiku', effort: 'low', taches: ['Coder'] },
+    ],
+  })
+  if (!('plan' in parsed)) throw new Error(parsed.error)
+  expect(parsed.plan.agents.map(a => a.subagentType)).toEqual(['savvy-flow:savvy-medium', 'revo-flow:verifier', 'revo-flow:verifier', 'general-purpose'])
+  const q = planQuestion(parsed.plan)
+  expect(q).toMatch(/• Code — Sonnet 5\.5, effort medium, 1 tâche, savvy-flow:savvy-medium\n/)
+  expect(q).toMatch(/• Juge — Sonnet 5\.5, effort medium, 1 tâche \(vérificateur\)\n/)
+  expect(q).toMatch(/• Front — Haiku 5\.5, effort low, 1 tâche\n/)
+  expect(planMarkdown(parsed.plan)).toMatch(/## 1\. Code\n\nSonnet 5\.5 · effort medium · savvy-flow:savvy-medium/)
+})
+
+test('agents installés : le catalogue est injecté au lancement, le plan prend leur type, le lancement garde leur modèle et leur effort', async ($, on) => {
+  const w = world(on)
+  const efforts: string[] = []
+  on('turn.step', async function* (_$, e) {
+    efforts.push(`${e.agentId ?? 'main'}:${e.model}:${e.effort}`)
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: STEP_USAGE } as never
+  })
+  installAgent(w, 'revue-front', 'description: Relit le code front (Vue, Nuxt)\nmodel: fable\neffort: high')
+  installAgent(w, 'doc-writer', 'description: Écrit la doc')
+  const started = await launch($, w)
+  const context = (started.context ?? []).join('\n')
+  expect(context).toMatch(/ou le type d'un agent installé du catalogue ci-dessous/)
+  expect(context).toMatch(/# Agents installés sur ce Claude Code[\s\S]*- `doc-writer` \(projet\) : Écrit la doc/)
+  expect(context).toMatch(/- `revue-front` \(projet ; fable, high\) : Relit le code front/)
+
+  // Un type ni de base ni du catalogue : refusé, avec les types connus.
+  const bad = await $.tool.call({
+    tool: 'mcp__revo-flow__plan',
+    titre: 'x',
+    agents: [{ nom: 'A', type: 'savvy-flow:inconnu', modele: 'sonnet', effort: 'low', taches: ['t'] }],
+  } as never)
+  expect(JSON.stringify(bad)).toMatch(/type « savvy-flow:inconnu » inconnu\. Types connus : general-purpose, Explore, Plan, claude-code-guide, revo-flow:verifier, doc-writer, revue-front/)
+
+  // La casse donnée par l'orchestrateur est remise à celle de la définition.
+  const plan = {
+    ...PLAN,
+    agents: [
+      { ...PLAN.agents[0]!, type: 'Revue-Front' },
+      { ...PLAN.agents[1]!, type: 'doc-writer' },
+    ],
+  }
+  const ok = await $.tool.call({ tool: 'mcp__revo-flow__plan', ...plan } as never)
+  expect(JSON.stringify(ok)).toMatch(/« Front panier » \(revue-front, Sonnet 5\.5\), « API promo » \(doc-writer, Opus 5\.5\)/)
+
+  // revue-front déclare son modèle : revo-flow n'en impose pas (celui de l'appel passe tel quel), type exact de la définition.
+  const front = await $.agent.spawn({
+    prompt: 'Mission de Front panier',
+    description: 'Front panier',
+    subagentType: 'general-purpose',
+    model: 'claude-fable-5',
+    provider: { kind: 'model' },
+  } as never)
+  // doc-writer ne déclare pas de modèle : celui du plan.
+  const api = await spawn($, 'API promo')
+  expect(w.spawned).toEqual([
+    { description: 'Front panier', subagentType: 'revue-front', model: 'claude-fable-5' },
+    { description: 'API promo', subagentType: 'doc-writer', model: 'claude-opus-5-5' },
+  ])
+  expect(front.model).toBe('claude-fable-5')
+  expect(api.model).toBe('claude-opus-5-5')
+
+  // L'effort déclaré par revue-front n'est pas remplacé par celui du plan ; doc-writer reçoit celui du plan.
+  for (const [agentId, model] of [
+    ['a-front', 'claude-fable-5'],
+    ['a-api', 'claude-opus-5-5'],
+  ] as const) {
+    for await (const _ of $.turn.step({ turnId: 't', index: 0, model, effort: 'low', messageCount: 1, agentId })) void _
+  }
+  expect(efforts).toEqual(['a-front:claude-fable-5:low', 'a-api:claude-opus-5-5:high'])
+
+  // Un modèle hors grille (fable) : ni prix ni plantage, le panneau l'affiche.
+  const pane = await drawn($, 'desktop', 'Pane')
+  expect(pane.alts).toMatch(/Front panier, Fable/)
+  expect(pane.alts).toMatch(/API promo, Opus 5\.5/)
+})
+
+test('agents installés désactivés : ni catalogue lu, ni consigne, type libre comme avant', { options: { agents: false } as never }, async ($, on) => {
+  const w = world(on)
+  installAgent(w, 'revue-front', 'model: sonnet')
+  const started = await launch($, w)
+  const context = (started.context ?? []).join('\n')
+  expect(context).not.toMatch(/catalogue|Agents installés/)
+  expect(context).toMatch(/type \(general-purpose par défaut, Explore pour de la lecture seule\), modèle/)
+  const ok = await $.tool.call({
+    tool: 'mcp__revo-flow__plan',
+    ...PLAN,
+    agents: [{ ...PLAN.agents[0]!, type: 'savvy-flow:savvy-medium' }],
+  } as never)
+  expect(JSON.stringify(ok)).toMatch(/« Front panier » \(savvy-flow:savvy-medium, Sonnet 5\.5\)/)
+  await spawn($, 'Front panier')
+  expect(w.spawned).toEqual([{ description: 'Front panier', subagentType: 'general-purpose', model: 'claude-sonnet-5-5' }])
+})
+
+test('sans agent installé : aucun bloc de catalogue, consigne inchangée', async ($, on) => {
+  const w = world(on)
+  const started = await launch($, w)
+  const context = (started.context ?? []).join('\n')
+  expect(context).not.toMatch(/catalogue|Agents installés/)
 })

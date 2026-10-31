@@ -6,6 +6,7 @@ import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, PluginOptions, Register, SessionContextUsage } from 'claude-code'
 
 import type { Activity, Context, Flow, FlowAgent, Lead } from '../types'
+import type { AgentDef, CatalogueIo } from '../types/agents'
 import type { AgentInfo, CacheHit, CacheStats, DiffEntry, Feature, FlowCache, Graph, LearnContext, LearnInput, PerimeEntry } from '../types/cache'
 import type {
   Critere,
@@ -54,6 +55,7 @@ import {
   servedSubset,
   tokensOf,
 } from './cache/graph'
+import { catalogue, catalogueBrief, trouveAgent } from './agents/catalogue'
 import {
   buildMechanical,
   deleteGraph,
@@ -177,7 +179,12 @@ const verifA = atom({ plugin: 'revo-flow', key: 'verif' } as const, null)
 const verifFlowA = atom({ plugin: 'revo-flow', key: 'verifFlow' } as const, null)
 
 /** Les options du plugin (userConfig), fixées pour ce chargement : un changement recharge le module. */
-const opts = { validerPlan: true, conflits: 'avertir' as 'avertir' | 'refuser', notifier: true, cache: true, verif: 'bloquer' as VerifMode, crap: true }
+const opts = { validerPlan: true, conflits: 'avertir' as 'avertir' | 'refuser', notifier: true, cache: true, verif: 'bloquer' as VerifMode, crap: true, agents: true }
+
+/** Les agents installés sur ce Claude Code (projet, dossier personnel, plugins), lus au lancement du flow ; vide sans l'option agents. */
+let agentsInstalles: AgentDef[] = []
+/** Les types que le plan accepte toujours, catalogue ou non : les natifs de Claude Code et le vérificateur. */
+const BASE_TYPES = ['general-purpose', 'Explore', 'Plan', 'claude-code-guide', VERIFIER_TYPE] as const
 
 /** Les agents prévus déjà attribués à un appel Agent : deux lancements en parallèle ne prennent jamais le même. */
 const claimed = new Set<string>()
@@ -311,7 +318,7 @@ async function registerTools($: $) {
             properties: {
               nom: { type: 'string', description: 'Nom court et unique, repris tel quel comme description de l’appel Agent' },
               role: { type: 'string' },
-              type: { type: 'string', description: 'Type de sous-agent : general-purpose (défaut), Explore…' },
+              type: { type: 'string', description: 'Type de sous-agent : general-purpose (défaut), Explore, revo-flow:verifier, ou le type d’un agent installé du catalogue' },
               modele: { type: 'string', enum: ['haiku', 'sonnet', 'opus'] },
               effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh'] },
               pourquoi: { type: 'string', description: 'Pourquoi ce modèle et cet effort, en une phrase' },
@@ -653,6 +660,58 @@ function ioOf($: $): Io {
     repo: () => $.session.repo(),
     root: () => $.session.root(),
   }
+}
+
+/**
+ * Le type et le modèle d'un agent prévu, à son lancement. Un vérificateur garde son type imposé ; un agent installé (type du
+ * catalogue) prend le type exact de sa définition et, si elle déclare un modèle, revo-flow n'en impose pas (le modèle de l'appel
+ * reste tel que reçu) ; les autres reçoivent le modèle du plan.
+ */
+function spawnType(a: FlowAgent): { subagentType?: string; model?: string } {
+  if (isVerifier(a)) return { subagentType: VERIFIER_TYPE, model: MODELS[a.model].id }
+  const def = trouveAgent(agentsInstalles, a.subagentType)
+  if (!def) return { model: MODELS[a.model].id }
+  return def.model ? { subagentType: def.type } : { subagentType: def.type, model: MODELS[a.model].id }
+}
+
+/** L'effort déclaré par la définition d'un agent installé : revo-flow ne le remplace pas par celui du plan. */
+const ownEffort = (a: FlowAgent) => !isVerifier(a) && !!trouveAgent(agentsInstalles, a.subagentType)?.effort
+
+/**
+ * Les types du plan, avec l'option agents : general-purpose, Explore, le vérificateur ou un agent du catalogue (mis à sa casse
+ * exacte) ; un autre type est refusé, avec la liste des types connus, pour que l'orchestrateur corrige. Sans l'option, libres.
+ */
+async function withKnownTypes($: $, plan: PlanInput): Promise<{ plan: PlanInput } | { error: string }> {
+  if (!opts.agents) return { plan }
+  // Le module a pu être rechargé depuis le lancement : le catalogue se relit.
+  if (agentsInstalles.length === 0) agentsInstalles = await loadAgents($).catch(() => [])
+  const base = (t: string) => BASE_TYPES.find(b => b.toLowerCase() === t.toLowerCase())
+  const agents: PlanInput['agents'] = []
+  for (const a of plan.agents) {
+    const type = base(a.subagentType) ?? trouveAgent(agentsInstalles, a.subagentType)?.type
+    if (!type) {
+      const known = [...BASE_TYPES, ...agentsInstalles.map(d => d.type)].join(', ')
+      return { error: `agent « ${a.name} » : type « ${a.subagentType} » inconnu. Types connus : ${known}.` }
+    }
+    agents.push({ ...a, subagentType: type })
+  }
+  return { plan: { ...plan, agents } }
+}
+
+/** Les accès du catalogue des agents installés : comme ioOf, agents/catalogue.ts ne reçoit jamais `$`. */
+function catalogueIoOf($: $): CatalogueIo {
+  const io = ioOf($)
+  return { read: io.fs.read, list: io.fs.list, exists: io.fs.exists, home: io.home }
+}
+
+/**
+ * Le catalogue des agents installés, relu à chaque flow (un agent ajouté entre deux flows est vu) ; option agents désactivée ou
+ * erreur : vide. La racine est celle de la session, sinon celle du dépôt.
+ */
+async function loadAgents($: $): Promise<AgentDef[]> {
+  if (!opts.agents) return []
+  const root = (await $.session.root().catch(() => undefined)) || (await $.session.repo().catch(() => null))?.root
+  return root ? catalogue(catalogueIoOf($), root).catch(() => []) : []
 }
 
 /** Le préfixe de description des sous-agents qui construisent des fiches : exemptés du plan, hors flow. */
@@ -2934,6 +2993,8 @@ function readOptions(o: PluginOptions) {
   opts.verif = o.verif === 'observer' || o.verif === 'off' ? o.verif : 'bloquer'
   // Le score CRAP (v2.1) dans la porte : actif par défaut ; il bloque selon le mode verif.
   opts.crap = o.crap !== false
+  // Les agents installés (v2.2) proposés à l'orchestrateur : actifs par défaut.
+  opts.agents = (o as { agents?: unknown }).agents !== false
 }
 
 // ── Les hooks ────────────────────────────────────────────────────────────
@@ -3063,12 +3124,20 @@ export const register: Register = (on, options) => {
     const brief = await startFlowCache($, String(now), args).catch(() => undefined)
     // Les commandes de vérification du projet (confirmées une fois), puis la base de référence en fond ; jamais bloquant.
     const verifNote = await startVerif($, String(now)).catch(() => undefined)
+    // Les agents installés (option agents) : leur bloc suit le rôle d'orchestrateur, qui les propose à l'étape « Équipe ».
+    agentsInstalles = await loadAgents($).catch(() => [])
+    const agentsNote = catalogueBrief(agentsInstalles)
     // Le rôle d'orchestrateur est une note cachée laissée au modèle par la commande ; la demande part ensuite
     // comme si l'utilisateur l'avait tapée. Sans /revo-flow, rien de tout cela n'est ajouté.
     $.clock.after(0, () => void $.prompt.submit({ text: args, asUser: true }).catch(() => undefined))
     return {
       text: `revo-flow : ${modelLabel(model)} lit la demande et les specs, puis prépare le plan et l’équipe d’agents…`,
-      context: [leadBrief(opts.cache, opts.verif !== 'off', opts.crap), ...(brief ? [brief] : []), ...(verifNote ? [verifNote] : [])],
+      context: [
+        leadBrief(opts.cache, opts.verif !== 'off', opts.crap, agentsInstalles.length > 0),
+        ...(agentsNote ? [agentsNote] : []),
+        ...(brief ? [brief] : []),
+        ...(verifNote ? [verifNote] : []),
+      ],
     }
   })
 
@@ -3170,8 +3239,9 @@ export const register: Register = (on, options) => {
   on('turn.step', async function* ($, e, next) {
     const flow = await read($, flowA)
     const a = flow && e.agentId ? flow.agents.find(x => x.agentId === e.agentId) : undefined
-    // Un modèle sans effort n'en reçoit pas : on ne fixe l'effort que là où la requête en porte un.
-    const step = a && e.effort !== undefined ? { ...e, effort: a.effort } : e
+    // Un modèle sans effort n'en reçoit pas : on ne fixe l'effort que là où la requête en porte un. Un agent installé qui déclare
+    // son effort garde le sien.
+    const step = a && e.effort !== undefined && !ownEffort(a) ? { ...e, effort: a.effort } : e
     const r = yield* next(step)
     try {
       const u = r.usage ?? undefined
@@ -3278,7 +3348,7 @@ export const register: Register = (on, options) => {
     const tester = isTester(a) ? `\n\n${TESTER_BRIEF}${criteres.length ? `\n\nCritères d'acceptation du plan :\n${criteres.map(c => `- ${c.id} : ${c.texte}`).join('\n')}` : ''}` : ''
     const verifier = isVerifier(a) ? await verifierBrief($).catch(() => undefined) : undefined
     const prompt = `${e.prompt}\n\n${agentBrief(a, await agentCacheMode($), others, isVerifOn, opts.crap)}${tester}${verifier ? `\n\n${verifier}` : ''}${extract ? `\n\n${extract.text}` : ''}`
-    const r = await next({ ...e, model: MODELS[a.model].id, prompt, ...(isVerifier(a) ? { subagentType: VERIFIER_TYPE } : {}) })
+    const r = await next({ ...e, prompt, ...spawnType(a) })
     if (r.deny !== undefined || !r.agentId) {
       claimed.delete(a.key)
       return r
@@ -3324,7 +3394,9 @@ export const register: Register = (on, options) => {
     if (flow.agents.some(a => a.agentId)) return { deny: 'revo-flow : le plan est déjà en cours d’exécution, il ne peut plus être remplacé.' }
     const parsed = parsePlan(e as unknown as Record<string, unknown>)
     if ('error' in parsed) return { deny: `Plan refusé : ${parsed.error}` }
-    const { plan } = parsed
+    const typed = await withKnownTypes($, parsed.plan)
+    if ('error' in typed) return { deny: `Plan refusé : ${typed.error}` }
+    const { plan } = typed
     claimed.clear()
     // Les critères d'acceptation (lot 2) : à la porte (vérificateur, testeur) et au panneau.
     if (gate && gate.flowId === flow.id) {

@@ -141,6 +141,17 @@ Depuis la v2.1, la porte juge aussi la **qualité des fonctions que le flow touc
 - **Option `crap`** (`/config`, oui par défaut) : `non` retire la commande `crap` et les flags de couverture, même des commandes déjà confirmées.
 - **Limites** : `dart test` pur n'est pas couvert (seul `flutter test` écrit un lcov) ; vitest demande `@vitest/coverage-v8` ou `@vitest/coverage-istanbul` (sans lui, un piège l'annonce à la confirmation et la commande `crap` n'est pas proposée) ; la couverture est celle des **tests liés** seulement, pas de toute la suite ; si les tests n'ont pas tourné ou n'ont écrit aucun rapport, la commande est sautée plutôt que de juger sans couverture ; la complexité est calculée par revo-flow (points de décision comptés dans le texte, sans compilateur) : approximative, mais stable d'un flow à l'autre, ce qui suffit à comparer.
 
+## Agents installés
+
+Depuis la v2.2, revo-flow découvre les agents déjà installés sur ton Claude Code et les propose à l'orchestrateur.
+
+- **Où il cherche** : `.claude/agents/*.md` du projet, `~/.claude/agents/*.md` et le dossier `agents/` des plugins listés dans `~/.claude/plugins/installed_plugins.json`. Les plugins désactivés dans `enabledPlugins` (`~/.claude/settings.json`) sont ignorés, ainsi que les agents `revo-flow:*`.
+- **Le catalogue** : injecté au lancement de `/revo-flow`, une ligne par agent (type, source, modèle et effort déclarés, description).
+- **Dans le plan** : un sous-agent peut recevoir le type d'un agent du catalogue quand son rôle correspond à ses tâches (un agent de code pour du code, de doc pour de la doc, de test pour des tests). revo-flow lui laisse alors le modèle et l'effort de sa définition ; le modèle du plan ne sert qu'à l'estimation. Sinon, `general-purpose` comme avant.
+- **Type inconnu** : un type absent du catalogue fait refuser le plan.
+- **Affichage** : le type apparaît dans le plan et dans `plan.md`.
+- **Option `agents`** (`/config`, oui par défaut) : `non` : rien n'est lu ni proposé, `general-purpose` comme avant.
+
 ## Options (`/config`)
 
 | Option | Défaut | Effet |
@@ -151,6 +162,7 @@ Depuis la v2.1, la porte juge aussi la **qualité des fonctions que le flow touc
 | `verif` | `bloquer` | vérification des flows : `bloquer` refuse la fin d'un flow tant qu'une erreur nouvelle subsiste (3 tentatives), `observer` vérifie et affiche sans bloquer, `off` ne vérifie pas |
 | `crap` | oui | score CRAP dans la porte : une fonction modifiée par le flow au-delà de 30 (complexité × couverture des tests liés) est une erreur nouvelle ; `non` : ni commande `crap`, ni flags de couverture |
 | `cache` | oui | brief du cache projet au lancement, extrait de fiche dans le prompt de chaque agent et outil `cache` proposé ; `non` : ni brief, ni extrait, ni outil, la commande `cache` reste et les flows comptent dans la mesure « sans cache » |
+| `agents` | oui | catalogue des agents installés (projet, dossier personnel, plugins activés) proposé à l'orchestrateur ; un sous-agent du plan peut en prendre le type, avec son modèle et son effort ; `non` : rien n'est lu ni proposé, `general-purpose` comme avant |
 
 Sur l'app desktop, `/revo-flow` n'apparaît pas toujours dans le menu `/` : tape la commande en entier, elle fonctionne.
 
@@ -178,6 +190,8 @@ revo-flow/
 │   ├── ui/
 │   │   ├── views.tsx      panneau et bande (terminal, desktop, mobile)
 │   │   └── art.ts         les dessins SVG
+│   ├── agents/
+│   │   └── catalogue.ts   découverte des agents installés, catalogue pour l'orchestrateur
 │   ├── cache/
 │   │   ├── graph.ts       graphe du cache, module pur
 │   │   └── store.ts       disque et git du cache
@@ -185,11 +199,12 @@ revo-flow/
 │       └── crap.ts        score CRAP : fonctions et complexité, lecture de la couverture, règle du scout
 ├── tests/                 lancés par claude plugin test .
 │   ├── flow.test.ts
+│   ├── agents/            catalogue.test.ts
 │   ├── cache/             graph.test.ts, store.test.ts
 │   ├── verif/             coeur.test.ts, garde.test.ts, crap.test.ts
 │   ├── ui/                verif.test.ts
 │   └── helpers/os.ts      les deux machines simulées (Windows, macOS)
-├── types/                 contrats : état du mod (index.d.ts), graphe du cache (cache.d.ts), vérification (verif.d.ts)
+├── types/                 contrats : état du mod (index.d.ts), graphe du cache (cache.d.ts), vérification (verif.d.ts), agents installés (agents.d.ts)
 ├── docs/rd-graphe-cache/  conception et R&D du cache
 ├── docs/rd-v2/            conception et R&D du flow vérifié
 └── tsconfig.json
