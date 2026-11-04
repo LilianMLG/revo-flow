@@ -7,6 +7,7 @@ import { detectCommands } from '../hooks/verif/detect'
 import { computeStats } from '../hooks/cache/graph'
 import type { AgentDef } from '../types/agents'
 import type { Graph } from '../types/cache'
+import type { MobileDispo } from '../hooks/verif/mobile'
 import type { WebDispo } from '../hooks/verif/web'
 import type { ProjetVerif, VerifCommande } from '../types/verif'
 import { OSES, diskKey, native, type Os } from './helpers/os'
@@ -144,6 +145,36 @@ describe('doctorText : projet reconnu', () => {
 describe('doctorText : la rubrique Web', () => {
   const web = (o: Partial<WebDispo> = {}): WebDispo => ({ option: 'extension', login: false, ...o })
   const serveur = (port?: number, argv = ['npm', 'run', 'dev']) => ({ argv, ...(port ? { port } : {}), origine: 'script dev' })
+
+  const mobile = (o: Partial<MobileDispo> = {}): MobileDispo => ({ option: 'appareil', ...o })
+  const FLUTTER = { framework: 'flutter' as const, plateformes: ['android' as const, 'ios' as const], origine: 'pubspec.yaml (flutter)' }
+
+  test('rubrique Mobile (v3.1) : elle remplace la rubrique Web sur une app mobile ; désactivée ; appareils vus ou aucun', () => {
+    const t = doctorText(
+      complet({
+        web: web({ serveur: serveur(3000) }),
+        mobile: mobile({
+          app: FLUTTER,
+          appareils: [
+            { id: '192.168.1.13:40481', nom: 'SM A515F', plateforme: 'android', type: 'physique', etat: 'connecte', sdk: 'Android 13 (API 33)', capture: true },
+            { id: 'Pixel_8', nom: 'Pixel 8', plateforme: 'android', type: 'emulateur', etat: 'eteint' },
+          ],
+        }),
+      }),
+    )
+    expect(find(t, 'Web')).toBeUndefined()
+    expect(find(t, 'Mobile')).toBe('Mobile       app Flutter (pubspec.yaml (flutter), android et ios) · preuve mobile au vérificateur sur votre accord, en direct sur l’appareil · outils : outil mobile de revo-flow (capture, arbre, journal, gestes)')
+    expect(t).toContain('appareils : SM A515F (téléphone branché, Android 13 (API 33)), Pixel 8 (émulateur, à démarrer)')
+    expect(doctorText(complet({ mobile: mobile({ app: FLUTTER, option: 'mcp' }) }))).toContain('aucun appareil vu : branchez un téléphone')
+    expect(doctorText(complet({ mobile: mobile({ app: FLUTTER, option: 'mcp' }) }))).toContain('et mobile-mcp (npx @mobilenext/mobile-mcp)')
+    expect(find(doctorText(complet({ mobile: mobile({ option: 'off', app: FLUTTER }) })), 'Mobile')).toBe('Mobile       preuve mobile désactivée (option mobile)')
+    // Un projet web : la rubrique Web reste, pas de rubrique Mobile.
+    const w = doctorText(complet({ web: web({ serveur: serveur(3000) }), mobile: mobile() }))
+    expect(find(w, 'Web')).toContain('npm run dev · port 3000')
+    expect(find(w, 'Mobile')).toBeUndefined()
+    // Ni l'un ni l'autre : la rubrique Mobile dit qu'aucune app n'est détectée seulement quand il n'y a pas d'entrée web.
+    expect(find(doctorText(complet({ mobile: mobile() })), 'Mobile')).toBe('Mobile       aucune app mobile détectée (ni pubspec.yaml Flutter, ni react-native ou expo) : pas de preuve mobile')
+  })
 
   test('sans l’entrée web, pas de rubrique', () => {
     expect(find(doctorText(complet()), 'Web')).toBeUndefined()

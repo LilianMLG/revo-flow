@@ -49,9 +49,13 @@ claude plugin update revo-flow@revo-flow
 3. **Validation.** The plan is shown in full (agents, roles, why each model, numbered tasks) and waits for **Launch** or **Cancel**, in the dialog or with the panel buttons. The same plan is written to `~/.claude/revo-flow/plans/<title>.md`. No agent starts before you accept.
 4. **Execution.** Each agent gets its own progress bar with "n/total" and its current task. An agent that depends on another one's work waits, and is resumed when that one finishes.
 5. **Verification gate.** When all agents are done, revo-flow runs the project's own lint, type check and related tests itself, with commands rather than a model. It compares against a baseline taken during planning, so only **new** errors count. If the gate is green, the flow ends "verified". If it is red, the orchestrator receives the new errors and must fix them: up to 3 attempts, then you decide (finish unverified, one more attempt, or see the detail).
-6. **End.** A notification gives duration, cost and number of files, and the flow is added to the history (`/revo-flow historique`). A markdown report is written to `~/.claude/revo-flow/rapports/<title>.md`; it links the web proof screenshots when there are any.
+6. **End.** A notification gives duration, cost and number of files, and the flow is added to the history (`/revo-flow historique`). A markdown report is written to `~/.claude/revo-flow/rapports/<title>.md`; it links the web or mobile proof screenshots when there are any.
 
-**Web proof (optional, v3.0).** For a flow with acceptance criteria, the verifier can ask to see the app running. After you confirm ("Start `npm run dev` for <project> (port 3000)?"; if the port is already taken, it offers the running server and kills nothing), it browses that one origin with the Claude in Chrome extension and reports the URL visited, what it saw, console errors, 4xx/5xx responses and a screenshot. It catches blank pages, hydration errors and failing API calls that lint, types and unit tests never see. Servers started by revo-flow are always stopped at the end. No test account is ever stored: set `REVO_WEB_LOGIN` for your dev server if the app needs a login. Nuxt, Next, Vite, Astro and Angular are recognized; no mobile.
+**Runtime proof, chosen per project.** For a flow with acceptance criteria, the verifier can ask to see the app running. revo-flow picks the proof that fits the project: a Flutter, Expo or React Native app gets the mobile proof; a project with a dev server gets the web proof.
+
+**Web proof (optional, v3.0).** For a flow with acceptance criteria, the verifier can ask to see the app running. After you confirm ("Start `npm run dev` for <project> (port 3000)?"; if the port is already taken, it offers the running server and kills nothing), it browses that one origin with the Claude in Chrome extension and reports the URL visited, what it saw, console errors, 4xx/5xx responses and a screenshot. It catches blank pages, hydration errors and failing API calls that lint, types and unit tests never see. Servers started by revo-flow are always stopped at the end. No test account is ever stored: set `REVO_WEB_LOGIN` for your dev server if the app needs a login. Nuxt, Next, Vite, Astro and Angular are recognized.
+
+**Mobile proof (optional, v3.1).** On a Flutter, Expo or React Native project, the verifier asks for the app on a device. revo-flow picks the device (a plugged-in phone over adb or Xcode first, then a running Android emulator or iOS simulator, then one to start, with its window open so you can watch), asks you ("Launch the Flutter app of <project> on SM A515F (plugged-in phone)?"), launches the app (`flutter run -d`, `expo run:android --device`, `react-native run-android --deviceId`) and tells the verifier when it is on screen. The verifier then observes it live with the `mobile` tool: screenshot (written as `capture-n.png`, read back with Read), view tree with the center of each element (Android), app log (Flutter exceptions, render overflows, logcat errors), tap, swipe, type, back key. Every action shows in the panel while it happens, and the verifier is refused if launched in the background. The app, and the emulator if revo-flow started it, are stopped at the end; a phone or an already running emulator is never touched. On iOS only screenshots (simulator) and the log are available.
 
 A red flow means the gate still finds new lint, type or test errors, or a function changed by the flow with a CRAP score above 30. It never means the agents' own claims were doubted: "I ran the tests and they pass" does not count, only what revo-flow ran. Errors that were already there before the flow are shown separately and do not block.
 
@@ -66,7 +70,7 @@ Run it first on a new project. It is read-only: it shows what revo-flow detected
 - the baseline of existing errors;
 - the project cache (file graph, feature sheets);
 - the installed agents it can offer to the orchestrator;
-- the `Web` line: dev server command and port for the web proof, where they come from, which browser tools are available, and whether `REVO_WEB_LOGIN` is set;
+- the `Web` line: dev server command and port for the web proof, where they come from, which browser tools are available, and whether `REVO_WEB_LOGIN` is set; on a mobile app, a `Mobile` line instead: framework, platforms and the devices seen (plugged-in phone, emulator, simulator);
 - known pitfalls for this project.
 
 ## Commands
@@ -98,6 +102,7 @@ Set in `/config`.
 | `crap` | yes | CRAP score in the gate: a function changed by the flow above 30 is a new error |
 | `cache` | yes | inject the project cache brief and feature excerpts, and offer the `cache` tool |
 | `web` | `extension` | web proof by the verifier: `extension` starts the dev server (after confirmation) and browses with Claude in Chrome, `devtools` also declares the Chrome DevTools MCP as a fallback, `off` disables it |
+| `mobile` | `appareil` | mobile proof by the verifier (v3.1): `appareil` picks the device (plugged-in phone, else an emulator or simulator started with its window), launches the app after confirmation and observes it live with the `mobile` tool, `mcp` also declares the mobile-mcp server, `off` disables it |
 | `agents` | yes | offer your installed agents (project, personal, enabled plugins) to the orchestrator |
 
 ## More

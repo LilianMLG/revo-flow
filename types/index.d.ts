@@ -229,6 +229,8 @@ export type CritereVerdict = {
   preuve: string
   /** Le verdict s'appuie sur la preuve web (navigateur). */
   web?: boolean
+  /** Le verdict s'appuie sur la preuve mobile (appareil). */
+  mobile?: boolean
 }
 export type Triche = { motif: string; fichier: string; extrait?: string; bloquant: boolean }
 /** Un fichier de test gelé à la fin du testeur : chemin relatif à la racine, hash git, auteur (clé de l'agent). */
@@ -252,6 +254,37 @@ export type WebView = {
   /** La raison d'un refus ou d'une erreur, en une phrase. */
   note?: string
 }
+// Lot 4 : preuve à l'exécution mobile (docs/rd-v3/README.md §3 bis)
+/** L'app mobile d'un projet (hooks/verif/mobile.ts, detectMobileApp) : framework, plateformes présentes, d'où elle vient (« pubspec.yaml (flutter) »). */
+export type MobileApp = { framework: 'flutter' | 'react-native' | 'expo'; plateformes: ('android' | 'ios')[]; origine: string }
+/** Un appareil du poste : téléphone branché, émulateur Android ou simulateur iOS ; connecté ou à démarrer ; capture = sait faire une capture d'écran. */
+export type Appareil = {
+  id: string
+  nom: string
+  plateforme: 'android' | 'ios'
+  type: 'physique' | 'emulateur' | 'simulateur'
+  etat: 'connecte' | 'eteint'
+  sdk?: string
+  capture?: boolean
+}
+/** L'état de la preuve mobile d'un flow : demarrage = l'émulateur s'allume, installation = l'app se construit et s'installe. */
+export type MobileEtat = 'non-demande' | 'question' | 'demarrage' | 'installation' | 'pret' | 'refuse' | 'erreur' | 'arrete'
+/** La preuve mobile telle que le panneau, le rapport et le journal la voient. */
+export type MobileView = {
+  etat: MobileEtat
+  /** « Flutter », « Expo », « React Native ». */
+  framework?: string
+  /** L'appareil accordé : « SM A515F (téléphone branché) ». */
+  appareil?: string
+  /** « flutter run -d emulator-5554 », telle qu'un humain la tape. */
+  commande?: string
+  /** L'émulateur ou le simulateur a été démarré par revo-flow (il sera éteint en fin de flow). */
+  emulateurLance?: boolean
+  /** Chemins absolus des captures écrites, dans l'ordre (capture-1.png). */
+  captures: string[]
+  /** La raison d'un refus ou d'une erreur, en une phrase. */
+  note?: string
+}
 /** Le champ verif du journal (graphe et store). */
 export type VerifJournal = {
   etat: 'verifie' | 'non-verifie' | 'observe' | 'off' | 'erreur'
@@ -269,6 +302,8 @@ export type VerifJournal = {
   crap?: { fonctions: number; nouvelles: number; preexistantes: number }
   /** La preuve web (v3) : son état, les captures écrites, les verdicts marqués web (web: true) et ceux parmi eux qui sont ko. */
   web?: { etat: WebEtat; captures: number; verdicts: number; ko: number }
+  /** La preuve mobile (v3.1) : son état, les captures écrites, les verdicts marqués mobile et ceux parmi eux qui sont ko. */
+  mobile?: { etat: MobileEtat; captures: number; verdicts: number; ko: number }
 }
 /** Ce que le panneau et la bande montrent (atom `verif` de register.tsx). */
 export type VerifView = {
@@ -289,6 +324,8 @@ export type VerifView = {
   detail?: string
   /** La preuve web du flow (v3). */
   web?: WebView
+  /** La preuve mobile du flow (v3.1). */
+  mobile?: MobileView
 }
 
 /**

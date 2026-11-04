@@ -26,6 +26,10 @@ import type {
   WebEtat,
   WebServeur,
   WebView,
+  Appareil,
+  MobileApp,
+  MobileEtat,
+  MobileView,
 } from '../types/verif'
 import {
   agentExtract,
@@ -175,6 +179,38 @@ import {
   webToolDenial,
   type WebDispo,
 } from './verif/web'
+import {
+  EMULATEUR_ATTENTE_MS,
+  EMULATEUR_SONDE_MS,
+  MOBILE_ATTENTE_MS,
+  MOBILE_MANIFESTES,
+  MOBILE_MCP,
+  MOBILE_SONDES,
+  appFailedFromOutput,
+  appReadyFromOutput,
+  bootedDevice,
+  captureCommands,
+  commandeMobile,
+  condenseUiTree,
+  countIssues,
+  detectMobileApp,
+  deviceLabel,
+  frameworkLabel,
+  gestureCommand,
+  isMobileMcpTool,
+  launchCommands,
+  listCommands,
+  logCommand,
+  mergeDevices,
+  mobileToolDenial,
+  rankDevices,
+  runCommand,
+  shutdownCommand,
+  tailLines,
+  treeCommands,
+  verifierMobileTask,
+  type MobileDispo,
+} from './verif/mobile'
 import { SNAPSHOT_PREFIX, isBeforeLaunch, isUnfinished, readSnapshot, resumeQuestion, resumedFlow, snapshotKey, snapshotOf, type FlowSnapshot } from './reprise'
 
 type $ = EngineInterface
@@ -210,7 +246,11 @@ const opts = {
   crap: true,
   agents: true,
   web: 'extension' as 'extension' | 'devtools' | 'off',
+  mobile: 'appareil' as 'appareil' | 'mcp' | 'off',
 }
+
+/** L'outil mobile de la preuve mobile (v3.1) : capture, arbre, journal, gestes, réservé au vérificateur. */
+const MOBILE_TOOL = `mcp__${PLUGIN}__mobile`
 
 /** Les agents installés sur ce Claude Code (projet, dossier personnel, plugins), lus au lancement du flow ; vide sans l'option agents. */
 let agentsInstalles: AgentDef[] = []
@@ -435,6 +475,32 @@ async function registerTools($: $) {
     isDeferred: false,
   })
   if (opts.verif !== 'off') await registerVerifTool($)
+  if (opts.verif !== 'off' && opts.mobile !== 'off') await registerMobileTool($)
+}
+
+/** L'outil mobile (v3.1) : ce que le vérificateur fait sur l'appareil pendant la preuve mobile, sous les yeux de l'utilisateur. */
+async function registerMobileTool($: $) {
+  await $.tool.register({
+    name: 'mobile',
+    description:
+      'revo-flow : la preuve mobile (vérificateur seulement, après mcp__revo-flow__verif action mobile). Actions : capture (écrit capture-n.png dans les sorties du flow : lis-la avec Read pour la voir) ; arbre (les vues à l’écran, texte, id et centre de chacune ; Android) ; journal (exceptions, débordements et erreurs de l’app, erreurs logcat) ; toucher (x, y) ; glisser (x1, y1, x2, y2) ; texte (texte saisi dans le champ qui a le focus) ; touche (retour, accueil, entree). L’utilisateur regarde l’appareil en direct : une action à la fois, puis une capture.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['capture', 'arbre', 'journal', 'toucher', 'glisser', 'texte', 'touche'] },
+        x: { type: 'number', description: 'toucher : abscisse en pixels de l’écran (centre donné par arbre)' },
+        y: { type: 'number', description: 'toucher : ordonnée en pixels' },
+        x1: { type: 'number', description: 'glisser : départ' },
+        y1: { type: 'number' },
+        x2: { type: 'number', description: 'glisser : arrivée' },
+        y2: { type: 'number' },
+        texte: { type: 'string', description: 'texte : ce qui est saisi' },
+        touche: { type: 'string', enum: ['retour', 'accueil', 'entree'], description: 'touche : la touche pressée' },
+      },
+      required: ['action'],
+    },
+    isDeferred: false,
+  })
 }
 
 /** L'outil verif (v2) : la vérification du flow, pour les agents (lancer, resultat) et l'orchestrateur (commandes, exception, degeler). */
@@ -442,11 +508,11 @@ async function registerVerifTool($: $) {
   await $.tool.register({
     name: 'verif',
     description:
-      "revo-flow : la vérification du flow (lint, typage, tests liés ; comparée à la base de référence, seules les erreurs nouvelles comptent). Actions : lancer (sur tes fichiers modifiés, ou ceux de « fichiers » → les erreurs nouvelles de tes fichiers ; pour l'orchestrateur, tout le flow) ; resultat (le dernier rapport de la porte de fin) ; commandes (orchestrateur : commandes = la liste complète corrigée, ou commande + exclus = motifs de tests à exclure ; toujours reposée à l'utilisateur) ; exception (orchestrateur, motif → l'utilisateur décide de terminer non vérifié ou non) ; degeler (orchestrateur, fichiers + motif → l'utilisateur décide de dégeler des tests gelés) ; web : (vérificateur) demande le serveur de dev pour la preuve web → l’URL à utiliser, ou pourquoi non.",
+      "revo-flow : la vérification du flow (lint, typage, tests liés ; comparée à la base de référence, seules les erreurs nouvelles comptent). Actions : lancer (sur tes fichiers modifiés, ou ceux de « fichiers » → les erreurs nouvelles de tes fichiers ; pour l'orchestrateur, tout le flow) ; resultat (le dernier rapport de la porte de fin) ; commandes (orchestrateur : commandes = la liste complète corrigée, ou commande + exclus = motifs de tests à exclure ; toujours reposée à l'utilisateur) ; exception (orchestrateur, motif → l'utilisateur décide de terminer non vérifié ou non) ; degeler (orchestrateur, fichiers + motif → l'utilisateur décide de dégeler des tests gelés) ; web : (vérificateur, projet web) demande le serveur de dev pour la preuve web → l’URL à utiliser, ou pourquoi non ; mobile : (vérificateur, app Flutter, React Native ou Expo) demande l’app sur un appareil (téléphone branché, émulateur ou simulateur) → quand elle est à l’écran, ou pourquoi non. Ta tâche dit laquelle des deux vaut pour ce projet.",
     inputSchema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['lancer', 'resultat', 'commandes', 'exception', 'degeler', 'web'] },
+        action: { type: 'string', enum: ['lancer', 'resultat', 'commandes', 'exception', 'degeler', 'web', 'mobile'] },
         fichiers: { type: 'array', items: { type: 'string' }, description: 'lancer : tes fichiers (défaut : ceux que tu as modifiés) ; degeler : les tests gelés à dégeler' },
         commandes: {
           type: 'array',
@@ -498,11 +564,15 @@ async function registerVerifier($: $) {
     model: 'sonnet' as const,
     effort: 'medium' as const,
   }
-  // Option web devtools : le serveur MCP Chrome DevTools (navigateur isolé) est déclaré pour le vérificateur seul (AgentSpec.mcpServers,
-  // cc:512) ; refusé par cette version de Claude Code, le vérificateur est enregistré sans lui (l'extension reste possible).
-  if (opts.web === 'devtools') {
+  // Option web devtools : le serveur MCP Chrome DevTools (navigateur isolé) ; option mobile mcp : le serveur mobile-mcp. Déclarés pour le
+  // vérificateur seul (AgentSpec.mcpServers, cc:512) ; refusés par cette version de Claude Code, le vérificateur est enregistré sans eux
+  // (l'extension et l'outil mobile de revo-flow restent possibles).
+  const mcpServers: Record<string, { command: string; args: string[] }> = {}
+  if (opts.web === 'devtools') mcpServers[DEVTOOLS_MCP] = { command: 'npx', args: ['-y', 'chrome-devtools-mcp@latest', '--isolated'] }
+  if (opts.mobile === 'mcp') mcpServers[MOBILE_MCP] = { command: 'npx', args: ['-y', '@mobilenext/mobile-mcp@latest'] }
+  if (Object.keys(mcpServers).length) {
     try {
-      await $.agent.register({ ...spec, mcpServers: { [DEVTOOLS_MCP]: { command: 'npx', args: ['-y', 'chrome-devtools-mcp@latest', '--isolated'] } } } as never)
+      await $.agent.register({ ...spec, mcpServers } as never)
       return
     } catch {
       // repli ci-dessous
@@ -665,7 +735,7 @@ async function finishFlow($: $) {
   const files = (await read($, entries)).length
   // Le serveur de dev de la preuve web s'arrête avec le flow, avant le journal (verifJournal) et le rapport : ils le disent arrêté,
   // captures comprises.
-  await stopWeb($, gate?.flowId === flow.id ? gate : undefined)
+  await stopProofs($, gate?.flowId === flow.id ? gate : undefined)
   const g = gate && gate.flowId === flow.id && !flow.isStopped && gate.mode !== 'off' ? gate : undefined
   // La porte de l'état final : déjà prête (porte bloquante passée au Stop), ou lancée maintenant en fond.
   const pending = g ? ensureGate($).catch(() => undefined) : undefined
@@ -1478,6 +1548,30 @@ type Gate = {
   verdicts?: CritereVerdict[]
   /** La preuve web (v3) : le serveur de dev demandé par le vérificateur ; absente tant qu'il ne l'a pas demandé. */
   web?: GateWeb
+  /** La preuve mobile (v3.1) : l'app lancée sur un appareil à la demande du vérificateur ; absente tant qu'il ne l'a pas demandée. */
+  mobile?: GateMobile
+}
+/**
+ * L'app de la preuve mobile : app détectée, appareil accordé, etat (demarrage = émulateur, installation = build et pose, pret = à l'écran) ;
+ * sortie = la fin de ce que `flutter run` (ou expo, react-native) a écrit (8 000 caractères) ; attente et enCours comme GateWeb ; stop
+ * arrête l'app lancée par revo-flow ; emulateur = l'émulateur ou simulateur que revo-flow a démarré (éteint en fin de flow), stopEmulateur
+ * ferme son processus quand il en a un ; vmService = l'URL du VM Service Dart annoncée ; prises = numéros de capture déjà donnés.
+ */
+type GateMobile = {
+  app?: MobileApp
+  appareil?: Appareil
+  etat: MobileEtat
+  captures: string[]
+  sortie: string
+  note?: string
+  commande?: string
+  attente?: Promise<void>
+  enCours?: boolean
+  stop?: () => Promise<void>
+  emulateur?: Appareil
+  stopEmulateur?: () => Promise<void>
+  vmService?: string
+  prises?: number
 }
 /**
  * Le serveur de dev de la preuve web : etat et url suivent son démarrage ; existant = déjà en marche (revo-flow ne l'arrête pas) ;
@@ -1731,8 +1825,8 @@ function adjustNote(nom: string, commandes: VerifCommande[], note?: string): str
  * référence part ensuite en fond. Rend la note pour l'orchestrateur quand l'utilisateur veut ajuster. Jamais d'exception.
  */
 async function startVerif($: $, flowId: string): Promise<string | undefined> {
-  // La porte du flow remplacé : son serveur de dev ne lui survit pas.
-  await stopWeb($, gate)
+  // La porte du flow remplacé : son serveur de dev et son app mobile ne lui survivent pas.
+  await stopProofs($, gate)
   gate = undefined
   verifStatus = undefined
   await update($, verifA, () => null)
@@ -2228,7 +2322,16 @@ function verifJournal(g: Gate): VerifJournal {
     ...(g.criteres.length ? { criteres: { total: g.criteres.length, ok } } : {}),
     ...crapJournal(r),
     ...webJournal(g),
+    ...mobileJournal(g),
   }
+}
+
+/** La preuve mobile du flow, pour le journal : son état, ses captures, et les verdicts appuyés sur l'appareil (dont ko). */
+function mobileJournal(g: Gate): Pick<VerifJournal, 'mobile'> {
+  const m = g.mobile
+  if (!m || m.etat === 'non-demande') return {}
+  const mobile = (g.verdicts ?? []).filter(v => v.mobile)
+  return { mobile: { etat: m.etat, captures: m.captures.length, verdicts: mobile.length, ko: mobile.filter(v => v.verdict === 'ko').length } }
 }
 
 /** La preuve web du flow, pour le journal : son état, ses captures, et les verdicts appuyés sur le navigateur (dont ko). */
@@ -2313,9 +2416,18 @@ async function verifierBrief($: $): Promise<string | undefined> {
   const g = gate
   if (!g) return undefined
   const stat = g.commit ? await gitOut($, g.ref.racine, ['diff', '--stat', g.commit, '--']) : ''
-  const graph = opts.web === 'off' ? null : await graphOf($, g.ref).catch(() => null)
-  const web = verifierWebTask(await webDispo($, g.ref, graph))
-  return verifierTask(g.criteres, stat, withoutCrap(verifOf(g)?.commandes ?? []), g.triches, web)
+  const graph = opts.web === 'off' && opts.mobile === 'off' ? null : await graphOf($, g.ref).catch(() => null)
+  return verifierTask(g.criteres, stat, withoutCrap(verifOf(g)?.commandes ?? []), g.triches, await preuveTask($, g.ref, graph))
+}
+
+/**
+ * Le paragraphe de la preuve à l'exécution du vérificateur, choisi selon le projet : « Preuve mobile » sur une app Flutter, React Native
+ * ou Expo (même désactivée, pour le dire), sinon « Preuve web » (serveur de dev de package.json).
+ */
+async function preuveTask($: $, ref: ProjectRef, graph: Graph | null | undefined): Promise<string> {
+  const mobile = await mobileDispo($, ref, graph)
+  if (mobile.app) return verifierMobileTask(mobile)
+  return verifierWebTask(await webDispo($, ref, graph))
 }
 
 /** La réponse du vérificateur : un verdict par critère (parseVerdicts), dans le panneau ; une réponse sans aucun verdict lisible ne remplace pas la précédente. */
@@ -2375,6 +2487,18 @@ async function restoreVerif($: $) {
       ...(web.commande ? { commande: web.commande } : {}),
     }
   }
+  // La preuve mobile : une app en question, en démarrage, en installation ou prête est morte avec le module (arrete) ; les captures restent.
+  const liveM = (s: MobileEtat) => s === 'question' || s === 'demarrage' || s === 'installation' || s === 'pret'
+  const mobile = view?.mobile ? { ...view.mobile, etat: liveM(view.mobile.etat) ? ('arrete' as const) : view.mobile.etat } : undefined
+  if (mobile) {
+    gate.mobile = {
+      etat: mobile.etat,
+      captures: [...mobile.captures],
+      sortie: '',
+      ...(mobile.note ? { note: mobile.note } : {}),
+      ...(mobile.commande ? { commande: mobile.commande } : {}),
+    }
+  }
   await update($, verifA, v =>
     v
       ? {
@@ -2382,6 +2506,7 @@ async function restoreVerif($: $) {
           base: v.base === 'en_cours' ? 'absente' : v.base,
           etat: v.etat === 'en_cours' || v.etat === 'base' ? 'attente' : v.etat,
           ...(web ? { web } : {}),
+          ...(mobile ? { mobile } : {}),
         }
       : v,
   )
@@ -2553,10 +2678,18 @@ async function verifTool($: $, e: Record<string, unknown> & { agentId?: string }
     case 'web': {
       const isAllowed = who === 'lead' || (!!e.agentId && verifierAgents.has(e.agentId))
       if (!isAllowed) return 'revo-flow verif : l’action web est réservée au vérificateur.'
+      // Une app mobile : la preuve à l'exécution de ce projet est la preuve mobile, pas un serveur de dev.
+      const app = await mobileAppOf($, g.ref).catch(() => undefined)
+      if (app) return `revo-flow verif : ce projet est une app mobile ${frameworkLabel(app.framework)} (${app.origine}) : sa preuve à l’exécution passe par l’action mobile, pas web. Appelle action "mobile".`
       return webTool($, g, flow.isStopped === true)
     }
+    case 'mobile': {
+      const isAllowed = who === 'lead' || (!!e.agentId && verifierAgents.has(e.agentId))
+      if (!isAllowed) return 'revo-flow verif : l’action mobile est réservée au vérificateur.'
+      return mobileTool($, g, flow.isStopped === true)
+    }
     default:
-      return `revo-flow verif : action « ${action} » inconnue (lancer, resultat, commandes, exception, degeler, web).`
+      return `revo-flow verif : action « ${action} » inconnue (lancer, resultat, commandes, exception, degeler, web, mobile).`
   }
 }
 
@@ -2868,9 +3001,9 @@ async function stopWeb($: $, g: Gate | undefined) {
 /** La dernière capture déjà lue (base64), pour ne lire qu'une fois le fichier de chaque capture. */
 let shownCapture: { path: string; png: string | undefined } | undefined
 
-/** La dernière capture de la preuve web pour le panneau terminal (Image) : son .png.txt, lu une fois, ignoré au-delà de 1,5 Mo. */
+/** La dernière capture de la preuve web ou mobile pour le panneau terminal (Image) : son .png.txt, lu une fois, ignoré au-delà de 1,5 Mo. */
 async function lastCapture($: $, v: VerifView | null): Promise<ViewData['capture']> {
-  const last = v?.web?.captures.at(-1)
+  const last = v?.mobile?.captures.at(-1) ?? v?.web?.captures.at(-1)
   if (!last) return undefined
   const path = last.endsWith('.txt') ? last : `${last}.txt`
   if (shownCapture?.path !== path) {
@@ -2895,8 +3028,9 @@ async function keepCapture($: $, ran: unknown) {
   try {
     const g = gate
     const flow = await read($, flowA)
-    const w = g?.web
-    if (!g || !w || !flow || flow.id !== g.flowId || w.etat !== 'pret') return
+    // La preuve ouverte : mobile (outils mobile-mcp) ou web (navigateur) ; un projet a l'une ou l'autre.
+    const w = g?.mobile?.etat === 'pret' ? g.mobile : g?.web?.etat === 'pret' ? g.web : undefined
+    if (!g || !w || !flow || flow.id !== g.flowId) return
     const b64 = extractPng(ran)
     if (!b64) return
     // Le numéro est pris avant toute attente : deux captures en même temps n'écrivent pas le même fichier.
@@ -2925,7 +3059,7 @@ async function keepCapture($: $, ran: unknown) {
       }
     }
     w.captures.push(kept)
-    await setView($, g, { web: webView(g) })
+    await setView($, g, w === g.mobile ? { mobile: mobileView(g) } : { web: webView(g) })
   } catch {
     // une capture perdue ne gêne jamais l'outil
   }
@@ -2933,8 +3067,494 @@ async function keepCapture($: $, ran: unknown) {
 
 /** Bouton « capture » du panneau : ouvre la dernière capture (le .png, sinon son .txt), comme le rapport. */
 async function openCapture($: $) {
-  const last = (await read($, verifA))?.web?.captures.at(-1)
+  const v = await read($, verifA)
+  const last = v?.mobile?.captures.at(-1) ?? v?.web?.captures.at(-1)
   if (last) await openFile($, last, 'la capture')
+}
+
+// ── Preuve mobile (v3.1, docs/rd-v2/execution.md §3) ─────────────────────
+
+/** La sortie de l'app (flutter run, expo, react-native) gardée pour le journal et la dernière ligne quand elle meurt : 8 000 caractères. */
+const MOBILE_SORTIE_MAX = 8000
+/** Lignes du journal de l'app rendues au vérificateur. */
+const JOURNAL_LIGNES = 40
+/** La note d'une preuve mobile sans app détectée : la réponse au vérificateur le dit à part. */
+const NO_MOBILE_APP = 'aucune app mobile détectée'
+/** Le refus d'un vérificateur lancé en arrière-plan : sa preuve se suit en direct. */
+const VERIFIER_FOREGROUND =
+  'revo-flow : lance le vérificateur au premier plan, pas en arrière-plan : sa preuve à l’exécution (web ou mobile) se suit en direct dans le panneau et sur l’appareil.'
+
+/** L'agent est-il demandé en arrière-plan (run_in_background de l'outil Agent, sous l'un de ses noms) ? */
+function isBackgroundSpawn(e: unknown): boolean {
+  const x = typeof e === 'object' && e !== null ? (e as Record<string, unknown>) : {}
+  return x.background === true || x.run_in_background === true || x.isBackground === true
+}
+
+/** La preuve mobile de la porte, créée à la première demande. */
+function mobileOf(g: Gate): GateMobile {
+  if (!g.mobile) g.mobile = { etat: 'non-demande', captures: [], sortie: '' }
+  return g.mobile
+}
+
+/** Ce que le panneau et le rapport montrent de la preuve mobile (VerifView.mobile). */
+function mobileView(g: Gate): MobileView {
+  const m = mobileOf(g)
+  return {
+    etat: m.etat,
+    ...(m.app ? { framework: frameworkLabel(m.app.framework) } : {}),
+    ...(m.appareil ? { appareil: deviceLabel(m.appareil) } : {}),
+    ...(m.commande ? { commande: m.commande } : {}),
+    ...(m.emulateur ? { emulateurLance: true } : {}),
+    captures: [...m.captures],
+    ...(m.note ? { note: m.note } : {}),
+  }
+}
+
+/** Change la preuve mobile (en place : l'app en fond garde la même référence) et la pousse dans la vue de la porte. */
+async function setMobile($: $, g: Gate, patch: Partial<GateMobile>) {
+  Object.assign(mobileOf(g), patch)
+  await setView($, g, { mobile: mobileView(g) }).catch(() => undefined)
+}
+
+/**
+ * L'app mobile du projet (detectMobileApp) : pubspec.yaml, package.json et app.json lus par ioOf, les dossiers android/ et ios/ sondés ;
+ * un chemin présent dans deja (déjà lu, même absent) n'est pas relu.
+ */
+async function mobileAppOf($: $, ref: ProjectRef, graph?: Graph | null, deja: Record<string, string | undefined> = {}): Promise<MobileApp | undefined> {
+  try {
+    const io = ioOf($)
+    const root = normalizePath(ref.racine)
+    const texts = await Promise.all(
+      MOBILE_MANIFESTES.map(p => (p in deja ? Promise.resolve(deja[p]) : io.fs.read(`${root}/${p}`).then(t => (typeof t === 'string' ? t : undefined), () => undefined))),
+    )
+    const sondes = Object.fromEntries(await Promise.all(MOBILE_SONDES.map(async d => [d, await io.fs.exists(`${root}/${d}`).catch(() => false)] as const)))
+    const stack = graph?.projet.stack
+    return detectMobileApp({ files: Object.keys(graph?.fichiers ?? {}), read: Object.fromEntries(MOBILE_MANIFESTES.map((p, i) => [p, texts[i]])), sondes, ...(stack ? { stack } : {}) })
+  } catch {
+    return undefined
+  }
+}
+
+/** Les lectures de la preuve mobile (MobileDispo) : l'option, l'app détectée et, sur demande (doctor), les appareils du poste. */
+async function mobileDispo($: $, ref: ProjectRef | undefined, graph: Graph | null | undefined, deja?: Record<string, string | undefined>, avecAppareils = false): Promise<MobileDispo> {
+  const app = ref ? await mobileAppOf($, ref, graph, deja) : undefined
+  if (opts.mobile === 'off') return { option: 'off', ...(app ? { app } : {}) }
+  const appareils = app && avecAppareils && ref ? await devicesOf($, ref, app) : undefined
+  return { option: opts.mobile, ...(app ? { app } : {}), ...(appareils ? { appareils } : {}) }
+}
+
+/**
+ * Les appareils du poste pour cette app (listCommands : flutter devices et flutter emulators, ou adb, emulator et simctl), fondus sans
+ * doublon ; une commande absente ou en échec ne compte pas. La sortie standard d'abord, l'erreur standard si elle est vide.
+ */
+async function devicesOf($: $, ref: ProjectRef, app: MobileApp): Promise<Appareil[]> {
+  const win = await isWindows($)
+  const lists = await Promise.all(
+    listCommands(app, win ? 'windows' : 'darwin').map(async c => {
+      try {
+        const r = await $.process.run(withShell(c.argv, win ? 'windows' : 'posix'), { cwd: ref.racine, timeoutMs: 45_000 })
+        return c.parse(r.stdout.trim() ? r.stdout : r.stderr)
+      } catch {
+        return [] as Appareil[]
+      }
+    }),
+  )
+  return mergeDevices(...lists)
+}
+
+/** La réponse de `verif mobile` au vérificateur, selon l'état de la preuve mobile. */
+function mobileAnswer(m: GateMobile): string {
+  const ou = m.appareil ? deviceLabel(m.appareil) : 'l’appareil'
+  if (m.etat === 'pret') {
+    return `revo-flow verif : app ${m.app ? frameworkLabel(m.app.framework) : ''} à l’écran sur ${ou} (${m.commande ?? 'lancée'}${m.emulateur ? ', émulateur démarré par revo-flow' : ''}). L’utilisateur la regarde en direct. Observe avec l’outil mcp__revo-flow__mobile : capture (puis Read), arbre, journal, toucher, glisser, texte, touche — une action à la fois ; cite dans chaque preuve l’écran vu, les exceptions, débordements et erreurs du journal, et « capture n ».`
+  }
+  if (m.etat === 'refuse') return 'revo-flow verif : l’utilisateur ne lance pas l’app : preuve mobile non vérifiable, dis-le dans tes preuves.'
+  if (m.etat === 'erreur' && m.note === NO_MOBILE_APP) {
+    return 'revo-flow verif : aucune app mobile détectée (ni pubspec.yaml Flutter, ni react-native ou expo dans package.json) : preuve mobile impossible, juge non vérifiable.'
+  }
+  if (m.etat === 'erreur') return `revo-flow verif : l’app n’a pas été lancée (${m.note ?? 'erreur inconnue'}) : preuve mobile non vérifiable.`
+  return 'revo-flow verif : l’app est arrêtée : preuve mobile non vérifiable.'
+}
+
+/**
+ * `verif mobile` : l'app de la preuve mobile. Un second appel attend la demande en cours et rend la même réponse ; prête, refusée ou en
+ * erreur, la réponse reste ; arrêtée (fin de flow puis agent relancé, rechargement du mod), la demande repart, sauf pour un flow arrêté.
+ */
+async function mobileTool($: $, g: Gate, isStopped: boolean): Promise<string> {
+  if (opts.mobile === 'off') return 'revo-flow verif : preuve mobile désactivée (option mobile) ; juge non vérifiable ce qui demande l’appareil.'
+  const m = mobileOf(g)
+  if (!m.enCours && (m.etat === 'non-demande' || (m.etat === 'arrete' && !isStopped))) {
+    m.enCours = true
+    m.attente = startMobile($, g, m)
+      .catch(async err => {
+        if (m.etat === 'question' || m.etat === 'demarrage' || m.etat === 'installation' || m.etat === 'non-demande') await setMobile($, g, { etat: 'erreur', note: errText(err) })
+      })
+      .finally(() => {
+        m.enCours = false
+      })
+  }
+  await m.attente
+  return mobileAnswer(m)
+}
+
+/** Appareils proposés au plus dans la question (plus « Pas cette fois »). */
+const APPAREILS_MAX = 3
+
+/**
+ * Détecte l'app, lit les appareils, choisit (téléphone branché d'abord, puis émulateur ou simulateur allumé, puis à démarrer), puis demande
+ * à l'utilisateur : un seul candidat, « Lancer » ; plusieurs, le choix de l'appareil. Démarre l'émulateur s'il le faut (avec sa fenêtre),
+ * lance l'app et attend qu'elle soit à l'écran. Rend quand l'issue est connue (pret, refuse ou erreur). Échap et -p : pas cette fois.
+ */
+async function startMobile($: $, g: Gate, m: GateMobile): Promise<void> {
+  Object.assign(m, { appareil: undefined, note: undefined, sortie: '', stop: undefined, emulateur: undefined, stopEmulateur: undefined, vmService: undefined, commande: undefined })
+  const graph = await graphOf($, g.ref).catch(() => null)
+  const app = await mobileAppOf($, g.ref, graph)
+  if (!app) return setMobile($, g, { etat: 'erreur', note: NO_MOBILE_APP })
+  m.app = app
+  await setMobile($, g, { etat: 'question' })
+  const tous = await devicesOf($, g.ref, app)
+  const candidats = rankDevices(tous, app)
+  if (!candidats.length) {
+    return setMobile($, g, {
+      etat: 'erreur',
+      note: `aucun appareil ${app.plateformes.join(' ou ')} : branchez un téléphone (adb ou Xcode) ou créez un émulateur / simulateur`,
+    })
+  }
+  const no = { headless: 'Pas cette fois', dismissed: 'Pas cette fois' }
+  const nom = frameworkLabel(app.framework)
+  let choisi: Appareil | undefined
+  if (candidats.length === 1) {
+    const d = candidats[0]!
+    const { answer } = await askGate(
+      $,
+      g,
+      d.etat === 'connecte'
+        ? `Lancer l’app ${nom} de ${g.ref.nom} sur ${deviceLabel(d)} ? Le vérificateur l’observera en direct sur l’appareil pour la preuve mobile.`
+        : `Démarrer ${deviceLabel(d)} (sa fenêtre s’ouvrira) puis y lancer l’app ${nom} de ${g.ref.nom} ? Le vérificateur l’observera en direct pour la preuve mobile.`,
+      ['Lancer', 'Pas cette fois'],
+      no,
+      'Preuve mobile : lancer l’app sur l’appareil ?',
+    )
+    if (m.etat !== 'question') return
+    if (answer === 'Lancer') choisi = d
+  } else {
+    const options = candidats.slice(0, APPAREILS_MAX)
+    const { answer } = await askGate(
+      $,
+      g,
+      `Lancer l’app ${nom} de ${g.ref.nom} pour la preuve mobile : sur quel appareil ? Le vérificateur l’observera en direct (un émulateur éteint est démarré avec sa fenêtre).`,
+      [...options.map(deviceLabel), 'Pas cette fois'],
+      no,
+      'Preuve mobile : sur quel appareil ?',
+    )
+    if (m.etat !== 'question') return
+    choisi = options.find(d => deviceLabel(d) === answer)
+  }
+  if (!choisi) return setMobile($, g, { etat: 'refuse' })
+  m.appareil = choisi
+  if (choisi.etat !== 'connecte') {
+    await setMobile($, g, { etat: 'demarrage' })
+    $.ui.toast(`revo-flow : démarrage de ${choisi.nom}, sa fenêtre s’ouvre`)
+    const allume = await bootEmulator($, g, m, app, choisi, tous)
+    if (m.etat !== 'demarrage') return
+    if (!allume) {
+      await m.stopEmulateur?.().catch(() => undefined)
+      return setMobile($, g, { etat: 'erreur', note: `${choisi.nom} ne s’est pas allumé en ${Math.round(EMULATEUR_ATTENTE_MS / 1000)} s` })
+    }
+    // L'émulateur à éteindre en fin de flow est celui qui s'est connecté (emulator-5554), pas le nom de l'AVD.
+    m.appareil = allume
+    m.emulateur = allume
+  }
+  await setMobile($, g, { etat: 'installation', commande: commandeMobile(runCommand(app, m.appareil)) })
+  await spawnApp($, g, m, app, m.appareil)
+}
+
+/**
+ * Démarre un émulateur ou un simulateur éteint (launchCommands : fenêtre visible) et attend qu'il soit connecté : simctl le dit Booted, ou un
+ * emulator-NNNN nouveau apparaît dans adb avec sys.boot_completed. Rend l'appareil allumé, ou undefined après EMULATEUR_ATTENTE_MS (ou si
+ * la preuve a changé d'état). Le processus `emulator -avd` est gardé (stopEmulateur le ferme) ; revo-flow l'éteindra en fin de flow.
+ */
+async function bootEmulator($: $, g: Gate, m: GateMobile, app: MobileApp, lance: Appareil, avant: Appareil[]): Promise<Appareil | undefined> {
+  const win = await isWindows($)
+  const os = win ? 'windows' : 'posix'
+  m.emulateur = lance
+  for (const c of launchCommands(app, lance)) {
+    try {
+      if (c.garder) {
+        const proc = await $.process.spawn({ argv: withShell(c.argv, os), cwd: g.ref.racine })
+        const it = iteratorOf(proc)
+        m.stopEmulateur = async () => {
+          for (const [target, name] of [[it, 'return'], [proc, 'return'], [proc, 'kill']] as const) {
+            try {
+              const fn = (target as Record<string, unknown> | null | undefined)?.[name]
+              if (typeof fn === 'function') void Promise.resolve(fn.call(target)).catch(() => undefined)
+            } catch {
+              // déjà fermé
+            }
+          }
+        }
+        // La sortie de l'émulateur est lue et jetée : quitter la boucle le tuerait.
+        if (it)
+          void (async () => {
+            try {
+              for (;;) if ((await it.next()).done) break
+            } catch {
+              // l'émulateur est parti
+            }
+          })()
+      } else await $.process.run(withShell(c.argv, os), { cwd: g.ref.racine, timeoutMs: 60_000 })
+    } catch (err) {
+      await setMobile($, g, { note: `démarrage impossible : ${errText(err)}` })
+      return undefined
+    }
+  }
+  const debut = await $.clock.now()
+  for (;;) {
+    if (m.etat !== 'demarrage') return undefined
+    const apres = await devicesOf($, g.ref, app)
+    const d = bootedDevice(lance, avant, apres)
+    if (d && (d.plateforme !== 'android' || (await androidBooted($, d, os)))) return d
+    if ((await $.clock.now()) - debut >= EMULATEUR_ATTENTE_MS) return undefined
+    await new Promise<void>(resolve => void $.clock.after(EMULATEUR_SONDE_MS, () => resolve()))
+  }
+}
+
+/** Android a fini de démarrer : `adb shell getprop sys.boot_completed` rend 1. */
+async function androidBooted($: $, d: Appareil, os: 'windows' | 'posix'): Promise<boolean> {
+  try {
+    const r = await $.process.run(withShell(['adb', '-s', d.id, 'shell', 'getprop', 'sys.boot_completed'], os), { timeoutMs: 15_000 })
+    return r.stdout.trim() === '1'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Lance l'app sur l'appareil ($.process.spawn, cmd /c sous Windows) et lit sa sortie en fond, comme spawnServer : app à l'écran
+ * (appReadyFromOutput) → pret ; échec de build ou de pose, processus mort ou 5 min sans signe → erreur (le processus est arrêté). Rend
+ * quand l'issue est connue ; la lecture continue ensuite (le journal du vérificateur la lit). Jamais d'exception.
+ */
+async function spawnApp($: $, g: Gate, m: GateMobile, app: MobileApp, d: Appareil): Promise<void> {
+  const os = (await isWindows($)) ? 'windows' : 'posix'
+  const argv = runCommand(app, d)
+  let proc: unknown
+  try {
+    proc = await $.process.spawn({ argv: withShell(argv, os), cwd: g.ref.racine })
+  } catch (err) {
+    return setMobile($, g, { etat: 'erreur', note: `lancement impossible : ${errText(err)}` })
+  }
+  const it = iteratorOf(proc)
+  if (!it) return setMobile($, g, { etat: 'erreur', note: 'lancement impossible : sortie de l’app illisible' })
+  let isStopped = false
+  const stop = async () => {
+    if (isStopped) return
+    isStopped = true
+    const call = (target: unknown, name: 'return' | 'kill') => {
+      try {
+        const fn = (target as Record<string, unknown> | null)?.[name]
+        if (typeof fn === 'function') void Promise.resolve(fn.call(target)).catch(() => undefined)
+      } catch {
+        // déjà fermé
+      }
+    }
+    call(it, 'return')
+    if (proc !== it) call(proc, 'return')
+    call(proc, 'kill')
+  }
+  m.stop = stop
+  if (m.etat !== 'installation') {
+    await stop()
+    return
+  }
+  await new Promise<void>(resolve => {
+    let isSettled = false
+    let timer: { cancel?: () => void } | undefined
+    const settle = async (patch: Partial<GateMobile>, kill = false) => {
+      if (isSettled) return
+      isSettled = true
+      timer?.cancel?.()
+      if (kill) await stop()
+      await setMobile($, g, patch)
+      if (patch.etat === 'pret') $.ui.toast(`revo-flow : app à l’écran sur ${d.nom}, le vérificateur la regarde`)
+      resolve()
+    }
+    timer = $.clock.after(MOBILE_ATTENTE_MS, () => void settle({ etat: 'erreur', note: `l’app n’est pas à l’écran après ${Math.round(MOBILE_ATTENTE_MS / 1000)} s` }, true)) as unknown as
+      | { cancel?: () => void }
+      | undefined
+    void (async () => {
+      try {
+        for (;;) {
+          const r = await it.next()
+          if (r.done) break
+          m.sortie = (m.sortie + chunkText(r.value)).slice(-MOBILE_SORTIE_MAX)
+          if (isSettled) continue
+          const ready = appReadyFromOutput(m.sortie)
+          if (ready) await settle({ etat: 'pret', ...(ready.vmService ? { vmService: ready.vmService } : {}) })
+          else {
+            const failed = appFailedFromOutput(m.sortie)
+            if (failed) await settle({ etat: 'erreur', note: failed }, true)
+          }
+        }
+      } catch {
+        // la sortie est perdue : le processus aussi
+      }
+      if (isStopped) return
+      isStopped = true
+      const note = `l’app s’est arrêtée : ${lastLine(m.sortie)}`
+      if (!isSettled) await settle({ etat: 'erreur', note })
+      // Morte après avoir été à l'écran : la preuve mobile n'a plus d'app, les actions sont refusées.
+      else if (m.etat === 'pret') await setMobile($, g, { etat: 'erreur', note })
+    })().catch(() => undefined)
+  })
+}
+
+/**
+ * Arrête l'app lancée par revo-flow et éteint l'émulateur ou le simulateur qu'il a démarré (jamais un appareil déjà allumé ni un téléphone) :
+ * fin de flow, Tout arrêter, flow abandonné, porte remplacée. Prête, en question, en démarrage ou en installation : arrete ; refuse, erreur
+ * et non-demande restent. Jamais d'exception.
+ */
+async function stopMobile($: $, g: Gate | undefined) {
+  const m = g?.mobile
+  if (!g || !m) return
+  try {
+    await m.stop?.()
+  } catch {
+    // arrêt au mieux : l'app meurt aussi avec le module
+  }
+  m.stop = undefined
+  if (m.emulateur) {
+    try {
+      const os = (await isWindows($)) ? 'windows' : 'posix'
+      await $.process.run(withShell(shutdownCommand(m.emulateur), os), { timeoutMs: 20_000 }).catch(() => undefined)
+      await m.stopEmulateur?.()
+    } catch {
+      // l'émulateur reste allumé : l'utilisateur le fermera
+    }
+    m.stopEmulateur = undefined
+  }
+  if (m.etat === 'refuse' || m.etat === 'erreur' || m.etat === 'non-demande') return
+  m.etat = 'arrete'
+  await setView($, g, { mobile: mobileView(g) }).catch(() => undefined)
+}
+
+/** Arrête les preuves à l'exécution d'une porte : le serveur de dev (web) et l'app sur l'appareil (mobile). */
+async function stopProofs($: $, g: Gate | undefined) {
+  await stopWeb($, g)
+  await stopMobile($, g)
+}
+
+/**
+ * Le base64 d'un fichier, par une commande du poste (le système de fichiers du mod ne lit que du texte) : openssl base64 -A, base64 -i
+ * (macOS) ou base64 -w 0 (Linux) ; certutil -encode sous Windows (en-tête et pied retirés). undefined si rien n'y arrive.
+ */
+async function base64Of($: $, path: string, os: 'windows' | 'posix'): Promise<string | undefined> {
+  const propre = (t: string) => t.replace(/-----(?:BEGIN|END) CERTIFICATE-----/g, '').replace(/\s+/g, '')
+  if (os === 'windows') {
+    const txt = `${path}.b64`
+    try {
+      const r = await $.process.run(['certutil', '-encode', '-f', path, txt], { timeoutMs: 20_000 })
+      if (r.exitCode !== 0) return undefined
+      const t = await $.fs.read(txt)
+      return typeof t === 'string' && t ? propre(t) : undefined
+    } catch {
+      return undefined
+    }
+  }
+  for (const argv of [
+    ['openssl', 'base64', '-A', '-in', path],
+    ['base64', '-i', path],
+    ['base64', '-w', '0', path],
+  ]) {
+    try {
+      const r = await $.process.run(argv, { timeoutMs: 20_000 })
+      const t = propre(r.stdout)
+      if (r.exitCode === 0 && t) return t
+    } catch {
+      // essai suivant
+    }
+  }
+  return undefined
+}
+
+/**
+ * L'outil mobile : capture, arbre, journal, toucher, glisser, texte, touche, sur l'app prête de la preuve mobile, pour le vérificateur
+ * seul. Chaque action passe par une commande du poste (flutter screenshot, adb, simctl) ; l'erreur est dite en texte.
+ */
+async function mobileActionTool($: $, e: Record<string, unknown> & { agentId?: string }): Promise<string> {
+  const action = text(e.action).toLowerCase()
+  const g = gate
+  const flow = await read($, flowA)
+  if (!g || !flow || flow.id !== g.flowId || flow.phase === 'done') return 'revo-flow mobile : aucun flow vérifié en cours.'
+  if (!e.agentId || !verifierAgents.has(e.agentId)) return 'revo-flow mobile : outil réservé au vérificateur.'
+  const m = g.mobile
+  if (!m || m.etat !== 'pret' || !m.app || !m.appareil) {
+    return 'revo-flow mobile : la preuve mobile n’est pas ouverte ; appelle d’abord mcp__revo-flow__verif action "mobile", puis réessaie.'
+  }
+  const os = (await isWindows($)) ? 'windows' : 'posix'
+  const run = async (argv: string[], timeoutMs = 60_000) => {
+    const r = await $.process.run(withShell(argv, os), { cwd: g.ref.racine, timeoutMs })
+    return { ok: r.exitCode === 0, out: r.stdout, err: lastLine(r.stderr || r.stdout) }
+  }
+  const d = m.appareil
+  switch (action) {
+    case 'capture': {
+      m.prises = Math.max(m.prises ?? 0, m.captures.length) + 1
+      const n = m.prises
+      const png = `${(await verifIoOf($, g)).sorties}/capture-${n}.png`
+      const steps = captureCommands(m.app, d, png)
+      if (!steps) return `revo-flow mobile : pas de capture possible sur ${deviceLabel(d)} (iPhone branché sans Flutter) ; juge avec le journal, sinon non vérifiable.`
+      // Le dossier des sorties existe grâce au .txt (le système de fichiers du mod crée les dossiers) ; il reçoit ensuite le base64 du panneau.
+      await $.fs.write(`${png}.txt`, '')
+      for (const argv of steps) {
+        const r = await run(argv, 90_000)
+        if (!r.ok) return `revo-flow mobile : capture ${n} impossible (${argv[0]} : ${r.err || 'échec'}) ; réessaie, ou juge avec l’arbre et le journal.`
+      }
+      if (!(await $.fs.exists(png).catch(() => false))) return `revo-flow mobile : capture ${n} non écrite (${png} absent) ; réessaie.`
+      const b64 = await base64Of($, png, os)
+      if (b64) await $.fs.write(`${png}.txt`, b64)
+      m.captures.push(png)
+      await setMobile($, g, {})
+      return `revo-flow mobile : capture ${n} écrite : ${png} — lis-la avec l’outil Read pour la voir, et cite « capture ${n} » dans ta preuve.`
+    }
+    case 'arbre': {
+      const steps = treeCommands(d)
+      if (!steps) return `revo-flow mobile : pas d’arbre des vues sur ${deviceLabel(d)} (iOS) ; observe avec capture et journal.`
+      let dernier = ''
+      for (const argv of steps) {
+        const r = await run(argv)
+        if (!r.ok) return `revo-flow mobile : arbre illisible (${r.err || 'échec'}) ; réessaie après une capture.`
+        dernier = r.out
+      }
+      const arbre = condenseUiTree(dernier)
+      return arbre ? `revo-flow mobile : vues à l’écran de ${d.nom} (classe « texte » [description] #id · centre x,y) :\n${arbre}` : 'revo-flow mobile : aucune vue avec un texte ou un id à l’écran (écran vide, ou en cours de dessin) ; prends une capture.'
+    }
+    case 'journal': {
+      const n = countIssues(m.sortie)
+      const lignes = [`revo-flow mobile : journal de l’app (${m.commande ?? 'lancement'}) — exceptions : ${n.exceptions}, débordements : ${n.debordements}, erreurs : ${n.erreurs}`, tailLines(m.sortie, JOURNAL_LIGNES) || '(rien encore)']
+      const logcat = logCommand(d)
+      if (logcat) {
+        const r = await run(logcat, 30_000).catch(() => undefined)
+        if (r?.ok && r.out.trim()) lignes.push('--- logcat, dernières erreurs de l’appareil ---', tailLines(r.out, 30))
+      }
+      return lignes.join('\n')
+    }
+    case 'toucher':
+    case 'glisser':
+    case 'texte':
+    case 'touche': {
+      const argv = gestureCommand(d, action, e)
+      if (!argv) {
+        return d.plateforme !== 'android'
+          ? `revo-flow mobile : pas de geste sur ${deviceLabel(d)} (iOS) : observe avec capture et journal, ou dis le critère non vérifiable.`
+          : `revo-flow mobile : ${action} demande ${action === 'toucher' ? 'x et y' : action === 'glisser' ? 'x1, y1, x2 et y2' : action === 'texte' ? '« texte »' : '« touche » (retour, accueil, entree)'}.`
+      }
+      const r = await run(argv, 30_000)
+      if (!r.ok) return `revo-flow mobile : ${action} refusé par l’appareil (${r.err || 'échec'}).`
+      return `revo-flow mobile : ${describeCall(MOBILE_TOOL, e).replace(/^Mobile /, '')} fait sur ${d.nom} ; prends une capture pour voir le résultat.`
+    }
+    default:
+      return `revo-flow mobile : action « ${action} » inconnue (capture, arbre, journal, toucher, glisser, texte, touche).`
+  }
 }
 
 // ── Commande cache ───────────────────────────────────────────────────────
@@ -3350,7 +3970,7 @@ async function stopAgent($: $, key: string, isQuiet = false) {
 async function stopAll($: $) {
   await setFlow($, f => ({ ...f, isStopped: true }))
   for (const a of (await read($, flowA))?.agents ?? []) if (a.status === 'running') await stopAgent($, a.key, true)
-  await stopWeb($, gate)
+  await stopProofs($, gate)
   const turnId = leadTurnId
   leadTurnId = undefined
   if (turnId) {
@@ -3505,7 +4125,7 @@ async function resumeFlow($: $, snap: FlowSnapshot) {
 async function abandonFlow($: $, snap: FlowSnapshot) {
   const flow: Flow = { ...snap.flow, isStopped: true, endedAt: Math.max(snap.savedAt, snap.flow.startedAt) }
   // Le serveur de la preuve web est mort avec la session ; au cas où la porte de ce flow serait encore en mémoire, rien ne reste.
-  if (gate?.flowId === flow.id) await stopWeb($, gate)
+  if (gate?.flowId === flow.id) await stopProofs($, gate)
   await journalize($, flow, snap.lead, snap.entries.length).catch(() => undefined)
   await $.store.delete(snapshotKey(flow.id))
   $.ui.toast(`revo-flow : flow « ${flow.title} » abandonné, inscrit au journal comme arrêté`)
@@ -3594,6 +4214,7 @@ async function writeRapport($: $, flow: Flow, lead: Lead, verifP: Promise<VerifJ
     verdicts: g?.verdicts,
     cache: (await read($, cacheStatsA))?.flow,
     ...(g?.web ? { web: webView(g) } : {}),
+    ...(g?.mobile ? { mobile: mobileView(g) } : {}),
   })
   const path = `${normalizePath(home)}/.claude/revo-flow/rapports/${slug(flow.title) || 'rapport'}.md`
   await $.fs.write(path, text)
@@ -3661,11 +4282,15 @@ function readOptions(o: PluginOptions) {
   // La preuve web (v3) : l'extension Claude in Chrome par défaut ; devtools ajoute le serveur MCP Chrome DevTools au vérificateur.
   const web = (o as { web?: unknown }).web
   opts.web = web === 'devtools' || web === 'off' ? web : 'extension'
+  // La preuve mobile (v3.1) : l'outil mobile de revo-flow par défaut ; mcp ajoute le serveur mobile-mcp au vérificateur.
+  const mobile = (o as { mobile?: unknown }).mobile
+  opts.mobile = mobile === 'mcp' || mobile === 'off' ? mobile : 'appareil'
 }
 
 /**
  * /revo-flow doctor : ce que le mod a détecté sur le projet courant. Lecture seule : le graphe est lu (ou construit en mémoire, jamais écrit),
- * les commandes de la porte sont celles confirmées ou, sinon, détectées maintenant ; aucune n'est lancée (seul `flutter --version` l'est, si .fvm existe).
+ * les commandes de la porte sont celles confirmées ou, sinon, détectées maintenant ; aucune n'est lancée (seuls `flutter --version`, si .fvm existe,
+ * et la liste des appareils (flutter devices, adb devices, simctl) sur une app mobile le sont).
  */
 async function doctorCommand($: $): Promise<string> {
   const ref = await resolveProject(ioOf($)).catch(() => undefined)
@@ -3713,6 +4338,7 @@ async function doctorCommand($: $): Promise<string> {
     journal: graph.journal?.length ?? 0,
     pieges,
     web: await webDispo($, ref, graph, readMap),
+    mobile: await mobileDispo($, ref, graph, readMap, true),
   })
 }
 
@@ -3781,7 +4407,7 @@ export const register: Register = (on, options) => {
         isStopped = answer !== 'Garder les agents'
       } else isStopped = flow !== null && leadTurnId !== undefined
       if (isStopped) await stopAll($)
-      else await stopWeb($, gate)
+      else await stopProofs($, gate)
       await update($, flowA, () => null)
       // Plus de flow : plus d'instantané à reprendre.
       await saveFlow($).catch(() => undefined)
@@ -4066,11 +4692,14 @@ export const register: Register = (on, options) => {
     if (!a) {
       // Un vérificateur lancé hors plan : sa tâche (critères, diff, commandes) s'ajoute à son prompt et son Bash sera filtré.
       if (e.subagentType !== VERIFIER_TYPE) return next(e)
+      if (isBackgroundSpawn(e)) return { deny: VERIFIER_FOREGROUND }
       const task = await verifierBrief($).catch(() => undefined)
       const r = await next(task ? { ...e, prompt: `${e.prompt}\n\n${task}` } : e)
       if (r.deny === undefined && r.agentId) verifierAgents.add(r.agentId)
       return r
     }
+    // Le vérificateur se suit en direct (preuve web ou mobile dans le panneau, sur l'appareil) : jamais en arrière-plan.
+    if ((isVerifier(a) || e.subagentType === VERIFIER_TYPE) && isBackgroundSpawn(e)) return { deny: VERIFIER_FOREGROUND }
     claimed.add(a.key)
     const others = flow.agents.filter(x => x.key !== a.key).map(x => x.name)
     // L'extrait de la fiche servie qui concerne cet agent, après ses consignes.
@@ -4225,6 +4854,27 @@ export const register: Register = (on, options) => {
     }
   }).catch(() => ({ result: 'revo-flow verif : indisponible pour l’instant ; continue, la porte de fin vérifiera.' as never }))
 
+  // L'outil mobile (v3.1) : chaque action est montrée dans le panneau pendant qu'elle se fait (l'utilisateur regarde l'appareil) ;
+  // aucune exception ne remonte, l'erreur est dite en texte.
+  on('tool.call', { tool: MOBILE_TOOL }, async ($, e) => {
+    const input = e as unknown as Record<string, unknown> & { agentId?: string }
+    const flow = await read($, flowA)
+    const who = flow && flow.phase !== 'done' ? whoIs(flow, input.agentId) : undefined
+    const label = describeCall(MOBILE_TOOL, input)
+    if (who) await setActivity($, who, { doing: label, isDoing: true, filePath: '', reason: '' }).catch(() => undefined)
+    let result: string
+    try {
+      result = await mobileActionTool($, input)
+    } catch (err) {
+      result = `revo-flow mobile : ${errText(err)}`
+    }
+    if (who) {
+      const prev = who === 'lead' ? await read($, leadA) : (await read($, flowA))?.agents.find(a => a.key === who)
+      await setActivity($, who, { isDoing: false, history: [...(prev?.history ?? []), label].slice(-3) }).catch(() => undefined)
+    }
+    return { result: result as never }
+  }).catch(() => ({ result: 'revo-flow mobile : indisponible pour l’instant ; juge non vérifiable ce qui demande l’appareil.' as never }))
+
   // Le gel des tests (lot 2) : le testeur n'édite que des tests, un test gelé ne se modifie que par son auteur. Fermé : un
   // plantage refuse l'édition tant que le gel est actif.
   on('tool.call', { tool: 'Edit' }, async ($, e, next) => {
@@ -4264,13 +4914,19 @@ export const register: Register = (on, options) => {
   // Ce que chacun fait en direct, et les fichiers modifiés : seulement pendant un flow.
   on('tool.call', async ($, e, next) => {
     const tool = String(e.tool)
-    if (tool === PLAN_TOOL || tool === STEP_TOOL || tool === VERIF_TOOL) return next(e)
+    if (tool === PLAN_TOOL || tool === STEP_TOOL || tool === VERIF_TOOL || tool === MOBILE_TOOL) return next(e)
     const input = e as unknown as Record<string, unknown>
     const isVerifierCall = !!e.agentId && verifierAgents.has(e.agentId)
     // La preuve web (v3) : le navigateur du vérificateur ne sert que pendant la preuve web, et seulement sur l'origine du serveur prêt.
     if (isVerifierCall && isWebTool(tool)) {
       const flow = await read($, flowA)
       const deny = webToolDenial(tool, input, gate?.web && flow && gate.flowId === flow.id ? { etat: gate.web.etat, url: gate.web.url } : undefined)
+      if (deny) return { deny }
+    }
+    // La preuve mobile (v3.1, option mcp) : les outils mobile-mcp du vérificateur ne servent que l'app prête sur l'appareil accordé.
+    if (isVerifierCall && isMobileMcpTool(tool)) {
+      const flow = await read($, flowA)
+      const deny = mobileToolDenial(tool, gate?.mobile && flow && gate.flowId === flow.id ? { etat: gate.mobile.etat } : undefined)
       if (deny) return { deny }
     }
     // Le vérificateur est en lecture seule : son Bash ne passe que pour des lectures et les commandes confirmées (§8).
@@ -4284,7 +4940,7 @@ export const register: Register = (on, options) => {
     }
     // Une capture d'écran du vérificateur pendant la preuve web est rangée avec les sorties du flow (au mieux, jamais bloquant).
     const kept = async <R extends { deny?: unknown; isError?: boolean }>(ran: R): Promise<R> => {
-      if (isVerifierCall && ran.deny === undefined && ran.isError !== true && isScreenshotCall(tool, input)) await keepCapture($, ran)
+      if (isVerifierCall && ran.deny === undefined && ran.isError !== true && (isScreenshotCall(tool, input) || (isMobileMcpTool(tool) && /screenshot/i.test(tool)))) await keepCapture($, ran)
       return ran
     }
     const flow = await read($, flowA)
@@ -4341,8 +4997,8 @@ export const register: Register = (on, options) => {
     return kept(ran)
   }).catch(($, e, next) =>
     // Un plantage du hook : l'outil passe, sauf un outil navigateur du vérificateur (la preuve web se ferme par prudence).
-    e.agentId && verifierAgents.has(e.agentId) && isWebTool(String(e.tool))
-      ? { deny: 'revo-flow : le contrôle de la preuve web a échoué ; outil navigateur refusé par prudence, réessaie.' }
+    e.agentId && verifierAgents.has(e.agentId) && (isWebTool(String(e.tool)) || isMobileMcpTool(String(e.tool)))
+      ? { deny: 'revo-flow : le contrôle de la preuve à l’exécution a échoué ; outil navigateur ou mobile refusé par prudence, réessaie.' }
       : next(e),
   )
 

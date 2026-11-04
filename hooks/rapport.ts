@@ -1,6 +1,6 @@
 // Le rapport de flow (docs/rd-v3 §2.4) : un markdown écrit en fin de flow, à côté du plan, qui sert de description de MR.
 // Pur : une mise en forme de ce que le flow sait déjà (agents, fichiers, porte, critères, cache), aucune collecte.
-import type { CacheStats, Critere, CritereVerdict, Entry, Flow, Lead, VerifErreur, VerifJournal, VerifResultat, WebView } from '../types'
+import type { CacheStats, Critere, CritereVerdict, Entry, Flow, Lead, MobileView, VerifErreur, VerifJournal, VerifResultat, WebView } from '../types'
 import { MODELS, euros, fmt, fmtDuration, total } from './lib'
 import { dureeText } from './verif/report'
 
@@ -27,6 +27,8 @@ export type RapportInput = {
   cache?: CacheStats['flow']
   /** La preuve web du vérificateur (serveur de dev, captures) ; absente sans navigateur. */
   web?: WebView
+  /** La preuve mobile du vérificateur (appareil, app lancée, captures) ; absente sans appareil. */
+  mobile?: MobileView
 }
 
 const plural = (n: number, un: string, plusieurs: string) => `${n} ${n > 1 ? plusieurs : un}`
@@ -120,18 +122,33 @@ function webParagraph(web: WebView | undefined): string {
   return `**Preuve web** : ${serveur} (${w.existant ? 'déjà en marche' : 'démarré par revo-flow'}), ${nb}`
 }
 
+/** Le paragraphe « Preuve mobile » : l'appareil, l'app et les captures (liens vers les fichiers), ou pourquoi il n'y en a pas. */
+function mobileParagraph(mobile: MobileView | undefined): string | undefined {
+  const m = mobile
+  if (!m || m.etat === 'non-demande') return undefined
+  if (m.etat === 'refuse') return '**Preuve mobile** : app non lancée (choix de l’utilisateur) : les critères mobiles sont non vérifiables'
+  if (m.etat === 'erreur') return `**Preuve mobile** : l’app n’a pas été lancée : ${m.note ?? 'erreur inconnue'}`
+  if (m.etat === 'demarrage' || m.etat === 'installation' || m.etat === 'question') return '**Preuve mobile** : app en cours de lancement'
+  const liens = m.captures.map(c => `[${c.split(/[\\/]/).pop()}](<${c}>)`)
+  const nb = liens.length ? `${plural(liens.length, 'capture', 'captures')} : ${liens.join(', ')}` : 'aucune capture'
+  const app = `app${m.framework ? ` ${m.framework}` : ''}${m.commande ? ` « ${m.commande} »` : ''}${m.appareil ? ` sur ${m.appareil}` : ''}`
+  return `**Preuve mobile** : ${app}${m.emulateurLance ? ' (émulateur démarré par revo-flow)' : ''}, ${nb}`
+}
+
 /** 4. Les critères d'acceptation et le verdict du vérificateur, avec la preuve de chacun. */
-function criteriaSection(criteres: readonly Critere[] | undefined, verdicts: readonly CritereVerdict[] | undefined, web?: WebView): string[] {
+function criteriaSection(criteres: readonly Critere[] | undefined, verdicts: readonly CritereVerdict[] | undefined, web?: WebView, mobile?: MobileView): string[] {
   const out = [`## Critères d'acceptation`, '']
   if (!criteres?.length) return [...out, `${ABSENT}le plan n'avait pas de critères.*`, '']
   const ok = verdicts?.filter(v => v.verdict === 'ok').length ?? 0
   out.push(verdicts?.length ? `**${ok}/${criteres.length} critères ok**` : '*Pas de verdict du vérificateur.*', '')
   for (const c of criteres) {
     const v = verdicts?.find(x => x.id === c.id)
-    out.push(`- **${c.id}** ${c.texte} : ${v ? `${VERDICT[v.verdict]}${v.web ? ' · preuve web' : ''}` : 'sans verdict'}`)
+    out.push(`- **${c.id}** ${c.texte} : ${v ? `${VERDICT[v.verdict]}${v.web ? ' · preuve web' : ''}${v.mobile ? ' · preuve mobile' : ''}` : 'sans verdict'}`)
     if (v?.preuve) out.push(`  > ${v.preuve.replace(/\s*\n\s*/g, ' ')}`)
   }
-  return [...out, '', webParagraph(web), '']
+  // Un projet a l'une ou l'autre : la preuve mobile remplace le paragraphe web quand le vérificateur l'a demandée.
+  const mobileP = mobileParagraph(mobile)
+  return [...out, '', mobileP ?? webParagraph(web), '']
 }
 
 /** 5. Le score CRAP : les fonctions au-dessus du seuil, touchées par le flow (nouvelles) ou non (préexistantes). */
@@ -161,7 +178,7 @@ function costSection(flow: Flow, lead: Lead, date: string | undefined, cache: Ca
 
 /** Le rapport de flow en markdown : six sections, chacune dite absente en une ligne quand elle n'a rien à montrer. */
 export function rapportMarkdown(input: RapportInput): string {
-  const { flow, lead, entries, verif, porte, criteres, verdicts, cache, date, web } = input
+  const { flow, lead, entries, verif, porte, criteres, verdicts, cache, date, web, mobile } = input
   const where = [flow.project, flow.branch].filter(Boolean).join(' · ')
   const head = [`# Rapport : ${flow.title}`, '']
   if (where) head.push(`**Projet** : ${where}  `)
@@ -171,7 +188,7 @@ export function rapportMarkdown(input: RapportInput): string {
     ...planSection(flow),
     ...filesSection(flow, entries),
     ...gateSection(verif, porte),
-    ...criteriaSection(criteres, verdicts, web),
+    ...criteriaSection(criteres, verdicts, web, mobile),
     ...crapSection(verif, porte),
     ...costSection(flow, lead, date, cache),
   ]

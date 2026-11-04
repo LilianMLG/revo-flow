@@ -63,7 +63,7 @@ Sans `/revo-flow`, le mod ne fait rien : pas même un outil déclaré (`plan`, `
 | `/revo-flow panneau` | affiche ou masque le panneau latéral |
 | `/revo-flow historique [n]` | les n derniers flows (10 par défaut) : date, durée, coût, agents, échecs et relances, puis par modèle le coût moyen d'un agent, son taux d'échec et ses relances |
 | `/revo-flow stop` | arrête vraiment : les agents en cours (TaskStop) et le tour de l'orchestrateur, après confirmation (Échap : rien ne change), puis retire la barre et le panneau |
-| `/revo-flow doctor` | ce que le mod a trouvé sur le projet courant : stack, commandes de vérification, base de référence, cache, agents installés, preuve web (ligne `Web` : commande et port détectés, d'où ils viennent, outils, état de `REVO_WEB_LOGIN` ; ou « aucun serveur de dev détecté (pas de script dev) : pas de preuve web » ; ou « preuve web désactivée (option web) »), pièges ; lecture seule, rien n'est lancé ni modifié |
+| `/revo-flow doctor` | ce que le mod a trouvé sur le projet courant : stack, commandes de vérification, base de référence, cache, agents installés, preuve à l'exécution (ligne `Web` : commande et port détectés, d'où ils viennent, outils, état de `REVO_WEB_LOGIN` ; ou « aucun serveur de dev détecté (pas de script dev) : pas de preuve web » ; ou « preuve web désactivée (option web) » ; sur une app mobile, ligne `Mobile` à la place : framework, plateformes, appareils vus (téléphone branché, émulateur, simulateur) ; c'est la seule commande qui liste les appareils), pièges ; lecture seule, rien n'est lancé ni modifié |
 | `/revo-flow version` | la version du mod |
 | `/revo-flow cache` | le graphe du projet courant : panneau (section « Cache » dépliée) et texte dans le terminal |
 | `/revo-flow cache <projet>` | le graphe de n'importe quel projet de `Documents/Front` ou `Documents/Back` (`reservation-tool`, `back/graphql`) |
@@ -148,7 +148,8 @@ Depuis la v2, un flow ne finit plus « terminé » sur un lint, un typage ou un 
 | `commandes` | orchestrateur seul : une liste de commandes corrigée, ou des tests à exclure ; toujours reposée à l'utilisateur |
 | `exception` | orchestrateur seul : terminer malgré le rouge, avec un motif ; toujours reposée à l'utilisateur |
 | `degeler` | orchestrateur seul : rouvrir un test gelé, avec un motif ; toujours reposée à l'utilisateur |
-| `web` | vérificateur et orchestrateur : démarre (ou reprend) le serveur de dev du projet pour la preuve web et rend l'URL ; toujours demandée à l'utilisateur ; voir « Preuve web » |
+| `web` | vérificateur et orchestrateur : démarre (ou reprend) le serveur de dev du projet pour la preuve web et rend l'URL ; toujours demandée à l'utilisateur ; voir « Preuve web ». Sur une app mobile, renvoie vers `mobile` |
+| `mobile` | vérificateur et orchestrateur : choisit l'appareil, lance (ou reprend) l'app du projet pour la preuve mobile et dit quand elle est à l'écran ; toujours demandée à l'utilisateur ; voir « Preuve mobile » |
 
 **Critères d'acceptation, vérificateur, tests gelés** (sur décision de l'orchestrateur, jamais automatiques ; ≈ 0,5 à 1,3 € de plus par flow) :
 
@@ -177,7 +178,21 @@ Depuis la v3.0, le vérificateur peut **voir l'application tourner**. C'est ce q
 - **Connexion** : revo-flow ne stocke ni ne lit aucun compte de test. Si l'application demande une connexion, définis la variable d'environnement `REVO_WEB_LOGIN` pour ton serveur de dev (c'est lui qui la lit) ; revo-flow signale seulement si elle est définie ou absente (`/revo-flow doctor`, consigne du vérificateur). Le vérificateur n'entre jamais d'identifiant : une page de connexion sans la variable donne « non vérifiable ».
 - **Option `web`** (`/config`) : `extension` (défaut) : comme ci-dessus ; `devtools` : en plus, le serveur MCP **Chrome DevTools** (`npx chrome-devtools-mcp@latest --isolated`) est déclaré pour le vérificateur, en repli quand l'extension n'est pas là (`navigate_page`, `take_snapshot`, `take_screenshot`, `list_console_messages`, `list_network_requests`) ; `off` : aucune preuve web, l'action `web` répond que c'est désactivé.
 - **Mesure** : le journal du graphe note la preuve web de chaque flow (état, captures, verdicts web, ko web), pour compter d'abord « combien de flows où la preuve web trouve ce que la porte n'a pas vu ».
-- **Limites** : l'extension Claude in Chrome est requise (ou l'option `devtools`) ; seuls les serveurs Nuxt, Next, Vite, Astro et Angular sont reconnus ; une application sans script `dev` n'a pas de preuve web ; pas de test mobile (un seul navigateur, une seule taille) ; un `build` n'est pas servi.
+- **Limites** : l'extension Claude in Chrome est requise (ou l'option `devtools`) ; seuls les serveurs Nuxt, Next, Vite, Astro et Angular sont reconnus ; une application sans script `dev` n'a pas de preuve web ; un seul navigateur, une seule taille ; un `build` n'est pas servi. Une app mobile passe par la preuve mobile ci-dessous.
+
+### Preuve mobile
+
+Depuis la v3.1, le même vérificateur peut **voir une app mobile tourner**, sur un téléphone branché ou dans un émulateur. revo-flow choisit tout seul la preuve qui vaut pour le projet : une app **Flutter** (`pubspec.yaml` qui dépend de `flutter`), **Expo** ou **React Native** (`package.json`) → preuve mobile ; sinon un serveur de dev → preuve web. Ce qu'elle attrape : écran rouge (exception de build de widget), débordement de rendu (« RenderFlex overflowed »), navigation cassée, texte manquant, régression visuelle grossière. Tout se passe **en direct, sous tes yeux** : l'émulateur s'ouvre avec sa fenêtre (jamais `-no-window`), l'app se lance sur l'appareil que tu regardes, chaque action du vérificateur s'affiche dans le panneau (« Mobile toucher 540,1660 », « Mobile capture ») et la dernière capture y est montrée ; le vérificateur est refusé s'il est lancé en arrière-plan.
+
+- **Appareils** : `flutter devices --machine` et `flutter emulators` sur Flutter ; `adb devices -l`, `emulator -list-avds` et `xcrun simctl list devices` (macOS) sur Expo et React Native. Ordre de préférence : téléphone branché (USB ou Wi-Fi) capable de capture, puis émulateur Android ou simulateur iOS déjà allumé, puis iPhone branché, puis un émulateur à démarrer. Plusieurs candidats : le dialogue te laisse choisir (3 au plus).
+- **Déroulé** : le vérificateur appelle l'action `mobile` de l'outil `verif`. Un dialogue demande « Lancer l'app Flutter de <projet> sur SM A515F (téléphone branché, Android 13) ? » ou « Démarrer Pixel 8 (émulateur, à démarrer) (sa fenêtre s'ouvrira) puis y lancer l'app ? » : **Lancer** ou **Pas cette fois**. Sans personne à qui demander (`claude -p`) ou sur Échap : pas cette fois. Sur **Lancer** : l'émulateur part s'il le faut (`flutter emulators --launch`, `emulator -avd`, ou `xcrun simctl boot` puis `open -a Simulator`), revo-flow attend qu'il soit connecté (`sys.boot_completed`, 3 min au plus), puis lance l'app (`flutter run -d <id>`, `npx expo run:android --device <id>`, `npx react-native run-android --deviceId <id>` ou leurs équivalents iOS ; `cmd /c` sous Windows) et lit sa sortie jusqu'à « A Dart VM Service … is available at », « Starting the app », « Bundling complete »… 5 min au plus ; un build qui échoue (« FAILURE: Build failed », « Error launching application ») est dit.
+- **Outil `mobile`** (vérificateur seul, une fois l'app à l'écran) : `capture` écrit `capture-n.png` dans les sorties du flow (`flutter screenshot`, `adb screencap` puis `pull`, ou `xcrun simctl io screenshot`) et le vérificateur la lit avec `Read` ; `arbre` rend les vues à l'écran (uiautomator : classe, texte, id, **centre** de chaque vue, pour toucher) ; `journal` compte les exceptions Flutter, les débordements et les erreurs (sortie de l'app, puis `adb logcat`) ; `toucher` (x, y), `glisser` (x1, y1, x2, y2), `texte`, `touche` (retour, accueil, entree) passent par `adb shell input`. Sur iOS, seules `capture` (simulateur) et `journal` existent ; un iPhone branché sans Flutter n'a pas de capture.
+- **Ce qu'est une preuve** : l'écran vu (texte de l'arbre ou de la capture), le nombre d'exceptions, de débordements et d'erreurs du journal, et « capture n ». Une capture seule n'est pas une preuve. Le verdict du critère porte `"mobile": true`.
+- **Captures** : `~/.claude/revo-flow/verif/<date>-<flow>/capture-n.png`, avec son `capture-n.png.txt` (base64, pour le panneau). Le panneau les montre (bouton **capture**) et le rapport de flow les lie (« Preuve mobile : app Flutter « flutter run -d … » sur SM A515F, 2 captures »).
+- **Fin** : l'app lancée par revo-flow est toujours arrêtée en fin de flow (ou par **Tout arrêter**) ; l'émulateur ou le simulateur que revo-flow a démarré est éteint (`adb emu kill`, `xcrun simctl shutdown`). Un appareil déjà allumé, ou un téléphone, n'est jamais touché.
+- **Option `mobile`** (`/config`) : `appareil` (défaut) : comme ci-dessus ; `mcp` : en plus, le serveur MCP **mobile-mcp** (`npx @mobilenext/mobile-mcp@latest`) est déclaré pour le vérificateur (liste des éléments, toucher, glisser, saisie, capture sur Android et simulateur iOS), ses outils ne passent qu'une fois l'app prête ; `off` : aucune preuve mobile, l'action `mobile` répond que c'est désactivé.
+- **Mesure** : le journal du graphe note la preuve mobile de chaque flow (état, captures, verdicts mobile, ko mobile), comme la preuve web.
+- **Limites** : Flutter, Expo et React Native seulement ; pas de geste ni d'arbre des vues sur iOS (capture et journal seulement) ; pas de hot reload ; un iPhone branché n'a de capture qu'avec Flutter ; iOS demande macOS ; le premier build Gradle ou Xcode peut dépasser les 5 minutes (relance l'action `mobile`, l'app est alors déjà construite).
 
 ### Score CRAP
 
@@ -211,6 +226,7 @@ Depuis la v2.2, revo-flow découvre les agents déjà installés sur ton Claude 
 | `crap` | oui | score CRAP dans la porte : une fonction modifiée par le flow au-delà de 30 (complexité × couverture des tests liés) est une erreur nouvelle ; `non` : ni commande `crap`, ni flags de couverture |
 | `cache` | oui | brief du cache projet au lancement, extrait de fiche dans le prompt de chaque agent et outil `cache` proposé ; `non` : ni brief, ni extrait, ni outil, la commande `cache` reste et les flows comptent dans la mesure « sans cache » |
 | `web` | `extension` | preuve web du vérificateur (v3.0) : `extension` démarre le serveur de dev du projet après confirmation et navigue avec Claude in Chrome ; `devtools` déclare en plus le MCP Chrome DevTools en repli ; `off` : aucune preuve web |
+| `mobile` | `appareil` | preuve mobile du vérificateur (v3.1) : `appareil` choisit l'appareil (téléphone branché, sinon émulateur ou simulateur démarré avec sa fenêtre), lance l'app après confirmation et l'observe en direct avec l'outil `mobile` ; `mcp` déclare en plus le MCP mobile-mcp ; `off` : aucune preuve mobile |
 | `agents` | oui | catalogue des agents installés (projet, dossier personnel, plugins activés) proposé à l'orchestrateur ; un sous-agent du plan peut en prendre le type, avec son modèle et son effort ; `non` : rien n'est lu ni proposé, `general-purpose` comme avant |
 
 Sur l'app desktop, `/revo-flow` n'apparaît pas toujours dans le menu `/` : tape la commande en entier, elle fonctionne.
@@ -249,14 +265,15 @@ revo-flow/
 │   │   └── store.ts       disque et git du cache
 │   └── verif/             le flow vérifié : détection, portée, lecture des sorties, base, rapport, exécution, garde-fous
 │       ├── crap.ts        score CRAP : fonctions et complexité, lecture de la couverture, règle du scout
-│       └── web.ts         preuve web : détection du serveur de dev, URL, port, filtre des outils navigateur, captures, consigne du vérificateur
+│       ├── web.ts         preuve web : détection du serveur de dev, URL, port, filtre des outils navigateur, captures, consigne du vérificateur
+│       └── mobile.ts      preuve mobile : détection de l'app (Flutter, Expo, React Native), appareils, commandes de lancement et d'observation, consigne du vérificateur
 ├── tests/                 lancés par claude plugin test .
 │   ├── flow.test.ts
 │   ├── doctor.test.ts
 │   ├── rapport.test.ts
 │   ├── agents/            catalogue.test.ts
 │   ├── cache/             graph.test.ts, store.test.ts
-│   ├── verif/             coeur.test.ts, garde.test.ts, crap.test.ts, web.test.ts, web-flow.test.ts
+│   ├── verif/             coeur.test.ts, garde.test.ts, crap.test.ts, web.test.ts, web-flow.test.ts, mobile.test.ts, mobile-flow.test.ts
 │   ├── ui/                verif.test.ts
 │   └── helpers/os.ts      les deux machines simulées (Windows, macOS)
 ├── types/                 contrats : état du mod (index.d.ts), graphe du cache (cache.d.ts), vérification (verif.d.ts), agents installés (agents.d.ts)

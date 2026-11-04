@@ -385,7 +385,12 @@ describe('VERIFIER_PROMPT et verifierTask', () => {
       '{"id":"C2","verdict":"ok","preuve":"http://localhost:3000/panier → read_page : « Total TTC 12,00 € » présent après ajout de l’option ; console : 0 erreur ; réseau : 0 réponse 4xx/5xx ; capture 1","web":true}',
     )
     expect(VERIFIER_PROMPT).toContain('capture prise, ça a l’air bon')
-    expect(VERIFIER_PROMPT).toContain('sauf si ta tâche t’ouvre la preuve web : alors demande le serveur et navigue, voir « Preuve web » ;')
+    expect(VERIFIER_PROMPT).toContain('sauf si ta tâche t’ouvre la preuve web ou la preuve mobile : alors demande le serveur ou l’app et observe, voir « Preuve web » et « Preuve mobile » ;')
+    // v3.1 : la section « Preuve mobile », l'exemple 5 et "mobile": true dans le bloc json.
+    expect(VERIFIER_PROMPT).toContain('## Preuve mobile')
+    expect(VERIFIER_PROMPT).toContain('Exemple 5, « ko » par preuve mobile')
+    expect(VERIFIER_PROMPT).toContain('mcp__revo-flow__mobile')
+    expect(VERIFIER_PROMPT).toContain('"mobile": true')
     expect(VERIFIER_PROMPT).toContain('mcp__revo-flow__verif')
     expect(VERIFIER_PROMPT).toContain('"web": true')
   })
@@ -425,6 +430,13 @@ describe('parseVerdicts', () => {
     const v = parseVerdicts(text, CRITERES)
     expect(v[0]).toEqual({ id: 'C1', verdict: 'non-verifiable', preuve: 'verdict « ok » sans preuve exécutée' })
     expect(v.length).toBe(3)
+  })
+
+  test('mobile: true gardé quand le verdict le porte (preuve mobile, v3.1), absent sinon', () => {
+    const c = [{ id: 'C1', texte: 'a' }, { id: 'C2', texte: 'b' }]
+    const v = parseVerdicts('```json\n[{"id":"C1","verdict":"ko","preuve":"SM A515F : 1 débordement ; capture 1","mobile":true},{"id":"C2","verdict":"ok","preuve":"vitest → ok"}]\n```', c)
+    expect(v[0]).toEqual({ id: 'C1', verdict: 'ko', preuve: 'SM A515F : 1 débordement ; capture 1', mobile: true })
+    expect(v[1]).toEqual({ id: 'C2', verdict: 'ok', preuve: 'vitest → ok' })
   })
 
   test('web: true gardé quand le verdict le porte, absent sinon', () => {

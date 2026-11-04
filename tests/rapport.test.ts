@@ -453,6 +453,21 @@ test('rapportMarkdown : preuve web prête, deux captures et un verdict web', () 
   expect(avecWeb({ ...WEB, etat: 'arrete' })).toContain('**Preuve web** : serveur « npm run dev »')
 })
 
+test('rapportMarkdown : preuve mobile (v3.1) prête avec captures, verdict mobile ; elle remplace le paragraphe web ; refusée, en erreur, en cours', () => {
+  const verdicts = [{ id: 'C1', verdict: 'ko' as const, preuve: 'SM A515F : 1 débordement ; capture 1', mobile: true }, { id: 'C2', verdict: 'ok' as const, preuve: 'vitest → ok' }]
+  const mobile = { etat: 'pret' as const, framework: 'Flutter', appareil: 'SM A515F (téléphone branché, Android 13 (API 33))', commande: 'flutter run -d 192.168.1.13:40481', captures: ['/r/sorties/capture-1.png'] }
+  const md = rapportMarkdown({ ...BASE, criteres: CRITERES, verdicts, web: { etat: 'non-demande', captures: [] }, mobile })
+  expect(md).toContain('ko ✗ · preuve mobile')
+  expect(md).toContain('**Preuve mobile** : app Flutter « flutter run -d 192.168.1.13:40481 » sur SM A515F (téléphone branché, Android 13 (API 33)), 1 capture : [capture-1.png](</r/sorties/capture-1.png>)')
+  expect(md).not.toContain('**Preuve web**')
+  expect(rapportMarkdown({ ...BASE, criteres: CRITERES, verdicts, mobile: { ...mobile, etat: 'arrete', emulateurLance: true, captures: [] } })).toContain('(émulateur démarré par revo-flow), aucune capture')
+  expect(rapportMarkdown({ ...BASE, criteres: CRITERES, verdicts, mobile: { etat: 'refuse', captures: [] } })).toContain('**Preuve mobile** : app non lancée (choix de l’utilisateur)')
+  expect(rapportMarkdown({ ...BASE, criteres: CRITERES, verdicts, mobile: { etat: 'erreur', captures: [], note: 'aucun appareil' } })).toContain('**Preuve mobile** : l’app n’a pas été lancée : aucun appareil')
+  expect(rapportMarkdown({ ...BASE, criteres: CRITERES, verdicts, mobile: { etat: 'installation', captures: [] } })).toContain('**Preuve mobile** : app en cours de lancement')
+  // Non demandée : le paragraphe web reprend sa place.
+  expect(rapportMarkdown({ ...BASE, criteres: CRITERES, verdicts, mobile: { etat: 'non-demande', captures: [] } })).toContain('**Preuve web**')
+})
+
 test('rapportMarkdown : preuve web refusée, en erreur, en cours ou absente', () => {
   expect(avecWeb({ etat: 'refuse', captures: [] })).toContain('**Preuve web** : serveur non démarré (choix de l’utilisateur) : les critères web sont non vérifiables')
   expect(avecWeb({ etat: 'erreur', captures: [], note: 'port occupé' })).toContain('**Preuve web** : le serveur n’a pas démarré : port occupé')

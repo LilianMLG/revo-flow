@@ -9,7 +9,7 @@
 > Question posée : « quelle prochaine version serait vraiment intéressante, et le mod est-il assez complet pour
 > avoir des utilisateurs, en vue d'une pub sur LinkedIn ? »
 
-> Lot B livré en v3.0 le 2026-10-31 : voir §3
+> Lot B livré en v3.0 le 2026-10-31 : voir §3. Lot C (preuve mobile) livré en v3.1 le 2026-11-04 : voir §3 bis.
 
 ## Verdict
 
@@ -199,13 +199,31 @@ Pourquoi c'est la bonne feature pour une v3 : c'est la plus démonstrative (une 
 post à soi tout seul), aucun orchestrateur open source ne la fait proprement, et elle réutilise le vérificateur et
 les critères du lot 2 sans rien changer au reste.
 
+## 3 bis. Lot C : v3.1, « preuve à l'exécution mobile, choisie selon le projet »
+
+Reprise du lot 4 de la R&D v2 ([execution.md](../rd-v2/execution.md) §3), livrée le 2026-11-04 sans l'essai d'un jour :
+l'auteur l'a demandée directement, avec deux exigences : **revo-flow choisit tout seul** la preuve qui vaut pour le
+projet (web ou mobile), et **l'utilisateur voit la vérification en direct**, jamais en arrière-plan.
+
+| Point | Décision |
+|---|---|
+| Choix web ou mobile | `preuveTask` (register.tsx) : une app mobile détectée (`pubspec.yaml` qui dépend de `flutter`, ou `expo` / `react-native` dans `package.json`) ouvre « Preuve mobile » au vérificateur ; sinon « Preuve web ». L'action `web` sur une app mobile renvoie vers `mobile`, et inversement. `/revo-flow doctor` montre la ligne `Mobile` à la place de `Web` |
+| Voie retenue (§3.2 de la R&D v2) | Ni Dart MCP ni Maestro : un **outil `mobile` de revo-flow** qui passe par les commandes du poste (`flutter screenshot`, `adb`, `xcrun simctl`), sans serveur MCP à installer ; option `mcp` pour déclarer mobile-mcp en plus. Les goldens (voie A) restent du ressort de la porte |
+| Appareils | `flutter devices --machine` + `flutter emulators` (Flutter) ; `adb devices -l`, `emulator -list-avds`, `xcrun simctl list` (Expo, React Native). Ordre : téléphone branché capable de capture, émulateur ou simulateur allumé, iPhone branché (sans capture), émulateur à démarrer. Plusieurs candidats : l'utilisateur choisit (3 au plus) |
+| En direct | Émulateur démarré **avec sa fenêtre** (jamais `-no-window`), toast au démarrage et quand l'app est à l'écran, ligne « preuve mobile » du panneau par étape (démarrage, installation, prête), chaque action de l'outil `mobile` affichée dans le panneau (« Mobile toucher 540,1660 »), dernière capture montrée ; un vérificateur demandé en arrière-plan (`run_in_background`) est refusé |
+| Ce que voit le vérificateur | `capture` (PNG écrit, lu avec `Read`), `arbre` (uiautomator condensé : classe, texte, id, centre), `journal` (exceptions Flutter, débordements, erreurs logcat), `toucher`, `glisser`, `texte`, `touche` ; verdict marqué `"mobile": true` |
+| Arrêt | L'app est toujours arrêtée en fin de flow ; l'émulateur ou le simulateur seulement si revo-flow l'a démarré ; un téléphone n'est jamais touché |
+| Délais | 3 min pour l'émulateur (sonde toutes les 3 s), 5 min pour le build et la pose |
+| Limites connues | Pas de geste ni d'arbre sur iOS ; pas de hot reload (demanderait `--pid-file` et SIGUSR1) ; un iPhone branché n'a de capture qu'avec Flutter ; le premier build peut dépasser 5 min |
+| Tests | `tests/verif/mobile.test.ts` (module pur) et `tests/verif/mobile-flow.test.ts` (flow complet, Windows et macOS : téléphone branché, émulateur démarré puis éteint, échec de build, projet Nuxt, option off, vérificateur en arrière-plan refusé) |
+
 ## 4. Écarté ou différé
 
 | Piste | Verdict | Pourquoi |
 |---|---|---|
 | Embeddings, symboles, liens Front ↔ Back, export d'équipe | Différé | Déjà jugés dans [ameliorations.md](../rd-graphe-cache/ameliorations.md) ; aucun utilisateur ne les réclame |
 | Worktrees par agent | Écarté | R&D v2, piste 6 : conflits de fusion, `node_modules`, `CLAUDE.md` non chargé |
-| Preuve mobile (émulateur) | Différé | R&D v2, piste 4 : essai d'un jour d'abord, après le lot B |
+| Preuve mobile (émulateur) | **Livrée en v3.1** | Voir §3 bis ; l'essai d'un jour a été sauté sur décision de l'auteur |
 | Mode « simple » qui cache le cache, le CRAP et le gel | Écarté | `doctor` (A2) répond au même besoin sans dédoubler le produit ; les options existent déjà |
 | Découper `hooks/register.tsx` (3 700 lignes) | Dette, pas une feature | À faire par morceaux au fil des lots A3 et A4, qui touchent la fin de flow et l'état : sortir au moins l'état (`atoms`), les commandes et la fin de flow dans des modules |
 | Messages en anglais (A5) | Différé | Voir §2 |

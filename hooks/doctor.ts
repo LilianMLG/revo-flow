@@ -8,6 +8,7 @@ import { CRAP_SEUIL } from './verif/crap'
 import { commandLabel } from './verif/detect'
 import { baseFor } from './verif/base'
 import { durationOf } from './verif/runner'
+import { deviceLabel, frameworkLabel, type MobileDispo } from './verif/mobile'
 import { commandeText, type WebDispo } from './verif/web'
 
 /** Largeur de la colonne des titres (« Stack », « Typage »…) : la maquette aligne le reste dessous. */
@@ -46,6 +47,8 @@ export type DoctorInput = {
   pieges: string[]
   /** La preuve web : option, serveur de dev détecté, REVO_WEB_LOGIN défini ; absent = rubrique non affichée. */
   web?: WebDispo
+  /** La preuve mobile : option, app détectée, appareils vus ; absent = rubrique non affichée. */
+  mobile?: MobileDispo
 }
 
 const LIBELLE: Record<VerifOutil, string> = { generation: 'Génération', format: 'Format', lint: 'Lint', typage: 'Typage', tests: 'Tests', qualite: 'CRAP' }
@@ -188,6 +191,21 @@ function webLines(w: WebDispo): string[] {
   return [ligne('Web', `${commandeText(s)} · ${port} · ${s.origine} · preuve web au vérificateur sur votre accord · outils : ${outils}`), suite(login)]
 }
 
+/** La rubrique Mobile : l'app détectée, les appareils du poste (téléphone branché, émulateur, simulateur) et ce que fera le vérificateur. */
+function mobileLines(m: MobileDispo): string[] {
+  if (m.option === 'off') return [ligne('Mobile', 'preuve mobile désactivée (option mobile)')]
+  const app = m.app
+  if (!app) return [ligne('Mobile', 'aucune app mobile détectée (ni pubspec.yaml Flutter, ni react-native ou expo) : pas de preuve mobile')]
+  const outils = m.option === 'mcp' ? 'outil mobile de revo-flow (capture, arbre, journal, gestes), et mobile-mcp (npx @mobilenext/mobile-mcp)' : 'outil mobile de revo-flow (capture, arbre, journal, gestes)'
+  const appareils = m.appareils?.length
+    ? `appareils : ${m.appareils.map(deviceLabel).join(', ')}`
+    : 'aucun appareil vu : branchez un téléphone (adb ou Xcode) ou créez un émulateur / simulateur'
+  return [
+    ligne('Mobile', `app ${frameworkLabel(app.framework)} (${app.origine}, ${app.plateformes.join(' et ')}) · preuve mobile au vérificateur sur votre accord, en direct sur l’appareil · outils : ${outils}`),
+    suite(appareils),
+  ]
+}
+
 /**
  * Le texte de /revo-flow doctor. Sans projet : le dit, et dit que la porte ne fera rien. Avec un projet : stack, porte, une ligne par
  * commande, CRAP, base de référence, cache, agents, pièges.
@@ -211,7 +229,9 @@ export function doctorText(input: DoctorInput): string {
   lignes.push(baseLine(input))
   lignes.push(cacheLine(input))
   lignes.push(agentsLine(input))
-  if (input.web) lignes.push(...webLines(input.web))
+  // Un projet a l'une ou l'autre : la rubrique Mobile remplace la rubrique Web quand une app mobile est détectée.
+  if (input.mobile?.app || (input.mobile && !input.web)) lignes.push(...mobileLines(input.mobile))
+  else if (input.web) lignes.push(...webLines(input.web))
   if (input.pieges.length === 0) lignes.push(ligne('Pièges', 'aucun'))
   else input.pieges.forEach((p, i) => lignes.push(i === 0 ? ligne('Pièges', p) : suite(p)))
   return lignes.join('\n')

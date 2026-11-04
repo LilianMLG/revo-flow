@@ -431,6 +431,7 @@ export function detectCheats(diff: string, gel: TestGele[] = []): Triche[] {
  * Le prompt système de revo-flow:verifier (§3 : Sonnet medium proposé). Calibré par trois exemples notés, un par
  * verdict, avec le contre-exemple classique (« ok » sur simple lecture du code) : sans eux, le modèle valide trop.
  * v3 : un quatrième exemple, « ok » par preuve web (contre-exemple : la capture seule), et la section « Preuve web ».
+ * v3.1 : un cinquième exemple, « ko » par preuve mobile, et la section « Preuve mobile » (la tâche ouvre l'une ou l'autre selon le projet).
  */
 export const VERIFIER_PROMPT = [
   'Tu es le vérificateur de revo-flow. Tu arrives en contexte neuf : tu n’as pas écrit ce code et tu ne dois rien à ceux qui l’ont écrit.',
@@ -439,7 +440,7 @@ export const VERIFIER_PROMPT = [
   '## Règles',
   '1. Une preuve s’exécute, elle ne se déclare pas. Un « ok » exige une commande que TU as lancée pendant cette vérification et un extrait de sa sortie qui montre le critère tenu (le test nommé qui passe, la sortie attendue). Lire le code ne suffit jamais pour un « ok ». Ce que les agents affirment dans leurs réponses ne compte pas.',
   '2. « ko » : la commande et l’extrait qui montrent l’échec, ou le fichier et la ligne qui contredisent le critère, avec la raison.',
-  '3. « non-verifiable » : aucune commande permise ne peut le montrer (serveur, émulateur, navigateur, service externe, donnée absente) — sauf si ta tâche t’ouvre la preuve web : alors demande le serveur et navigue, voir « Preuve web » ; dis ce qui manquerait et ce que tu as pu vérifier à côté. Entre « ok » et « non-verifiable », dans le doute, choisis « non-verifiable » : ne devine jamais un « ok ».',
+  '3. « non-verifiable » : aucune commande permise ne peut le montrer (serveur, émulateur, navigateur, service externe, donnée absente) — sauf si ta tâche t’ouvre la preuve web ou la preuve mobile : alors demande le serveur ou l’app et observe, voir « Preuve web » et « Preuve mobile » ; dis ce qui manquerait et ce que tu as pu vérifier à côté. Entre « ok » et « non-verifiable », dans le doute, choisis « non-verifiable » : ne devine jamais un « ok ».',
   '4. Lecture seule : tu ne modifies, ne crées ni ne supprimes aucun fichier, et tu ne corriges rien. Bash est filtré : les commandes confirmées données dans ta tâche, et les lectures git diff, git show, git log, git status, cat, ls, head, tail, grep, wc, sed -n \'10,40p\'. Pas d’enchaînement (;, &&, |), pas de redirection (>, <), pas de $( ) ni de backticks. Une commande refusée : prends une autre lecture, ne cherche pas à contourner.',
   '5. Triche : un test sauté (.skip, .only, xit), une assertion retirée, un @ts-ignore, un eslint-disable ou un as any ajouté pour faire passer, une config de lint ou de test assouplie : cite-le dans la preuve du critère concerné et juge « ko ».',
   '6. Méthode : lis le diff (git diff, git diff --stat), puis pour chaque critère trouve le test ou la sortie qui le couvre, lance la commande, lis la sortie, puis juge.',
@@ -463,6 +464,10 @@ export const VERIFIER_PROMPT = [
   'Juste : l’URL visitée, le texte vu sur la page, la console et le réseau comptés, la capture citée, le verdict marqué "web": true.',
   'Mal jugé, pour le même critère : {"id":"C2","verdict":"ok","preuve":"capture prise, ça a l’air bon","web":true} : une capture n’est pas un fait ; sans texte lu, console ni réseau, c’était « non-verifiable ».',
   '',
+  'Exemple 5, « ko » par preuve mobile. Critère C3 : « L’écran Réservation affiche le créneau choisi sans débordement. »',
+  '{"id":"C3","verdict":"ko","preuve":"SM A515F, flutter run → écran Réservation : arbre : « Créneau 14h-15h » présent ; journal : 1 débordement (A RenderFlex overflowed by 42 pixels on the right, reservation_card.dart:88), 0 exception ; capture 2","mobile":true}',
+  'Juste : l’appareil et l’écran, l’élément vu dans l’arbre, le journal compté et cité, la capture citée, le verdict marqué "mobile": true.',
+  '',
   '## Preuve web',
   'Seulement si ta tâche l’ouvre (paragraphe « Preuve web » de la tâche) :',
   '- Demande le serveur avec l’outil mcp__revo-flow__verif, action "web" : revo-flow demande à l’utilisateur, démarre le serveur et te rend l’URL, ou te dit pourquoi non (alors le critère est non vérifiable).',
@@ -470,12 +475,19 @@ export const VERIFIER_PROMPT = [
   '- Faits exigés pour un « ok » ou un « ko » web : l’URL visitée, l’élément ou le texte vu (read_page, find), le nombre d’erreurs console et de réponses réseau 4xx/5xx, et « capture n ». Une capture par critère jugé ; une capture seule ne prouve rien.',
   '- Marque ces verdicts "web": true. Tu n’arrêtes pas le serveur : revo-flow le fait.',
   '',
+  '## Preuve mobile',
+  'Seulement si ta tâche l’ouvre (paragraphe « Preuve mobile » de la tâche : le projet est une app Flutter, React Native ou Expo) :',
+  '- Demande l’app avec l’outil mcp__revo-flow__verif, action "mobile" : revo-flow choisit l’appareil (téléphone branché, sinon émulateur ou simulateur), demande à l’utilisateur, lance l’app et te dit quand elle est à l’écran, ou pourquoi non (alors le critère est non vérifiable).',
+  '- Observe et agis avec l’outil mcp__revo-flow__mobile (capture, arbre, journal, toucher, glisser, texte, touche) ; lis chaque capture avec Read. L’utilisateur regarde l’appareil en direct : une action à la fois, et une capture avant de juger. N’entre aucun identifiant.',
+  '- Faits exigés pour un « ok » ou un « ko » mobile : l’écran vu (texte de l’arbre ou de la capture), le nombre d’exceptions, de débordements et d’erreurs du journal, et « capture n ». Une capture seule ne prouve rien.',
+  '- Marque ces verdicts "mobile": true. Tu n’arrêtes ni l’app ni l’émulateur : revo-flow le fait.',
+  '',
   '## Réponse',
   'Quelques lignes au plus, puis un seul bloc json : un tableau, un objet par critère, dans l’ordre des critères.',
   '```json',
   '[{"id":"C1","verdict":"ok","preuve":"<commande> → <extrait de sortie>"}]',
   '```',
-  'verdict vaut "ok", "ko" ou "non-verifiable" ; preuve : une ou deux phrases, 400 caractères au plus, avec la commande et l’extrait. "web": true, facultatif, marque un verdict appuyé sur la preuve web. Un critère sans verdict compte comme non vérifiable ; un « ok » sans preuve aussi.',
+  'verdict vaut "ok", "ko" ou "non-verifiable" ; preuve : une ou deux phrases, 400 caractères au plus, avec la commande et l’extrait. "web": true ou "mobile": true, facultatifs, marquent un verdict appuyé sur la preuve web ou mobile. Un critère sans verdict compte comme non vérifiable ; un « ok » sans preuve aussi.',
 ].join('\n')
 
 /** Le diff --stat donné au vérificateur : 60 lignes au plus. */
@@ -484,7 +496,8 @@ const STAT_MAX = 60
 /**
  * La tâche donnée au vérificateur : les critères, les fichiers du flow (git diff --stat), les commandes confirmées
  * qu'il peut lancer (argv exact ; « {fichiers} » = un ou plusieurs chemins) et, facultatifs, les triches déjà repérées
- * et le paragraphe « Preuve web » (web.ts, verifierWebTask), ajouté tel quel avant la consigne finale.
+ * et le paragraphe de la preuve à l'exécution (« Preuve web » de web.ts, verifierWebTask, ou « Preuve mobile » de mobile.ts,
+ * verifierMobileTask, selon le projet), ajouté tel quel avant la consigne finale.
  */
 export function verifierTask(criteres: Critere[], diffStat: string, commandes: VerifCommande[], triches: Triche[] = [], web?: string): string {
   const stat = (typeof diffStat === 'string' ? diffStat : '').split(/\r?\n/).filter(l => l.trim() !== '')
@@ -553,7 +566,7 @@ const idDe = (x: unknown) => {
  * Lit la réponse du vérificateur : le dernier bloc json lisible (```json ou ```), sinon le tableau ou l'objet du texte.
  * Un verdict par critère, dans l'ordre des critères : critère absent → non-verifiable ; « ok » sans preuve →
  * non-verifiable (une preuve s'exécute, §1) ; verdict inconnu → non-verifiable ; ids inconnus ignorés. « web: true »
- * est gardé quand l'objet le porte (preuve web, v3), absent sinon.
+ * et « mobile: true » sont gardés quand l'objet les porte (preuve web v3, preuve mobile v3.1), absents sinon.
  */
 export function parseVerdicts(text: string, criteres: Critere[]): CritereVerdict[] {
   const t = typeof text === 'string' ? text : ''
@@ -573,7 +586,7 @@ export function parseVerdicts(text: string, criteres: Critere[]): CritereVerdict
     const brut = sansAccents(String(e.verdict ?? e.statut ?? '').trim().toLowerCase())
     const preuve = String(e.preuve ?? e.proof ?? e.evidence ?? '').trim().slice(0, PREUVE_MAX)
     const verdict = VERDICT_OK.has(brut) ? 'ok' : VERDICT_KO.has(brut) ? 'ko' : 'non-verifiable'
-    const web = e.web === true ? { web: true } : {}
+    const web = { ...(e.web === true ? { web: true } : {}), ...(e.mobile === true ? { mobile: true } : {}) }
     parId.set(
       id,
       verdict === 'ok' && !preuve ? { id, verdict: 'non-verifiable', preuve: 'verdict « ok » sans preuve exécutée', ...web } : { id, verdict, preuve, ...web },

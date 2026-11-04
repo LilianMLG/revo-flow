@@ -65,7 +65,7 @@ export type ViewData = {
   cacheOpen: boolean
   /** La vérification du flow (porte de fin) ; null sans projet vérifié. */
   verif: VerifView | null
-  /** La dernière capture de la preuve web (base64 PNG nue) et son nom (« capture-2.png ») ; remplie par register.tsx. */
+  /** La dernière capture de la preuve web ou mobile (base64 PNG nue) et son nom (« capture-2.png ») ; remplie par register.tsx. */
   capture?: { png: string; nom: string }
 }
 
@@ -86,7 +86,7 @@ export type PaneActions = {
   openRapport(): unknown
   /** Relance la vérification (bouton Relancer). */
   rerunVerif(): unknown
-  /** Ouvre la dernière capture de la preuve web (bouton capture). */
+  /** Ouvre la dernière capture de la preuve web ou mobile (bouton capture). */
   openCapture: () => void
 }
 
@@ -232,6 +232,25 @@ export function webLine(v: VerifView): { mark: string; tone: VerifTone; text: st
   return undefined
 }
 
+/** La ligne de la preuve mobile (« preuve mobile : SM A515F (téléphone branché) · app lancée · 2 captures ») ; undefined quand il n'y a rien à dire. */
+export function mobileLine(v: VerifView): { mark: string; tone: VerifTone; text: string } | undefined {
+  const m = v.mobile
+  if (!m) return undefined
+  const n = m.captures.length
+  const captures = n > 0 ? ` · ${n} capture${n > 1 ? 's' : ''}` : ''
+  const ou = m.appareil ?? 'l’appareil'
+  if (m.etat === 'demarrage') return { mark: '…', tone: 'dim', text: `preuve mobile : démarrage de ${ou} (regardez sa fenêtre)` }
+  if (m.etat === 'installation') return { mark: '…', tone: 'dim', text: `preuve mobile : « ${m.commande ?? 'lancement de l’app'} » sur ${ou}` }
+  if (m.etat === 'pret') return { mark: '✓', tone: 'ok', text: `preuve mobile : app${m.framework ? ` ${m.framework}` : ''} à l’écran sur ${ou}, en direct${captures}` }
+  if (m.etat === 'refuse') return { mark: '–', tone: 'dim', text: 'preuve mobile : app non lancée (votre choix)' }
+  if (m.etat === 'erreur') return { mark: '⚠', tone: 'warn', text: `preuve mobile : ${m.note ?? 'erreur'}` }
+  if (m.etat === 'arrete') return { mark: '·', tone: 'dim', text: `preuve mobile : app arrêtée${m.emulateurLance ? ', émulateur éteint' : ''}${captures}` }
+  return undefined
+}
+
+/** Les captures de la preuve à l'exécution (web ou mobile) : le bouton capture et l'image du panneau en dépendent. */
+export const captureCount = (v: VerifView | null | undefined) => (v?.web?.captures.length ?? 0) + (v?.mobile?.captures.length ?? 0)
+
 /** Les remarques sous les commandes, une par ligne : base, tests gelés, triches, critères, question en attente. */
 export function verifNotes(v: VerifView): { mark: string; tone: VerifTone; text: string }[] {
   const notes: { mark: string; tone: VerifTone; text: string }[] = []
@@ -243,6 +262,8 @@ export function verifNotes(v: VerifView): { mark: string; tone: VerifTone; text:
   if (crit) notes.push({ mark: v.criteres && v.criteres.verdicts.some(x => x.verdict === 'ko') ? '✗' : '✓', tone: v.criteres && v.criteres.verdicts.some(x => x.verdict === 'ko') ? 'ko' : 'ok', text: crit })
   const web = webLine(v)
   if (web) notes.push(web)
+  const mobile = mobileLine(v)
+  if (mobile) notes.push(mobile)
   if (v.enAttente) notes.push({ mark: '?', tone: 'warn', text: `en attente de votre réponse : ${v.enAttente}` })
   return notes
 }
@@ -850,7 +871,7 @@ export function DesktopPane(t: Elements['desktop'], d: ViewData, actions: PaneAc
               ))}
               {d.capture && <Text key="capture-nom" dimColor>{d.capture.nom}</Text>}
               <Box flexDirection="row" justifyContent="flex-end" gap={2} width="100%">
-                {v.web?.captures.length ? <Button key="verif-capture" plain label="capture" onPress={() => actions.openCapture()} /> : null}
+                {captureCount(v) ? <Button key="verif-capture" plain label="capture" onPress={() => actions.openCapture()} /> : null}
                 {v.detail && <Button key="verif-detail" plain label="Détail" onPress={() => actions.openVerif()} />}
                 {v.mode !== 'off' && <Button key="verif-rerun" plain label="Relancer" onPress={() => actions.rerunVerif()} />}
               </Box>
@@ -1140,7 +1161,7 @@ export function TerminalPane(t: Elements['terminal'], d: ViewData, actions: Pane
       ))}
       {d.capture && Image ? <Image key="capture" source={{ png: d.capture.png }} alt={d.capture.nom} /> : null}
       {d.capture && !Image ? <Text key="capture-nom" dimColor>{`  ${d.capture.nom}`}</Text> : null}
-      {v.web?.captures.length ? (
+      {captureCount(v) ? (
         <Box key="capture-actions" gap={2}>
           <Button key="verif-capture" plain label="capture" onPress={() => actions.openCapture()} />
         </Box>
