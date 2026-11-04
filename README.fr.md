@@ -4,9 +4,9 @@
 
 Mod Claude Code qui orchestre une demande avec une équipe de sous-agents, et montre l'avancement de chacun.
 
-![Un flow revo-flow avec preuve web : plan, agents, porte de vérification, le vérificateur ouvre l'app dans Chrome, verdict](docs/demo-preuve-web.gif)
+![Un flow revo-flow avec preuve mobile : plan, agents, porte de vérification, le vérificateur lance l'app sur un téléphone, lit l'écran et touche, verdict](docs/demo-preuve-mobile.gif)
 
-*Un flow complet avec la preuve web de la v3, rejoué avec les dessins du panneau : plan, agents, porte, le vérificateur ouvre l'app sur localhost, verdict.*
+*Un flow complet de la v3.1 avec preuve mobile sur une app de démo, rejoué avec les dessins du panneau : plan, agents, porte, le vérificateur lance l'app sur le téléphone, lit le total, touche « Valider », verdict. La preuve web dans Chrome : [docs/demo-preuve-web.gif](docs/demo-preuve-web.gif).*
 
 ## Installation
 

@@ -2,9 +2,9 @@
 
 A Claude Code mod that turns one request into a plan, splits it between sub-agents, shows each agent's progress, and checks the result itself before calling it done.
 
-![A revo-flow flow with web proof: plan, agents, verification gate, the verifier opening the app in Chrome, verdict](docs/demo-preuve-web.gif)
+![A revo-flow flow with mobile proof: plan, agents, verification gate, the verifier running the app on a phone, reading the screen and tapping, verdict](docs/demo-preuve-mobile.gif)
 
-*A full flow with the v3 web proof, replayed with the panel's own drawings: plan, agents, gate, the verifier opening the app on localhost, verdict.*
+*A full v3.1 flow with mobile proof on a demo app, replayed with the panel's own drawings: plan, agents, gate, the verifier running the app on a phone, reading the total, tapping "Validate", verdict. The web proof in Chrome: [docs/demo-preuve-web.gif](docs/demo-preuve-web.gif).*
 
 Full documentation is in French: [README.fr.md](README.fr.md).
 
