@@ -196,6 +196,26 @@ export function pauseTasks(tasks: readonly FlowTask[]): FlowTask[] {
   return tasks.map(t => (t.status === 'in_progress' ? { ...t, status: 'pending' as const } : t))
 }
 
+/**
+ * Un agent qui avait fini est renvoyé au travail (porte rouge, demande de l'orchestrateur) : une tâche de plus, en cours, au bout de
+ * sa liste, pour que sa barre montre le nouveau travail au lieu de rester pleine. Pas de doublon si la même reprise est déjà ouverte.
+ */
+export function reworkTasks(tasks: readonly FlowTask[], title: string): FlowTask[] {
+  const last = tasks.at(-1)
+  if (last && last.title === title && last.status !== 'completed') return tasks.map((t, i) => (i === tasks.length - 1 ? { ...t, status: 'in_progress' as const } : t))
+  return [...tasks, { title, kind: 'codage', status: 'in_progress' }]
+}
+
+/**
+ * Le titre de la tâche de reprise : « Corriger la porte (typecheck, eslint) » quand la dernière porte est rouge, sinon la première phrase
+ * du message de l'orchestrateur (« Reprise : … »), sinon « Reprise demandée par l'orchestrateur ».
+ */
+export function reworkTitle(message: string, rouges: readonly string[] = []): string {
+  if (rouges.length) return `Corriger la porte (${rouges.join(', ')})`
+  const s = firstSentence(typeof message === 'string' ? message : '', 60)
+  return s ? `Reprise : ${s}` : 'Reprise demandée par l’orchestrateur'
+}
+
 /** L'agent a fini : tout est fait ; s'il a échoué, la tâche en cours (ou la première restante) passe en échec. */
 export function finishTasks(tasks: readonly FlowTask[], failed: boolean): FlowTask[] {
   if (!failed) return tasks.map(t => (t.status === 'failed' ? t : { ...t, status: 'completed' as const }))
@@ -457,7 +477,7 @@ export function agentBrief(a: FlowAgent, cache: AgentCache | boolean = 'fiches',
   const resume = done > 0 && done < a.tasks.length
   const check =
     verif && a.subagentType !== 'Explore' && !isVerifier(a)
-      ? `\nAvant de finir, appelle l'outil ${VERIF_TOOL} action lancer sur tes fichiers ; corrige ce qui est nouveau et à toi (les erreurs préexistantes ou d'un autre agent ne sont pas à toi).${crap ? SCOUT : ''}`
+      ? `\nNe lance pas toi-même le lint, le typage ni les tests du projet : revo-flow les lance une seule fois, quand tous les agents ont fini (la porte). Si elle trouve une erreur nouvelle dans tes fichiers, l'orchestrateur te renverra la corriger.${crap ? SCOUT : ''}`
       : ''
   return `# Tes tâches (revo-flow) — « ${a.name} »${a.role ? ` : ${a.role}` : ''}
 ${a.tasks.map((t, i) => `${i + 1}. ${t.title}${t.status === 'completed' ? ' ✓ déjà faite' : ''}`).join('\n')}

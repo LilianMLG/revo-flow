@@ -143,7 +143,7 @@ Depuis la v2, un flow ne finit plus « terminé » sur un lint, un typage ou un 
 
 | Action | Effet |
 | --- | --- |
-| `lancer` | tous : lance la vérification sur les fichiers de l'appelant ; un agent le fait avant de finir et ne voit que les erreurs de ses fichiers |
+| `lancer` | orchestrateur : lance la vérification sur tout le flow (ou les fichiers donnés). Les sous-agents ne vérifient pas : la porte le fait une seule fois, quand tous ont fini, et un agent renvoyé corriger reçoit une tâche « Corriger la porte (…) » dans sa barre |
 | `resultat` | tous : le dernier résultat (commandes, erreurs nouvelles, préexistantes, instables) |
 | `commandes` | orchestrateur seul : une liste de commandes corrigée, ou des tests à exclure ; toujours reposée à l'utilisateur |
 | `exception` | orchestrateur seul : terminer malgré le rouge, avec un motif ; toujours reposée à l'utilisateur |

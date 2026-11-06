@@ -10,6 +10,8 @@ import {
   bashReadFile,
   findAgent,
   finishTasks,
+  reworkTasks,
+  reworkTitle,
   flowRecap,
   fmtDuration,
   leadBrief,
@@ -1605,8 +1607,9 @@ for (const os of OSES) {
       expect(w.asked[0]!).toMatch(/revo-flow a trouvé ces vérifications pour ui-vel/)
       expect(w.asked[0]!).toMatch(/npx tsc --noEmit/)
       expect(w.asked[0]!).toMatch(/Utiliser.*Ajuster.*Pas de vérification/)
-      // La consigne de chaque agent : verif lancer avant de finir.
-      expect(w.prompts[0]).toMatch(/Avant de finir, appelle l'outil mcp__revo-flow__verif action lancer sur tes fichiers/)
+      // La consigne de chaque agent : pas de vérification par agent, la porte le fait une fois à la fin.
+      expect(w.prompts[0]).toMatch(/Ne lance pas toi-même le lint, le typage ni les tests du projet : revo-flow les lance une seule fois/)
+      expect(w.prompts[0]).not.toMatch(/action lancer sur tes fichiers/)
       // La base de référence a tourné en fond, sur le projet entier (vert au commit de départ).
       expect((w.states.verif as { base: string }).base).toBe('prete')
       expect(w.runs.some(r => r.includes('tsc'))).toBe(true)
@@ -1663,19 +1666,56 @@ for (const os of OSES) {
       expect(await run($, 'historique')).toMatch(/· vérif ✓/)
     })
 
-    test('verif lancer : un agent ne vérifie que ses fichiers ; resultat avant la porte', async ($, on) => {
+    test('verif lancer : un sous-agent ne lance rien, seule la porte vérifie, une fois ; resultat avant la porte', async ($, on) => {
       const w = world(on, os)
       seedVerif(w, os)
       const { front } = await launchVerif($, w)
-      expect(JSON.stringify(await $.tool.call({ tool: 'mcp__revo-flow__verif', action: 'lancer', agentId: front } as never))).toMatch(/aucun fichier modifié à ton nom/)
       await $.tool.call({ tool: 'Edit', file_path: native(os, 'Documents', 'Front', 'ui-vel', 'components', 'Basket.vue'), agentId: front, tool_use_id: 'u1' } as never)
       w.verifRun.tsc = RED
+      const avant = w.runs.filter(r => r.includes('tsc')).length
       const r = JSON.stringify(await $.tool.call({ tool: 'mcp__revo-flow__verif', action: 'lancer', agentId: front } as never))
-      expect(r).toMatch(/« Front panier », 1 fichier/)
-      expect(r).toMatch(/TS2322/)
+      expect(r).toMatch(/pas de vérification par agent/)
+      // Aucune commande lancée pour l'agent : ni typage, ni tests.
+      expect(w.runs.filter(r => r.includes('tsc')).length).toBe(avant)
       expect(JSON.stringify(await $.tool.call({ tool: 'mcp__revo-flow__verif', action: 'resultat' } as never))).toMatch(/aucune porte encore lancée/)
       // Les actions de décision sont à l'orchestrateur.
       expect(JSON.stringify(await $.tool.call({ tool: 'mcp__revo-flow__verif', action: 'exception', motif: 'x', agentId: front } as never))).toMatch(/réservée à l’orchestrateur/)
+    })
+
+    test('porte rouge : l’agent renvoyé corriger par SendMessage reçoit une tâche de plus, en cours, puis faite', async ($, on) => {
+      const w = world(on, os)
+      seedVerif(w, os)
+      const { front, api } = await launchVerif($, w)
+      await $.tool.call({ tool: 'Edit', file_path: native(os, 'Documents', 'Front', 'ui-vel', 'components', 'Basket.vue'), agentId: front, tool_use_id: 'u1' } as never)
+      w.verifRun.tsc = RED
+      await endTurn($, w, front, 'completed')
+      await endTurn($, w, api, 'completed')
+      expect((await stop($)).block).toMatch(/rouge \(tentative 1\/3\)/)
+      const avant = agentIn(w, 'front-panier').tasks.length
+      expect(agentIn(w, 'front-panier').tasks.every(t => t.status === 'completed')).toBe(true)
+      // L'orchestrateur renvoie l'agent corriger, avec son id.
+      await $.tool.call({ tool: 'SendMessage', to: front, message: 'Corrige le TS2322 de Basket.vue.' } as never)
+      await $.turn.start({ turnId: 'r1', agentId: front } as never)
+      const a = agentIn(w, 'front-panier')
+      expect(a.status).toBe('running')
+      expect(a.tasks.length).toBe(avant + 1)
+      expect(a.tasks.at(-1)).toEqual({ title: 'Corriger la porte (typecheck)', kind: 'codage', status: 'in_progress' })
+      expect(w.toasts.some(t => /« Front panier » reprend : Corriger la porte \(typecheck\)/.test(t))).toBe(true)
+      // Sa fin coche la reprise.
+      await endTurn($, w, front, 'completed')
+      expect(agentIn(w, 'front-panier').tasks.at(-1)!.status).toBe('completed')
+    })
+
+    test('un agent tenu fini que son travail de fond réveille, sans SendMessage : pas de tâche de plus', async ($, on) => {
+      const w = world(on, os)
+      seedVerif(w, os)
+      const { front, api } = await launchVerif($, w)
+      await endTurn($, w, front, 'waiting')
+      const avant = agentIn(w, 'front-panier').tasks.length
+      await $.turn.start({ turnId: 'r2', agentId: front } as never)
+      expect(agentIn(w, 'front-panier').status).toBe('running')
+      expect(agentIn(w, 'front-panier').tasks.length).toBe(avant)
+      await endTurn($, w, api, 'completed')
     })
   })
 }
@@ -1835,7 +1875,7 @@ test('consignes v2 : la porte vérifie, testeur et vérificateur proposés avec 
   expect(off).not.toMatch(/porte|criteres|verif/)
   expect(leadBrief(false, true)).not.toMatch(/cache|rafraichir|extrait/i)
   const a = agentOf({ tasks: [{ title: 'Coder', kind: 'codage', status: 'pending' }] })
-  expect(agentBrief(a)).toMatch(/Avant de finir, appelle l'outil mcp__revo-flow__verif action lancer sur tes fichiers ; corrige ce qui est nouveau et à toi/)
+  expect(agentBrief(a)).toMatch(/revo-flow les lance une seule fois, quand tous les agents ont fini/)
   expect(agentBrief(a, 'fiches', [], false)).not.toMatch(/mcp__revo-flow__verif/)
   expect(agentBrief(agentOf({ subagentType: 'Explore', tasks: [] }))).not.toMatch(/mcp__revo-flow__verif/)
   expect(agentBrief(agentOf({ subagentType: 'revo-flow:verifier', tasks: [] }))).not.toMatch(/mcp__revo-flow__verif/)
@@ -2179,4 +2219,16 @@ test('redémarrage : dialogue fermé, l’instantané attend ; celui d’un autr
   expect(snapshots(w).sort()).toEqual(['flow:42', 'flow:7'])
   expect(w.states.flow ?? null).toBeNull()
   expect(w.store.journal).toBeUndefined()
+})
+
+test('reworkTasks et reworkTitle : une tâche de reprise au bout, en cours, sans doublon', () => {
+  const faites = [{ title: 'Lire', kind: 'analyse' as const, status: 'completed' as const }, { title: 'Coder', kind: 'codage' as const, status: 'completed' as const }]
+  const t = reworkTasks(faites, 'Corriger la porte (typecheck)')
+  expect(t).toHaveLength(3)
+  expect(t[2]).toEqual({ title: 'Corriger la porte (typecheck)', kind: 'codage', status: 'in_progress' })
+  // La même reprise déjà ouverte n'est pas dupliquée.
+  expect(reworkTasks(t, 'Corriger la porte (typecheck)')).toHaveLength(3)
+  expect(reworkTitle('Corrige Basket.vue.', ['typecheck', 'eslint'])).toBe('Corriger la porte (typecheck, eslint)')
+  expect(reworkTitle('Ajoute le cas du code expiré. Puis relance.')).toBe('Reprise : Ajoute le cas du code expiré.')
+  expect(reworkTitle('')).toBe('Reprise demandée par l’orchestrateur')
 })

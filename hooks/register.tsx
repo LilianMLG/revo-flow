@@ -102,6 +102,8 @@ import {
   euros,
   findAgent,
   finishTasks,
+  reworkTasks,
+  reworkTitle,
   firstSentence,
   pauseTasks,
   leadBrief,
@@ -508,7 +510,7 @@ async function registerVerifTool($: $) {
   await $.tool.register({
     name: 'verif',
     description:
-      "revo-flow : la vérification du flow (lint, typage, tests liés ; comparée à la base de référence, seules les erreurs nouvelles comptent). Actions : lancer (sur tes fichiers modifiés, ou ceux de « fichiers » → les erreurs nouvelles de tes fichiers ; pour l'orchestrateur, tout le flow) ; resultat (le dernier rapport de la porte de fin) ; commandes (orchestrateur : commandes = la liste complète corrigée, ou commande + exclus = motifs de tests à exclure ; toujours reposée à l'utilisateur) ; exception (orchestrateur, motif → l'utilisateur décide de terminer non vérifié ou non) ; degeler (orchestrateur, fichiers + motif → l'utilisateur décide de dégeler des tests gelés) ; web : (vérificateur, projet web) demande le serveur de dev pour la preuve web → l’URL à utiliser, ou pourquoi non ; mobile : (vérificateur, app Flutter, React Native ou Expo) demande l’app sur un appareil (téléphone branché, émulateur ou simulateur) → quand elle est à l’écran, ou pourquoi non. Ta tâche dit laquelle des deux vaut pour ce projet.",
+      "revo-flow : la vérification du flow (lint, typage, tests liés ; comparée à la base de référence, seules les erreurs nouvelles comptent). Actions : lancer (orchestrateur : tout le flow, ou ceux de « fichiers » ; un sous-agent ne vérifie pas, la porte le fait une fois quand tous ont fini) ; resultat (le dernier rapport de la porte de fin) ; commandes (orchestrateur : commandes = la liste complète corrigée, ou commande + exclus = motifs de tests à exclure ; toujours reposée à l'utilisateur) ; exception (orchestrateur, motif → l'utilisateur décide de terminer non vérifié ou non) ; degeler (orchestrateur, fichiers + motif → l'utilisateur décide de dégeler des tests gelés) ; web : (vérificateur, projet web) demande le serveur de dev pour la preuve web → l’URL à utiliser, ou pourquoi non ; mobile : (vérificateur, app Flutter, React Native ou Expo) demande l’app sur un appareil (téléphone branché, émulateur ou simulateur) → quand elle est à l’écran, ou pourquoi non. Ta tâche dit laquelle des deux vaut pour ce projet.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -2034,6 +2036,27 @@ function blockers(g: Gate): string[] {
 
 const isGreen = (g: Gate, r: VerifResultat) => r.etat === 'vert' && blockers(g).length === 0
 
+/** Les commandes rouges de la dernière porte du flow courant (« typecheck », « eslint ») ; vide si elle est verte ou absente. */
+function redCommands(): string[] {
+  const g = gate
+  const r = g?.dernier
+  if (!g || !r || isGreen(g, r)) return []
+  return r.commandes.filter(c => c.etat === 'ko').map(c => c.id)
+}
+
+/** Les agents terminés que l'orchestrateur renvoie au travail par SendMessage : id → titre de la tâche de reprise, posée à leur réveil. */
+const reworks = new Map<string, string>()
+
+/** Un SendMessage de l'orchestrateur : s'il vise un agent du flow qui a fini (par son id ou son nom), sa tâche de reprise est notée. */
+async function noteRework($: $, input: Record<string, unknown>) {
+  const to = text(input.to)
+  const flow = await read($, flowA)
+  if (!to || !flow || flow.phase === 'done') return
+  const a = flow.agents.find(x => (x.status === 'done' || x.status === 'failed') && (x.agentId === to || x.lastAgentId === to || x.name === to))
+  const id = a?.agentId ?? a?.lastAgentId
+  if (a && id) reworks.set(id, reworkTitle(text(input.message), redCommands()))
+}
+
 /** Le fichier de sortie à ouvrir par le bouton Détail : la première commande rouge, sinon la dernière qui en a un. */
 const detailOf = (r: VerifResultat | undefined) =>
   r ? (r.commandes.find(c => (c.etat === 'ko' || c.etat === 'erreur') && c.sortie)?.sortie ?? [...r.commandes].reverse().find(c => c.sortie)?.sortie) : undefined
@@ -2512,8 +2535,15 @@ async function restoreVerif($: $) {
   )
 }
 
-/** Un `verif lancer` d'un agent : seulement ses fichiers (ceux qu'il a modifiés, ou ceux qu'il donne), rapport limité à eux. */
+/** La réponse à un sous-agent qui demande `verif lancer` : il n'y a qu'une vérification, la porte de fin. */
+const AGENT_LANCER =
+  'revo-flow verif : pas de vérification par agent. La porte lance le lint, le typage et les tests une seule fois, quand tous les agents ont fini ; si elle trouve une erreur dans tes fichiers, l’orchestrateur te renverra la corriger. Termine tes tâches.'
+
+/** `verif lancer` de l'orchestrateur : tout le flow, ou les fichiers donnés. */
 async function lancerTool($: $, g: Gate, who: string, e: Record<string, unknown>): Promise<string> {
+  // Une seule vérification par flow (v3.1.2) : la porte, quand tous les agents ont fini. Un agent qui vérifiait ses fichiers relançait
+  // le typage du projet entier et attendait les autres dans la file : c'est ce qui ralentissait chaque agent.
+  if (who !== 'lead') return AGENT_LANCER
   if (g.mode === 'off') return 'revo-flow verif : pas de vérification pour ce flow (option ou choix de l’utilisateur) ; continue.'
   if (g.proposees) return 'revo-flow verif : les commandes de vérification attendent encore la confirmation de l’utilisateur ; continue, la porte de fin vérifiera.'
   const given = (Array.isArray(e.fichiers) ? e.fichiers : []).map(text).filter(Boolean).map(p => relTo(g.ref.racine, p) ?? p)
@@ -4501,9 +4531,17 @@ export const register: Register = (on, options) => {
     const flow = await read($, flowA)
     if (flow) await update($, isBusy, () => true)
     // Un agent tenu pour fini (waiting après son tour) que son travail de fond réveille : il reprend, le flow aussi.
-    const woken = e.agentId && flow && flow.phase !== 'done' ? flow.agents.find(a => a.agentId === e.agentId && a.status === 'done') : undefined
+    const woken = e.agentId && flow && flow.phase !== 'done' ? flow.agents.find(a => a.agentId === e.agentId && (a.status === 'done' || (a.status === 'failed' && reworks.has(e.agentId!)))) : undefined
     if (woken) {
-      await setAgent($, woken.key, ({ endedAt: _end, ...x }) => ({ ...x, status: 'running', hasEndedTurn: false }))
+      const rework = reworks.get(e.agentId!)
+      reworks.delete(e.agentId!)
+      await setAgent($, woken.key, ({ endedAt: _end, ...x }) => ({
+        ...x,
+        status: 'running',
+        hasEndedTurn: false,
+        ...(rework ? { tasks: reworkTasks(x.tasks, rework), hasReported: false } : {}),
+      }))
+      if (rework) $.ui.toast(`revo-flow : « ${woken.name} » reprend : ${rework}`)
       await setFlow($, f => (f.phase === 'review' ? { ...f, phase: 'running' } : f))
     }
     // Un agent en attente (ou réarmé pour une relance) repris par SendMessage : même id, même contexte, suivi de nouveau.
@@ -4712,8 +4750,11 @@ export const register: Register = (on, options) => {
     const agentId = r.agentId
     const now = await $.clock.now()
     // Un agent en attente relancé directement par l'orchestrateur (sans relaunch) : c'est une nouvelle tentative.
+    const rework = a.status === 'done' || a.status === 'failed' ? reworkTitle(e.prompt, redCommands()) : undefined
+    if (rework) $.ui.toast(`revo-flow : « ${a.name} » reprend : ${rework}`)
     await setAgent($, a.key, ({ waitingFor: _w, ...x }) => ({
       ...x,
+      ...(rework ? { tasks: reworkTasks(x.tasks, rework), hasReported: false } : {}),
       agentId,
       modelId: r.model,
       status: 'running',
@@ -4905,6 +4946,7 @@ export const register: Register = (on, options) => {
   on('tool.call', async ($, e, next) => {
     const tool = String(e.tool)
     if (tool === PLAN_TOOL || tool === STEP_TOOL || tool === VERIF_TOOL || tool === MOBILE_TOOL) return next(e)
+    if (tool === 'SendMessage' && e.agentId === undefined) await noteRework($, e as unknown as Record<string, unknown>).catch(() => undefined)
     const input = e as unknown as Record<string, unknown>
     const isVerifierCall = !!e.agentId && verifierAgents.has(e.agentId)
     // La preuve web (v3) : le navigateur du vérificateur ne sert que pendant la preuve web, et seulement sur l'origine du serveur prêt.
