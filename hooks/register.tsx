@@ -3080,15 +3080,6 @@ const MOBILE_SORTIE_MAX = 8000
 const JOURNAL_LIGNES = 40
 /** La note d'une preuve mobile sans app détectée : la réponse au vérificateur le dit à part. */
 const NO_MOBILE_APP = 'aucune app mobile détectée'
-/** Le refus d'un vérificateur lancé en arrière-plan : sa preuve se suit en direct. */
-const VERIFIER_FOREGROUND =
-  'revo-flow : lance le vérificateur au premier plan, pas en arrière-plan : sa preuve à l’exécution (web ou mobile) se suit en direct dans le panneau et sur l’appareil.'
-
-/** L'agent est-il demandé en arrière-plan (run_in_background de l'outil Agent, sous l'un de ses noms) ? */
-function isBackgroundSpawn(e: unknown): boolean {
-  const x = typeof e === 'object' && e !== null ? (e as Record<string, unknown>) : {}
-  return x.background === true || x.run_in_background === true || x.isBackground === true
-}
 
 /** La preuve mobile de la porte, créée à la première demande. */
 function mobileOf(g: Gate): GateMobile {
@@ -4692,14 +4683,13 @@ export const register: Register = (on, options) => {
     if (!a) {
       // Un vérificateur lancé hors plan : sa tâche (critères, diff, commandes) s'ajoute à son prompt et son Bash sera filtré.
       if (e.subagentType !== VERIFIER_TYPE) return next(e)
-      if (isBackgroundSpawn(e)) return { deny: VERIFIER_FOREGROUND }
       const task = await verifierBrief($).catch(() => undefined)
       const r = await next(task ? { ...e, prompt: `${e.prompt}\n\n${task}` } : e)
       if (r.deny === undefined && r.agentId) verifierAgents.add(r.agentId)
       return r
     }
-    // Le vérificateur se suit en direct (preuve web ou mobile dans le panneau, sur l'appareil) : jamais en arrière-plan.
-    if ((isVerifier(a) || e.subagentType === VERIFIER_TYPE) && isBackgroundSpawn(e)) return { deny: VERIFIER_FOREGROUND }
+    // Le vérificateur part comme les autres agents, au premier plan ou en arrière-plan : l'outil Agent de l'application de bureau ne
+    // propose que l'arrière-plan (v3.1.1). Sa preuve se suit en direct quand même : chaque action va au panneau et sur l'appareil.
     claimed.add(a.key)
     const others = flow.agents.filter(x => x.key !== a.key).map(x => x.name)
     // L'extrait de la fiche servie qui concerne cet agent, après ses consignes.
