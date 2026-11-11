@@ -1,6 +1,6 @@
 {
   "name": "revo-flow",
-  "version": "3.1.2",
+  "version": "3.2.0",
   "license": "MIT",
   "description": "/revo-flow <demande> : l'orchestrateur lit les specs, fait un plan, répartit les tâches entre des sous-agents (modèle et effort choisis pour chacun) et affiche une barre de progression par agent dans le panneau latéral ; un cache par projet (graphe des fichiers et fiches de features apprises en fin de flow) lui évite de relire le code : /revo-flow cache. Un agent peut en attendre un autre (relancé quand il a fini) et reçoit l'extrait de fiche qui le concerne, qu'il vérifie et rafraîchit. Un flow vérifié : revo-flow apprend les commandes de vérification du projet (lint, typage, tests ciblés), les lance lui-même en fin de flow et refuse de le déclarer terminé tant qu'elles sont rouges (erreurs nouvelles seulement, base de référence prise pendant la planification) ; critères d'acceptation, vérificateur indépendant et tests gelés en option. Le score CRAP (complexité × couverture des tests liés) fait respecter la règle du scout : une fonction modifiée par le flow au-delà de 30 bloque la porte, une fonction ancienne qu'il ne touche pas jamais. Les agents installés sur votre Claude Code (projet, dossier personnel, plugins activés) sont proposés à l'orchestrateur : un sous-agent peut en prendre le type, avec son modèle et son effort. /revo-flow doctor montre ce que le mod a détecté sur le projet (stack, commandes de vérification, base de référence, cache, agents installés) et ce qu'il y fera ; un flow interrompu par un redémarrage peut être repris ou abandonné ; chaque flow laisse un rapport en markdown (plan, fichiers, verdict de la porte, critères, CRAP, coût). Preuve à l'exécution, choisie selon le projet : web (package.json avec serveur de dev) ou mobile (Flutter, React Native, Expo). Web : sur un critère observable, le vérificateur demande le serveur de dev, revo-flow le démarre sur votre accord et lui donne l'URL ; il navigue (console, réseau, capture par critère). Mobile : revo-flow choisit l'appareil (téléphone branché, sinon émulateur ou simulateur démarré avec sa fenêtre), lance l'app sur votre accord et le vérificateur l'observe en direct (capture, arbre des vues, journal, gestes). Les captures vont dans le rapport ; serveur, app et émulateur démarrés par revo-flow sont arrêtés en fin de flow.",
   "author": {
@@ -81,6 +81,12 @@
         "mcp",
         "off"
       ]
+    },
+    "architecture": {
+      "type": "boolean",
+      "title": "Revue d'architecture",
+      "description": "À la fin de chaque flow vérifié, le vérificateur juge aussi l'étape ARCHI : le code de la branche (ou de la PR) respecte-t-il l'architecture du projet ? Fichiers rangés là où le projet range leurs semblables, conventions suivies, rien de redéfini qui existe déjà (types, fonctions, composants). revo-flow lui donne la base de comparaison, les fichiers de la branche, les documents d'architecture du projet et des indices (fichier rangé ailleurs que ses semblables, nom déjà pris, définition qui existe déjà). La porte attend son verdict : sans revue, ou sur un « ko », elle refuse de conclure (3 tentatives, puis la décision revient à vous). Désactivée : le vérificateur reste facultatif.",
+      "default": true
     }
   }
 }

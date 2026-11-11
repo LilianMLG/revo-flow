@@ -463,3 +463,27 @@ describe('TESTER_BRIEF', () => {
     for (const s of ['critères d’acceptation', 'interfaces', 'Ne pars pas du code', 'que des fichiers de test', 'gèle', 'restent dans le dépôt']) expect(TESTER_BRIEF).toContain(s)
   })
 })
+
+describe('vérificateur : étape ARCHI (v3.2)', () => {
+  test('git grep, merge-base et ls-tree sont des lectures ; git grep -O (éditeur) ne l’est pas', () => {
+    expect(verifierBashAllowed('git grep -n -w Panier', [])).toBe(true)
+    expect(verifierBashAllowed('git merge-base HEAD origin/main', [])).toBe(true)
+    expect(verifierBashAllowed('git ls-tree -r --name-only HEAD', [])).toBe(true)
+    expect(verifierBashAllowed('git grep -O Panier', [])).toBe(false)
+    expect(verifierBashAllowed('git grep --open-files-in-pager=vim Panier', [])).toBe(false)
+  })
+  test('la tâche sans critère porte sur l’architecture et demande le verdict ARCHI', () => {
+    const t = verifierTask([], ' a.ts | 2 +-', [], [], undefined, '## Architecture (étape ARCHI, obligatoire)\nBase : abc')
+    expect(t).toMatch(/Le plan n’a pas de critère d’acceptation : ta vérification porte sur l’architecture \(étape ARCHI\)\./)
+    expect(t).toMatch(/## Architecture \(étape ARCHI, obligatoire\)/)
+    expect(t).toMatch(/Rends le bloc json avec un verdict pour ARCHI\.$/)
+  })
+  test('avec des critères : les critères puis ARCHI', () => {
+    const t = verifierTask([{ id: 'C1', texte: 'Un code expiré affiche une erreur' }], '', [], [], undefined, '## Architecture (étape ARCHI, obligatoire)')
+    expect(t).toMatch(/Rends le bloc json avec un verdict pour C1, ARCHI\.$/)
+  })
+  test('le prompt du vérificateur présente l’étape ARCHI, toujours, et l’objet ARCHI du bloc json', () => {
+    expect(VERIFIER_PROMPT).toMatch(/## Architecture \(étape ARCHI, toujours\)/)
+    expect(VERIFIER_PROMPT).toMatch(/\{"id":"ARCHI","verdict":"ok"/)
+  })
+})

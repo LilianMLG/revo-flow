@@ -194,6 +194,17 @@ Depuis la v3.1, le même vérificateur peut **voir une app mobile tourner**, sur
 - **Mesure** : le journal du graphe note la preuve mobile de chaque flow (état, captures, verdicts mobile, ko mobile), comme la preuve web.
 - **Limites** : Flutter, Expo et React Native seulement ; pas de geste ni d'arbre des vues sur iOS (capture et journal seulement) ; pas de hot reload ; un iPhone branché n'a de capture qu'avec Flutter ; iOS demande macOS ; le premier build Gradle ou Xcode peut dépasser les 5 minutes (relance l'action `mobile`, l'app est alors déjà construite).
 
+### Revue d'architecture
+
+Depuis la v3.2, chaque flow vérifié finit par une **revue d'architecture obligatoire** : le vérificateur juge l'étape **ARCHI** en plus des critères. Le code de la branche (ou de la PR) respecte-t-il l'architecture du projet ? Même sans critère dans le plan, le vérificateur est lancé pour cette revue.
+
+- **Ce qui est jugé** : tout le code de la branche, comparé au point où elle quitte la branche par défaut (`origin/HEAD`, sinon `main`, `master`, `develop`) ; sur la branche par défaut elle-même, le commit de départ du flow. Chaque fichier ajouté ou modifié doit être rangé là où le projet range ses semblables, suivre les conventions de nommage et de couches, et ne rien redéfinir qui existe déjà (types, interfaces, modèles, fonctions, composants, constantes). Ce que la branche ne touche pas n'est pas à juger.
+- **Ce que revo-flow prépare** : la base de comparaison, la liste des fichiers de la branche, les documents d'architecture du projet à lire d'abord (`ARCHITECTURE.md`, `docs/architecture.md`, `CLAUDE.md`, `AGENTS.md`, `CONTRIBUTING.md`, `README.md`), et des **indices** calculés : un fichier rangé ailleurs que ses semblables (« les fichiers use*.ts du projet sont sous composables/ (12) »), un nom de fichier déjà pris ailleurs, une définition ajoutée qui existe déjà sous le même nom (« interface Panier existe déjà : types/cart.ts:3 »). Ce sont des pistes, que le vérificateur confirme ou écarte en lisant le code (`git ls-files`, `git ls-tree`, `git grep -n -w`, permis en lecture seule).
+- **Le verdict** : `ok` avec ce qui a été lu et comparé, `ko` avec chaque problème (fichier, ce qui ne va pas, ce qui existe déjà, où le mettre), ou `non vérifiable`.
+- **La porte attend la revue** : une fois la porte verte, la conclusion est refusée tant qu'il n'y a pas de verdict ARCHI (l'orchestrateur reçoit la consigne de lancer le vérificateur). Sur un `ko`, il corrige (lui-même ou en reprenant l'agent concerné), puis relance une revue : un `ko` dont le code a changé depuis exige une nouvelle revue. 3 tentatives, puis la décision revient à vous (**Terminer sans** ou **Une tentative de plus**) ; l'action `exception` de l'outil `verif` marche aussi. Le flow ne se clôt pas tant qu'un vérificateur lancé n'a pas répondu.
+- **Affichage** : ligne « architecture » de la section Vérification du panneau (revue attendue, conforme, ko avec sa preuve), section « Architecture » du rapport de flow, champ `archi` du journal.
+- **Option `architecture`** (`/config`, oui par défaut) : `non` rend le vérificateur facultatif, comme avant la v3.2.
+
 ### Score CRAP
 
 Depuis la v2.1, la porte juge aussi la **qualité des fonctions que le flow touche**, avec le score CRAP (Savoia et Evans, 2007) : pour chaque fonction, `CRAP = cc² × (1 − cov)³ + cc`, où `cc` est la complexité cyclomatique et `cov` la part de ses lignes couverte par les tests (0 à 1). **Seuil : 30.** Une fonction entièrement couverte vaut sa complexité ; une fonction sans aucun test dépasse 30 dès une complexité de 6.
@@ -227,6 +238,7 @@ Depuis la v2.2, revo-flow découvre les agents déjà installés sur ton Claude 
 | `cache` | oui | brief du cache projet au lancement, extrait de fiche dans le prompt de chaque agent et outil `cache` proposé ; `non` : ni brief, ni extrait, ni outil, la commande `cache` reste et les flows comptent dans la mesure « sans cache » |
 | `web` | `extension` | preuve web du vérificateur (v3.0) : `extension` démarre le serveur de dev du projet après confirmation et navigue avec Claude in Chrome ; `devtools` déclare en plus le MCP Chrome DevTools en repli ; `off` : aucune preuve web |
 | `mobile` | `appareil` | preuve mobile du vérificateur (v3.1) : `appareil` choisit l'appareil (téléphone branché, sinon émulateur ou simulateur démarré avec sa fenêtre), lance l'app après confirmation et l'observe en direct avec l'outil `mobile` ; `mcp` déclare en plus le MCP mobile-mcp ; `off` : aucune preuve mobile |
+| `architecture` | oui | revue d'architecture obligatoire du vérificateur à la fin de chaque flow vérifié (v3.2) : fichiers au bon endroit, conventions, rien de redéfini ; la porte attend son verdict ; `non` la rend facultative |
 | `agents` | oui | catalogue des agents installés (projet, dossier personnel, plugins activés) proposé à l'orchestrateur ; un sous-agent du plan peut en prendre le type, avec son modèle et son effort ; `non` : rien n'est lu ni proposé, `general-purpose` comme avant |
 
 Sur l'app desktop, `/revo-flow` n'apparaît pas toujours dans le menu `/` : tape la commande en entier, elle fonctionne.

@@ -2232,3 +2232,71 @@ test('reworkTasks et reworkTitle : une tâche de reprise au bout, en cours, sans
   expect(reworkTitle('Ajoute le cas du code expiré. Puis relance.')).toBe('Reprise : Ajoute le cas du code expiré.')
   expect(reworkTitle('')).toBe('Reprise demandée par l’orchestrateur')
 })
+
+test('revue d’architecture obligatoire : porte verte → vérificateur exigé ; ko bloque, nouvelle revue après correction ; ok conclut', async ($, on) => {
+  const w = world(on)
+  // Au démarrage de session, revo-flow enregistre le vérificateur : la revue d'architecture peut être exigée.
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  seedVerif(w, WINDOWS)
+  const { front, api } = await launchVerif($, w)
+  await $.tool.call({ tool: 'Edit', file_path: FILE, agentId: front, tool_use_id: 'u1' } as never)
+  w.verifRun.tsc = GREEN
+  await endTurn($, w, front, 'completed')
+  await endTurn($, w, api, 'completed')
+
+  // 1. Porte verte, aucune revue : la conclusion est refusée, avec la consigne de lancer le vérificateur.
+  let r = await stop($)
+  expect(r.block).toMatch(/Revue d’architecture obligatoire \(revo-flow\) : la porte est verte, il reste l’étape ARCHI\./)
+  expect(r.block).toMatch(/subagent_type « revo-flow:verifier »/)
+  expect((w.states.verif as { archi?: unknown }).archi).toEqual({ verdict: 'attente' })
+
+  // 2. Le vérificateur, lancé hors plan : sa tâche porte l'étape ARCHI.
+  const juge = (await $.agent.spawn({ prompt: 'Juge', description: 'Vérificateur', subagentType: 'revo-flow:verifier', provider: { kind: 'model' } } as never)).agentId!
+  expect(w.prompts.at(-1)).toMatch(/## Architecture \(étape ARCHI, obligatoire\)/)
+  expect(w.prompts.at(-1)).toMatch(/Rends le bloc json avec un verdict pour ARCHI\./)
+  // Il travaille : la fin du tour de l'orchestrateur n'est pas bloquée, et le flow ne se clôt pas avant sa réponse.
+  expect((await stop($, { stop_hook_active: true })).block).toBeUndefined()
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' } as never)
+  await w.clock.settle()
+  expect((w.states.flow as Flow).phase).not.toBe('done')
+
+  // 3. Sa réponse : ko. La conclusion est refusée avec la preuve.
+  w.status[juge] = 'completed'
+  const ko = '```json\n[{"id":"ARCHI","verdict":"ko","preuve":"lib/recap.ts redéfinit Panier, déjà dans types/cart.ts:3"}]\n```'
+  await $.turn.complete({ answer: ko, durationMs: 1, isAborted: false, turnId: 'j1', reason: 'answer', agentId: juge } as never)
+  await w.clock.settle()
+  expect((w.states.verif as { archi?: unknown }).archi).toEqual({ verdict: 'ko', preuve: 'lib/recap.ts redéfinit Panier, déjà dans types/cart.ts:3' })
+  r = await stop($)
+  expect(r.block).toMatch(/Revue d’architecture : ko\. lib\/recap\.ts redéfinit Panier, déjà dans types\/cart\.ts:3/)
+  expect(r.block).toMatch(/relance le vérificateur pour une nouvelle revue/)
+
+  // 4. L'orchestrateur corrige : le code a changé, une nouvelle revue est exigée.
+  await $.tool.call({ tool: 'Edit', file_path: FILE, tool_use_id: 'u2' } as never)
+  r = await stop($, { stop_hook_active: true })
+  expect(r.block).toMatch(/le code a changé depuis le « ko » ; une nouvelle revue est obligatoire/)
+
+  // 5. Nouvelle revue : ok. La conclusion passe, le flow se clôt, le rapport et le journal le disent.
+  const juge2 = (await $.agent.spawn({ prompt: 'Juge', description: 'Vérificateur', subagentType: 'revo-flow:verifier', provider: { kind: 'model' } } as never)).agentId!
+  w.status[juge2] = 'completed'
+  const ok = '```json\n[{"id":"ARCHI","verdict":"ok","preuve":"2 fichiers lus ; Panier importé de types/cart.ts, plus redéfini"}]\n```'
+  await $.turn.complete({ answer: ok, durationMs: 1, isAborted: false, turnId: 'j2', reason: 'answer', agentId: juge2 } as never)
+  await w.clock.settle()
+  expect((await stop($)).block).toBeUndefined()
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' } as never)
+  await w.clock.settle()
+  expect((w.states.flow as Flow).phase).toBe('done')
+  const rapport = Object.entries(w.disk).find(([k]) => k.includes('/rapports/'))?.[1] ?? ''
+  expect(rapport).toContain('## Architecture\n\n**Revue du vérificateur** : conforme ✓')
+})
+
+test('revue d’architecture désactivée (option architecture) : la porte verte conclut sans vérificateur', { options: { architecture: false } }, async ($, on) => {
+  const w = world(on)
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  seedVerif(w, WINDOWS)
+  const { front, api } = await launchVerif($, w)
+  await $.tool.call({ tool: 'Edit', file_path: FILE, agentId: front, tool_use_id: 'u1' } as never)
+  w.verifRun.tsc = GREEN
+  await endTurn($, w, front, 'completed')
+  await endTurn($, w, api, 'completed')
+  expect((await stop($)).block).toBeUndefined()
+})
