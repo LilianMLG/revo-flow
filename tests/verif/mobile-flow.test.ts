@@ -1,6 +1,6 @@
 // La preuve à l'exécution mobile (v3.1), au niveau de register.tsx : le choix web ou mobile selon le projet, l'action mobile de l'outil
 // verif, la question, le téléphone branché ou l'émulateur démarré, l'app lancée par process.spawn, l'outil mobile du vérificateur
-// (capture, arbre, journal, toucher), l'arrêt en fin de flow et le vérificateur refusé en arrière-plan.
+// (capture, arbre, journal, toucher), l'arrêt en fin de flow et le vérificateur accepté en arrière-plan (v3.1.1).
 // Écrits d'après le contrat de l'action mobile et de l'outil mobile, pas d'après le code.
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
@@ -468,20 +468,22 @@ test('option mobile à off → preuve mobile désactivée, sans question ni spaw
   expect(w.registered).not.toContain('mobile')
 })
 
-test('le vérificateur demandé en arrière-plan est refusé : sa preuve se suit en direct', LENT, async ($, on) => {
+test('le vérificateur lancé en arrière-plan est accepté et reste un vérificateur (Bash filtré)', LENT, async ($, on) => {
+  // L'outil Agent de l'application de bureau ne propose que l'arrière-plan : refuser ce lancement bloquait toute vérification
+  // (l'orchestrateur jugeait alors lui-même), sur le web comme sur l'émulateur.
   const w = world(on, WINDOWS)
   seed(w, WINDOWS)
   await $.command.run({ command: 'revo-flow', args: 'affiche le créneau choisi' } as never)
   await w.clock.advance(1)
   await w.clock.settle()
   await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN_MOBILE } as never)
-  let deny: string | undefined
-  try {
-    deny = (await spawnAgent($, 'Vérificateur', 'revo-flow:verifier', { run_in_background: true })).deny
-  } catch (err) {
-    deny = err instanceof Error ? err.message : String(err)
-  }
-  expect(deny).toContain('premier plan')
-  // Au premier plan : accepté.
-  expect((await spawnAgent($, 'Vérificateur', 'revo-flow:verifier')).agentId).toBeTruthy()
+  const r = await spawnAgent($, 'Vérificateur', 'revo-flow:verifier', { run_in_background: true })
+  expect(r.deny).toBeUndefined()
+  expect(r.agentId).toBeTruthy()
+  // Il est bien suivi comme vérificateur : une commande qui écrit lui est refusée.
+  const bash = await $.tool.call({ tool: 'Bash', agentId: r.agentId, command: 'rm -rf lib' } as never).then(
+    x => (x as { deny?: string }).deny,
+    err => (err instanceof Error ? err.message : String(err)),
+  )
+  expect(bash).toContain('lecture seule')
 })

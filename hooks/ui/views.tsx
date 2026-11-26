@@ -251,6 +251,17 @@ export function mobileLine(v: VerifView): { mark: string; tone: VerifTone; text:
 /** Les captures de la preuve à l'exécution (web ou mobile) : le bouton capture et l'image du panneau en dépendent. */
 export const captureCount = (v: VerifView | null | undefined) => (v?.web?.captures.length ?? 0) + (v?.mobile?.captures.length ?? 0)
 
+/** La ligne de la revue d'architecture (étape ARCHI du vérificateur, v3.2) ; undefined tant qu'elle n'est pas demandée. */
+export function archiLine(v: VerifView): { mark: string; tone: VerifTone; text: string } | undefined {
+  const a = v.archi
+  if (!a) return undefined
+  if (a.verdict === 'attente') return { mark: '…', tone: 'warn', text: 'architecture : revue du vérificateur attendue' }
+  if (a.verdict === 'ok') return { mark: '✓', tone: 'ok', text: 'architecture : conforme' }
+  if (a.verdict === 'ko') return { mark: '✗', tone: 'ko', text: `architecture : ${a.preuve ?? 'ko'}` }
+  if (a.verdict === 'passee') return { mark: '–', tone: 'dim', text: 'architecture : terminé sans revue (votre choix)' }
+  return { mark: '–', tone: 'dim', text: `architecture : non vérifiable${a.preuve ? ` (${a.preuve})` : ''}` }
+}
+
 /** Les remarques sous les commandes, une par ligne : base, tests gelés, triches, critères, question en attente. */
 export function verifNotes(v: VerifView): { mark: string; tone: VerifTone; text: string }[] {
   const notes: { mark: string; tone: VerifTone; text: string }[] = []
@@ -264,6 +275,8 @@ export function verifNotes(v: VerifView): { mark: string; tone: VerifTone; text:
   if (web) notes.push(web)
   const mobile = mobileLine(v)
   if (mobile) notes.push(mobile)
+  const archi = archiLine(v)
+  if (archi) notes.push(archi)
   if (v.enAttente) notes.push({ mark: '?', tone: 'warn', text: `en attente de votre réponse : ${v.enAttente}` })
   return notes
 }

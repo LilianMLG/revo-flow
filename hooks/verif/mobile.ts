@@ -490,7 +490,7 @@ export function mobileToolDenial(tool: string, mobile: { etat: MobileEtat } | un
 
 /**
  * Le paragraphe « ## Preuve mobile » ajouté à la tâche du vérificateur : désactivée, sans app détectée, ou ouverte avec l'app, les
- * appareils vus, l'outil mobile et ses actions, et les règles. Jamais lancée en arrière-plan : l'utilisateur regarde l'appareil.
+ * appareils vus, l'outil mobile et ses actions, et les règles. L'utilisateur regarde l'appareil : chaque action va au panneau.
  */
 export function verifierMobileTask(d: MobileDispo): string {
   const titre = '## Preuve mobile'

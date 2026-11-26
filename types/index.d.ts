@@ -223,6 +223,8 @@ export type VerifEtatCommande = {
 }
 /** Un critère d'acceptation du plan (lot 2) : C1 à C8, vérifiable. */
 export type Critere = { id: string; texte: string }
+/** La revue d'architecture telle que le panneau et le rapport la montrent : attendue, ou le verdict ARCHI et sa preuve ; passee = terminé sans revue, sur décision. */
+export type ArchiView = { verdict: 'attente' | 'ok' | 'ko' | 'non-verifiable' | 'passee'; preuve?: string }
 export type CritereVerdict = {
   id: string
   verdict: 'ok' | 'ko' | 'non-verifiable'
@@ -304,6 +306,8 @@ export type VerifJournal = {
   web?: { etat: WebEtat; captures: number; verdicts: number; ko: number }
   /** La preuve mobile (v3.1) : son état, les captures écrites, les verdicts marqués mobile et ceux parmi eux qui sont ko. */
   mobile?: { etat: MobileEtat; captures: number; verdicts: number; ko: number }
+  /** La revue d'architecture (v3.2) : le verdict de l'étape ARCHI du vérificateur ; absente si elle n'a pas eu lieu. */
+  archi?: 'ok' | 'ko' | 'non-verifiable' | 'passee'
 }
 /** Ce que le panneau et la bande montrent (atom `verif` de register.tsx). */
 export type VerifView = {
@@ -326,6 +330,8 @@ export type VerifView = {
   web?: WebView
   /** La preuve mobile du flow (v3.1). */
   mobile?: MobileView
+  /** La revue d'architecture (v3.2) : attendue, puis le verdict de l'étape ARCHI et sa preuve. */
+  archi?: ArchiView
 }
 
 /**

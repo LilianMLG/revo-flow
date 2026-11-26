@@ -1,6 +1,6 @@
 // Le rapport de flow (docs/rd-v3 §2.4) : un markdown écrit en fin de flow, à côté du plan, qui sert de description de MR.
 // Pur : une mise en forme de ce que le flow sait déjà (agents, fichiers, porte, critères, cache), aucune collecte.
-import type { CacheStats, Critere, CritereVerdict, Entry, Flow, Lead, MobileView, VerifErreur, VerifJournal, VerifResultat, WebView } from '../types'
+import type { ArchiView, CacheStats, Critere, CritereVerdict, Entry, Flow, Lead, MobileView, VerifErreur, VerifJournal, VerifResultat, WebView } from '../types'
 import { MODELS, euros, fmt, fmtDuration, total } from './lib'
 import { dureeText } from './verif/report'
 
@@ -29,6 +29,8 @@ export type RapportInput = {
   web?: WebView
   /** La preuve mobile du vérificateur (appareil, app lancée, captures) ; absente sans appareil. */
   mobile?: MobileView
+  /** La revue d'architecture du vérificateur (étape ARCHI, v3.2) ; absente si elle n'a pas eu lieu. */
+  archi?: ArchiView
 }
 
 const plural = (n: number, un: string, plusieurs: string) => `${n} ${n > 1 ? plusieurs : un}`
@@ -136,6 +138,23 @@ function mobileParagraph(mobile: MobileView | undefined): string | undefined {
 }
 
 /** 4. Les critères d'acceptation et le verdict du vérificateur, avec la preuve de chacun. */
+const ARCHI_TEXTE: Record<ArchiView['verdict'], string> = {
+  attente: 'en attente du vérificateur',
+  ok: 'conforme ✓',
+  ko: 'ko ✗',
+  'non-verifiable': 'non vérifiable',
+  passee: 'terminé sans revue (décision de l’utilisateur)',
+}
+
+/** La revue d'architecture : le verdict de l'étape ARCHI et sa preuve, ou ce qui l'a remplacée. */
+function archiSection(archi: ArchiView | undefined): string[] {
+  const out = ['## Architecture', '']
+  if (!archi) return [...out, `${ABSENT}pas de revue d'architecture pour ce flow.*`, '']
+  out.push(`**Revue du vérificateur** : ${ARCHI_TEXTE[archi.verdict]}`)
+  if (archi.preuve) out.push(`> ${archi.preuve.replace(/\s*\n\s*/g, ' ')}`)
+  return [...out, '']
+}
+
 function criteriaSection(criteres: readonly Critere[] | undefined, verdicts: readonly CritereVerdict[] | undefined, web?: WebView, mobile?: MobileView): string[] {
   const out = [`## Critères d'acceptation`, '']
   if (!criteres?.length) return [...out, `${ABSENT}le plan n'avait pas de critères.*`, '']
@@ -178,7 +197,7 @@ function costSection(flow: Flow, lead: Lead, date: string | undefined, cache: Ca
 
 /** Le rapport de flow en markdown : six sections, chacune dite absente en une ligne quand elle n'a rien à montrer. */
 export function rapportMarkdown(input: RapportInput): string {
-  const { flow, lead, entries, verif, porte, criteres, verdicts, cache, date, web, mobile } = input
+  const { flow, lead, entries, verif, porte, criteres, verdicts, cache, date, web, mobile, archi } = input
   const where = [flow.project, flow.branch].filter(Boolean).join(' · ')
   const head = [`# Rapport : ${flow.title}`, '']
   if (where) head.push(`**Projet** : ${where}  `)
@@ -189,6 +208,7 @@ export function rapportMarkdown(input: RapportInput): string {
     ...filesSection(flow, entries),
     ...gateSection(verif, porte),
     ...criteriaSection(criteres, verdicts, web, mobile),
+    ...archiSection(archi),
     ...crapSection(verif, porte),
     ...costSection(flow, lead, date, cache),
   ]

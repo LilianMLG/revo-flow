@@ -231,7 +231,7 @@ function estConfirmee(m: string[], argv: string[]): boolean {
 }
 
 /** Les sous-commandes git qui ne font que lire. checkout, reset, restore, stash, clean… n'y sont pas. */
-const GIT_LECTURES = new Set(['diff', 'show', 'log', 'status', 'blame', 'ls-files'])
+const GIT_LECTURES = new Set(['diff', 'show', 'log', 'status', 'blame', 'ls-files', 'ls-tree', 'grep', 'merge-base'])
 /** Les commandes de lecture permises telles quelles (sans chemin : un « ./cat » du dépôt serait un script arbitraire). */
 const LECTURES = new Set(['cat', 'ls', 'head', 'tail', 'grep', 'wc', 'pwd'])
 /** Un script sed qui n'imprime que des lignes : adresses (numéro, $, /motif/), plage facultative, puis p. Ni w, ni e. */
@@ -243,8 +243,8 @@ function estLecture(m: string[]): boolean {
     let i = 0
     while (args[i] === '--no-pager' || args[i] === '-C') i += args[i] === '-C' ? 2 : 1
     const sub = args[i] ?? ''
-    // --output écrit un fichier, --ext-diff lance un programme externe.
-    return GIT_LECTURES.has(sub) && !args.slice(i + 1).some(a => /^--(output|ext-diff)/.test(a))
+    // --output écrit un fichier, --ext-diff lance un programme externe, git grep -O ouvre un éditeur.
+    return GIT_LECTURES.has(sub) && !args.slice(i + 1).some(a => /^--(output|ext-diff|open-files-in-pager)/.test(a) || (sub === 'grep' && /^-[A-Za-z]*O/.test(a)))
   }
   if (prog === 'sed') {
     const opts = args.filter(a => a.startsWith('-'))
@@ -284,7 +284,7 @@ export function verifierBashAllowed(command: string, confirmees: string[][]): bo
 // ── Triche dans le diff du flow ──────────────────────────────────────────
 
 /** Un fichier d'un diff unifié : ses lignes ajoutées et retirées (jamais le contexte). */
-type FichierDiff = { p: string; ajouts: string[]; retraits: string[] }
+export type FichierDiff = { p: string; ajouts: string[]; retraits: string[] }
 
 /** « "b/caf\303\251.ts" » ou « b/x.ts » → « x.ts » (les échappements C de git sont gardés tels quels). */
 const cheminDiff = (s: string) => s.trim().replace(/^"(.*)"$/, '$1').replace(/^[ab]\//, '')
@@ -294,7 +294,7 @@ const cheminDiff = (s: string) => s.trim().replace(/^"(.*)"$/, '$1').replace(/^[
  * (@@ -a,b +c,d @@) : une ligne retirée qui commence par « -- » ne passe pas pour un en-tête, et un diff sans
  * « diff --git » (diff -u) se lit aussi.
  */
-function fichiersDuDiff(diff: string): FichierDiff[] {
+export function fichiersDuDiff(diff: string): FichierDiff[] {
   const out: FichierDiff[] = []
   let cur: FichierDiff | undefined
   let ancien = 0
@@ -482,10 +482,16 @@ export const VERIFIER_PROMPT = [
   '- Faits exigés pour un « ok » ou un « ko » mobile : l’écran vu (texte de l’arbre ou de la capture), le nombre d’exceptions, de débordements et d’erreurs du journal, et « capture n ». Une capture seule ne prouve rien.',
   '- Marque ces verdicts "mobile": true. Tu n’arrêtes ni l’app ni l’émulateur : revo-flow le fait.',
   '',
+  '## Architecture (étape ARCHI, toujours)',
+  'À chaque flow, ta tâche porte aussi l’étape ARCHI : le code de la branche respecte-t-il l’architecture du projet ? Fichiers rangés là où le projet range leurs semblables, conventions de nommage et de couches suivies, et rien de redéfini qui existe déjà (types, interfaces, modèles, fonctions, composants, constantes).',
+  '- Lis les documents d’architecture cités par ta tâche, puis les fichiers de la branche et leurs voisins (git ls-files, git ls-tree, git grep -n -w <Nom>).',
+  '- Les indices de revo-flow sont des pistes, pas des verdicts : confirme ou écarte chacun en lisant le code.',
+  '- « ok » : la preuve dit ce que tu as lu et comparé (« 4 fichiers lus ; RecapPage sous lib/features/recap/ comme les autres pages ; Panier importé de lib/models/panier.dart, pas redéfini »). « ko » : chaque problème avec le fichier, ce qui ne va pas, ce qui existe déjà (chemin:ligne) et où il faudrait le mettre. Une lecture de code suffit ici : pas de commande à lancer.',
+  '',
   '## Réponse',
-  'Quelques lignes au plus, puis un seul bloc json : un tableau, un objet par critère, dans l’ordre des critères.',
+  'Quelques lignes au plus, puis un seul bloc json : un tableau, un objet par critère, dans l’ordre des critères, et toujours l’objet ARCHI à la fin.',
   '```json',
-  '[{"id":"C1","verdict":"ok","preuve":"<commande> → <extrait de sortie>"}]',
+  '[{"id":"C1","verdict":"ok","preuve":"<commande> → <extrait de sortie>"},{"id":"ARCHI","verdict":"ok","preuve":"<fichiers lus et comparés>"}]',
   '```',
   'verdict vaut "ok", "ko" ou "non-verifiable" ; preuve : une ou deux phrases, 400 caractères au plus, avec la commande et l’extrait. "web": true ou "mobile": true, facultatifs, marquent un verdict appuyé sur la preuve web ou mobile. Un critère sans verdict compte comme non vérifiable ; un « ok » sans preuve aussi.',
 ].join('\n')
@@ -499,16 +505,18 @@ const STAT_MAX = 60
  * et le paragraphe de la preuve à l'exécution (« Preuve web » de web.ts, verifierWebTask, ou « Preuve mobile » de mobile.ts,
  * verifierMobileTask, selon le projet), ajouté tel quel avant la consigne finale.
  */
-export function verifierTask(criteres: Critere[], diffStat: string, commandes: VerifCommande[], triches: Triche[] = [], web?: string): string {
+export function verifierTask(criteres: Critere[], diffStat: string, commandes: VerifCommande[], triches: Triche[] = [], web?: string, archi?: string): string {
   const stat = (typeof diffStat === 'string' ? diffStat : '').split(/\r?\n/).filter(l => l.trim() !== '')
   const statLignes = stat.length > STAT_MAX ? [...stat.slice(0, STAT_MAX), `… et ${stat.length - STAT_MAX} autres lignes (git diff --stat)`] : stat
   const cmds = (Array.isArray(commandes) ? commandes : []).filter(c => Array.isArray(c?.argv) && c.argv.length > 0)
-  const ids = criteres.map(c => c.id).join(', ')
+  const aArchi = typeof archi === 'string' && archi.trim() !== ''
+  const ids = [...criteres.map(c => c.id), ...(aArchi ? ['ARCHI'] : [])].join(', ')
   return [
     '# Vérification du flow',
     '',
-    'Critères d’acceptation à juger :',
-    ...criteres.map(c => `- ${c.id} : ${c.texte}`),
+    ...(criteres.length
+      ? ['Critères d’acceptation à juger :', ...criteres.map(c => `- ${c.id} : ${c.texte}`)]
+      : ['Le plan n’a pas de critère d’acceptation : ta vérification porte sur l’architecture (étape ARCHI).']),
     '',
     'Fichiers du flow (git diff --stat) :',
     ...(statLignes.length ? statLignes : ['(aucun fichier modifié)']),
@@ -522,7 +530,8 @@ export function verifierTask(criteres: Critere[], diffStat: string, commandes: V
     ...(triches.length
       ? ['', 'Triches repérées par revo-flow dans le diff (à confirmer et à citer dans la preuve) :', ...triches.map(t => `- ${t.motif} : ${t.fichier}${t.extrait ? ` (${t.extrait})` : ''}`)]
       : []),
-    ...(typeof web === 'string' && web.trim() !== '' ? ['', web] : []),
+    ...(typeof web === 'string' && web.trim() !== '' && criteres.length ? ['', web] : []),
+    ...(aArchi ? ['', archi!] : []),
     '',
     `Rends le bloc json avec un verdict pour ${ids}.`,
   ].join('\n')

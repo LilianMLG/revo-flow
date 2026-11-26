@@ -196,6 +196,26 @@ export function pauseTasks(tasks: readonly FlowTask[]): FlowTask[] {
   return tasks.map(t => (t.status === 'in_progress' ? { ...t, status: 'pending' as const } : t))
 }
 
+/**
+ * Un agent qui avait fini est renvoyé au travail (porte rouge, demande de l'orchestrateur) : une tâche de plus, en cours, au bout de
+ * sa liste, pour que sa barre montre le nouveau travail au lieu de rester pleine. Pas de doublon si la même reprise est déjà ouverte.
+ */
+export function reworkTasks(tasks: readonly FlowTask[], title: string): FlowTask[] {
+  const last = tasks.at(-1)
+  if (last && last.title === title && last.status !== 'completed') return tasks.map((t, i) => (i === tasks.length - 1 ? { ...t, status: 'in_progress' as const } : t))
+  return [...tasks, { title, kind: 'codage', status: 'in_progress' }]
+}
+
+/**
+ * Le titre de la tâche de reprise : « Corriger la porte (typecheck, eslint) » quand la dernière porte est rouge, sinon la première phrase
+ * du message de l'orchestrateur (« Reprise : … »), sinon « Reprise demandée par l'orchestrateur ».
+ */
+export function reworkTitle(message: string, rouges: readonly string[] = []): string {
+  if (rouges.length) return `Corriger la porte (${rouges.join(', ')})`
+  const s = firstSentence(typeof message === 'string' ? message : '', 60)
+  return s ? `Reprise : ${s}` : 'Reprise demandée par l’orchestrateur'
+}
+
 /** L'agent a fini : tout est fait ; s'il a échoué, la tâche en cours (ou la première restante) passe en échec. */
 export function finishTasks(tasks: readonly FlowTask[], failed: boolean): FlowTask[] {
   if (!failed) return tasks.map(t => (t.status === 'failed' ? t : { ...t, status: 'completed' as const }))
@@ -291,8 +311,11 @@ export const allFinished = (flow: Flow) =>
  * vérifie lui-même comme en v1.5, et rien n'y parle de la porte, des critères ni de l'outil verif. Avec des agents installés
  * (catalogue non vide), l'étape « Équipe » propose leur type ; sans eux, le texte est celui d'avant.
  */
-export function leadBrief(withCache: boolean, withVerif = true, withCrap = true, withAgents = false): string {
+export function leadBrief(withCache: boolean, withVerif = true, withCrap = true, withAgents = false, withArchi = false): string {
   const cache = (s: string) => (withCache ? s : '')
+  const archi = withVerif && withArchi
+    ? ` Revue d’architecture obligatoire : à la fin de chaque flow, même sans critères, lance un vérificateur (type ${VERIFIER_TYPE}) quand les autres agents ont fini ; il juge l’étape ARCHI (le code de la branche respecte l’architecture du projet : fichiers au bon endroit, conventions, rien de redéfini qui existe déjà) et la porte attend son verdict avant de te laisser conclure. Prévois-le dans le plan.`
+    : ''
   const agents = (s: string) => (withAgents ? s : '')
   const verif = (s: string) => (withVerif ? s : '')
   const end = withVerif
@@ -301,7 +324,7 @@ export function leadBrief(withCache: boolean, withVerif = true, withCrap = true,
   return `# revo-flow — tu es l'orchestrateur de cette demande
 1. Plan : ${cache(`commence par le cache revo-flow ci-dessous s'il y en a un, une carte, pas la vérité : vérifie dans le code ce que tu affirmes ou changes. S'il connaît la feature, ne lis que les fichiers à modifier et ceux modifiés depuis l'apprentissage. Puis `)}lis toi-même la demande et les specs utiles, seulement le nécessaire, sans rien modifier. Pas de sous-agent avant le plan, sauf un éclaireur Explore (lecture seule, haiku ou sonnet) quand la lecture est large : revo-flow demande l'accord de l'utilisateur.
 2. Équipe : appelle UNE fois l'outil ${PLAN_TOOL} : titre, résumé, et 1 à 6 sous-agents, pas plus que le travail ne le demande. Pour chacun : nom court et unique, rôle, type (general-purpose par défaut, Explore pour de la lecture seule${agents(`, ou le type d'un agent installé du catalogue ci-dessous quand son rôle correspond à ses tâches (code, doc, test, revue) : revo-flow lui laisse alors le modèle et l'effort de sa définition, donne quand même modele et effort pour l'estimation`)}), modèle le plus fiable pour SES tâches (haiku : mécanique et localisé ; sonnet : la plupart des features et correctifs ; opus : transverse, ambigu, délicat, sécurité), effort (low à xhigh), et 2 à 10 tâches courtes à l'infinitif avec leur type. Découpe pour qu'ils avancent en parallèle sans modifier les mêmes fichiers.${verif(`
-   Vérification : donne des critères d'acceptation (criteres, 1 à 8, chacun vérifiable par une commande ou un test) quand la demande s'y prête. Avec des critères, à toi de juger s'il faut un testeur (un agent dont toutes les tâches sont de type test, au moins du niveau des implémenteurs : il écrit les tests à partir des critères et des interfaces, revo-flow les gèle à sa fin) et un vérificateur (type ${VERIFIER_TYPE}, sonnet medium, lecture seule : il juge chaque critère avec une preuve exécutée, après les autres ; lance-le au premier plan, jamais en arrière-plan : sa preuve à l'exécution, web ou mobile, se suit en direct dans le panneau et sur l'appareil). Un gros flow (beaucoup de fichiers, plusieurs agents) mérite aussi une revue (/code-review) avant de conclure.`)}
+   Vérification : donne des critères d'acceptation (criteres, 1 à 8, chacun vérifiable par une commande ou un test) quand la demande s'y prête. Avec des critères, à toi de juger s'il faut un testeur (un agent dont toutes les tâches sont de type test, au moins du niveau des implémenteurs : il écrit les tests à partir des critères et des interfaces, revo-flow les gèle à sa fin) et un vérificateur (type ${VERIFIER_TYPE}, sonnet medium, lecture seule : il juge chaque critère avec une preuve exécutée, après les autres ; lance-le avec l’outil Agent comme les autres, même en arrière-plan : sa preuve à l'exécution, web ou mobile, se suit en direct dans le panneau et sur l'appareil ; ne juge jamais les critères toi-même à sa place).${archi} Un gros flow (beaucoup de fichiers, plusieurs agents) mérite aussi une revue (/code-review) avant de conclure.`)}
 3. Exécution : lance chaque agent avec l'outil Agent (description = son nom exact), dans un même message quand ils sont indépendants ; prompt = sa mission et le contexte utile (fichiers, conventions, contraintes, ce que font les autres). revo-flow ajoute lui-même son modèle, son effort, sa liste de tâches${cache(` et l'extrait de fiche du cache qui le concerne : ajoute seulement ce qui manque (pièges transverses, décisions)`)} ; ne les recopie pas.
 ${end}${cache(`. Puis, pour chaque feature touchée, ${CACHE_TOOL} action « apprendre » (feature, titre, alias, resume, flux, entrees, fichiers et rôles, pièges, corrections de ce que le cache disait de faux) ; pour une fiche seulement périmée et toujours juste, action « rafraichir » (feature, fichiers relus)`)}. Conclus par une synthèse courte.
 Ne fais pas toi-même les tâches confiées aux sous-agents. Pas de commit, de push ni de MR sans que l'utilisateur le demande.`
@@ -457,7 +480,7 @@ export function agentBrief(a: FlowAgent, cache: AgentCache | boolean = 'fiches',
   const resume = done > 0 && done < a.tasks.length
   const check =
     verif && a.subagentType !== 'Explore' && !isVerifier(a)
-      ? `\nAvant de finir, appelle l'outil ${VERIF_TOOL} action lancer sur tes fichiers ; corrige ce qui est nouveau et à toi (les erreurs préexistantes ou d'un autre agent ne sont pas à toi).${crap ? SCOUT : ''}`
+      ? `\nNe lance pas toi-même le lint, le typage ni les tests du projet : revo-flow les lance une seule fois, quand tous les agents ont fini (la porte). Si elle trouve une erreur nouvelle dans tes fichiers, l'orchestrateur te renverra la corriger.${crap ? SCOUT : ''}`
       : ''
   return `# Tes tâches (revo-flow) — « ${a.name} »${a.role ? ` : ${a.role}` : ''}
 ${a.tasks.map((t, i) => `${i + 1}. ${t.title}${t.status === 'completed' ? ' ✓ déjà faite' : ''}`).join('\n')}

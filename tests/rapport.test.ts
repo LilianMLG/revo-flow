@@ -277,7 +277,7 @@ const ENTRIES: Entry[] = [
 ]
 const BASE: RapportInput = { flow: FLOW, lead: LEAD, entries: ENTRIES, date: '2026-10-12 09:03' }
 
-const SECTIONS = ['## Demande et plan', '## Fichiers modifiés', '## Vérification (porte)', "## Critères d'acceptation", '## Score CRAP', '## Durée, coût et tokens']
+const SECTIONS = ['## Demande et plan', '## Fichiers modifiés', '## Vérification (porte)', "## Critères d'acceptation", '## Architecture', '## Score CRAP', '## Durée, coût et tokens']
 
 test('rapportMarkdown : rapport complet, les six sections', () => {
   const md = rapportMarkdown({
@@ -310,6 +310,7 @@ test('rapportMarkdown : rapport complet, les six sections', () => {
     ],
     cache: { injecte: 1200, evites: 8400, net: 7200, lus: 3, completude: 1 },
     web: { etat: 'arrete', commande: 'npm run dev', url: 'http://localhost:3000', captures: [] },
+    archi: { verdict: 'ok', preuve: '3 fichiers lus ; Basket.vue sous components/ comme les autres vues ; Promo importé de types/promo.ts' },
   })
   for (const s of SECTIONS) expect(md).toContain(s)
   expect(md).not.toMatch(/\*Absent/)
@@ -348,7 +349,8 @@ test('rapportMarkdown : rapport complet, les six sections', () => {
 test('rapportMarkdown : sans porte, sans critères, sans fichiers ni cache, chaque section dit son absence', () => {
   const md = rapportMarkdown({ ...BASE, entries: [] })
   for (const s of SECTIONS) expect(md).toContain(s)
-  expect(md.match(/\*Absent : /g)).toHaveLength(5)
+  expect(md.match(/\*Absent : /g)).toHaveLength(6)
+  expect(md).toContain("*Absent : pas de revue d'architecture pour ce flow.*")
   expect(md).toContain('*Absent : pas de porte de vérification pour ce flow.*')
   expect(md).toContain("*Absent : le plan n'avait pas de critères.*")
   expect(md).toContain('*Absent : pas de score CRAP pour ce flow.*')
@@ -481,4 +483,10 @@ test('rapportMarkdown : sans critères, rien n’est ajouté pour le web', () =>
   const md = rapportMarkdown({ ...BASE, web: WEB })
   expect(md).not.toContain('Preuve web')
   expect(md).toContain("*Absent : le plan n'avait pas de critères.*")
+})
+
+test('rapportMarkdown : la revue d’architecture, conforme, ko avec sa preuve, ou terminée sans', () => {
+  expect(rapportMarkdown({ ...BASE, archi: { verdict: 'ok', preuve: 'rien à redire' } })).toContain('## Architecture\n\n**Revue du vérificateur** : conforme ✓\n> rien à redire')
+  expect(rapportMarkdown({ ...BASE, archi: { verdict: 'ko', preuve: 'lib/x.ts redéfinit Panier (types/cart.ts:3)' } })).toContain('**Revue du vérificateur** : ko ✗\n> lib/x.ts redéfinit Panier (types/cart.ts:3)')
+  expect(rapportMarkdown({ ...BASE, archi: { verdict: 'passee' } })).toContain('terminé sans revue (décision de l’utilisateur)')
 })

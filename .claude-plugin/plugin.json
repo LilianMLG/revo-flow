@@ -87,6 +87,12 @@
       "title": "Garde anti-merge",
       "description": "Activée : revo-flow refuse toute commande de Claude (Bash ou PowerShell, dans un flow ou non, orchestrateur, sous-agents et suivi /ship compris) qui fusionnerait une PR ou une MR (gh pr merge, glab mr merge, API REST ou GraphQL de merge), armerait l'auto-merge (gh pr merge --auto, merge_when_pipeline_succeeds, option de push GitLab) ou pousserait sur la branche par défaut (main, master, origin/HEAD, --all, --mirror). Le merge reste à vous, depuis GitHub ou GitLab. C'est une deuxième barrière : la vraie garantie est la protection de branche côté serveur. Désactivée : aucune garde.",
       "default": true
+    },
+    "architecture": {
+      "type": "boolean",
+      "title": "Revue d'architecture",
+      "description": "À la fin de chaque flow vérifié, le vérificateur juge aussi l'étape ARCHI : le code de la branche (ou de la PR) respecte-t-il l'architecture du projet ? Fichiers rangés là où le projet range leurs semblables, conventions suivies, rien de redéfini qui existe déjà (types, fonctions, composants). revo-flow lui donne la base de comparaison, les fichiers de la branche, les documents d'architecture du projet et des indices (fichier rangé ailleurs que ses semblables, nom déjà pris, définition qui existe déjà). La porte attend son verdict : sans revue, ou sur un « ko », elle refuse de conclure (3 tentatives, puis la décision revient à vous). Désactivée : le vérificateur reste facultatif.",
+      "default": true
     }
   }
 }
