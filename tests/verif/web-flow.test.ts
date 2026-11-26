@@ -259,6 +259,8 @@ async function launchWeb($: Engine, w: World) {
   await w.clock.settle()
   await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN_WEB } as never)
   const front = (await spawnAgent($, 'Front panier')).agentId!
+  // Le vérificateur passe après les autres agents du plan (v3.6) : le front a fini quand il part.
+  await endTurn($, w, front)
   const verifier = (await spawnAgent($, 'Vérificateur', 'revo-flow:verifier')).agentId!
   return { front, verifier }
 }

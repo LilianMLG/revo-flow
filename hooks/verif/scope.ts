@@ -20,8 +20,17 @@ export const SORTIES = '{sorties}'
  */
 const MAX_ARGV = 6000
 
-/** Les exécutables qui sont des .cmd ou des .bat sous Windows : sans shell, il faut `cmd /c` (§6.3). */
-const CMD_BINS = new Set(['npx', 'npm', 'yarn', 'pnpm', 'flutter', 'dart', 'fvm', 'melos'])
+/**
+ * Les exécutables qui sont des .cmd ou des .bat sous Windows : sans shell, il faut `cmd /c` (§6.3). `claude` est un claude.exe
+ * (installateur natif) ou un claude.cmd (npm install -g) : `cmd /c` marche pour les deux, il passe donc par là.
+ */
+const CMD_BINS = new Set(['npx', 'npm', 'yarn', 'pnpm', 'flutter', 'dart', 'fvm', 'melos', 'claude'])
+
+/**
+ * Durée visée d'un paquet de tests liés, en ms : le délai d'un lancement vaut 3 fois sa durée attendue, plafonné à 10 min
+ * (RUN_MAX_MS du runner), donc un paquet de 200 s tient juste sous le plafond.
+ */
+export const PAQUET_MS = 200_000
 
 const JS_EXT = ['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.mts', '.cts', '.vue']
 const BIOME_EXT = ['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.mts', '.cts', '.json', '.jsonc']
@@ -207,13 +216,26 @@ function withExclusions(cmd: VerifCommande): string[] {
   return argv
 }
 
-/** Découpe une liste de fichiers en paquets d'au plus MAX_ARGV caractères. */
-function chunks(fichiers: string[]): string[][] {
+/** La durée apprise par fichier d'une commande de tests liés qui reçoit ses fichiers ; undefined pour les autres (pas de découpe par durée). */
+export function parFichierOf(cmd: VerifCommande): number | undefined {
+  if (cmd.portee !== 'lies' || !cmd.argv.includes(FICHIERS)) return undefined
+  const d = cmd.dureeParFichierMs
+  return typeof d === 'number' && d > 0 ? d : undefined
+}
+
+/** Fichiers d'un paquet au plus, pour qu'il dure PAQUET_MS selon la durée apprise par fichier ; sans durée apprise, pas de borne. */
+export function paquetMax(cmd: VerifCommande): number {
+  const d = parFichierOf(cmd)
+  return d ? Math.max(1, Math.floor(PAQUET_MS / d)) : Infinity
+}
+
+/** Découpe une liste de fichiers en paquets d'au plus MAX_ARGV caractères et d'au plus `max` fichiers. */
+function chunks(fichiers: string[], max = Infinity): string[][] {
   const out: string[][] = []
   let cur: string[] = []
   let len = 0
   for (const f of fichiers) {
-    if (cur.length && len + f.length + 1 > MAX_ARGV) {
+    if (cur.length && (len + f.length + 1 > MAX_ARGV || cur.length >= max)) {
       out.push(cur)
       cur = []
       len = 0
@@ -270,13 +292,14 @@ export function plan(cmd: VerifCommande, input: { changed: string[]; files: stri
     parPaquet.set(r, [...(parPaquet.get(r) ?? []), p])
   }
   const out: Lancement[] = []
+  const max = paquetMax(cmd)
   for (const cwd of [...parPaquet.keys()].sort()) {
     const fichiers = parPaquet.get(cwd)!
     if (!argv.includes(FICHIERS)) {
       out.push({ id: cmd.id, cwd, argv: fill(argv, [], cwd), fichiers })
       continue
     }
-    for (const lot of chunks(fichiers)) out.push({ id: cmd.id, cwd, argv: fill(argv, lot.map(p => relative(cwd, p)), cwd), fichiers: lot })
+    for (const lot of chunks(fichiers, max)) out.push({ id: cmd.id, cwd, argv: fill(argv, lot.map(p => relative(cwd, p)), cwd), fichiers: lot })
   }
   return out
 }

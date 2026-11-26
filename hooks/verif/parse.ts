@@ -263,16 +263,101 @@ function flutterJson(out: Sortie, ctx: ParseCtx): Erreur[] {
   return res
 }
 
-/** Sortie texte : `Changed x.dart` (dart format --output=none) et `[warn] x.ts` (prettier --check) ; rien d'autre n'est lisible. */
-function texte(out: Sortie, ctx: ParseCtx): Erreur[] {
+/** Codes de sortie d'une commande introuvable (sh, cmd.exe) : une panne, jamais une erreur du code. */
+export const INTROUVABLE = new Set([127, 9009])
+
+/** Lignes de bruit des lanceurs (npm, yarn, pnpm) : jamais la ligne retenue comme message d'une sortie en échec. */
+const BRUIT = /^(npm (ERR!|error|notice|warn)|error Command failed with exit code|info Visit https?:|\S*ELIFECYCLE\b|.*A complete log of this run)/
+
+/** La dernière ligne non vide et utile d'un texte (bruit des lanceurs écarté), sans durée (« 3.2s », « 850ms ») : stable d'une exécution à l'autre. */
+function derniereLigne(text: string): string {
+  const utiles = lines(text)
+    .map(l => l.trim())
+    .filter(l => l && !BRUIT.test(l))
+  return (utiles.at(-1) ?? '').replace(/\b\d+(?:\.\d+)?\s?m?s\b/g, '').trim().slice(0, MAX_MESSAGE)
+}
+
+/**
+ * Une commande sortie en code non nul sans rien de lisible : une erreur bloquante (code 'sortie'), message = la dernière ligne utile de
+ * stderr, sinon de stdout. Rien pour un code nul, négatif (délai dépassé, lancement impossible : le runner en fait une panne) ou « introuvable ».
+ */
+function sortieNonNulle(out: Sortie, ctx: ParseCtx): Erreur[] {
+  if (out.exitCode <= 0 || INTROUVABLE.has(out.exitCode)) return []
+  const message = derniereLigne(out.stderr) || derniereLigne(out.stdout) || `code de sortie ${out.exitCode}, sortie vide`
+  return [{ outil: ctx.outil, fichier: '', code: 'sortie', message }]
+}
+
+/**
+ * `claude plugin validate` en échec : chaque « ❯ message » d'un bloc « ✘ Found N error(s): », fichier = celui du « Validating …: chemin »
+ * au-dessus. Les avertissements (⚠) et la partie « Plugin directory checks » (sans effet sur le résultat) ne comptent pas.
+ */
+function pluginValidate(all: string[], out: Sortie, ctx: ParseCtx): Erreur[] {
   const res: Erreur[] = []
-  for (const l of [...lines(out.stdout), ...lines(out.stderr)]) {
+  if (out.exitCode <= 0) return res
+  let fichier = ''
+  let erreurs = false
+  for (const l of all) {
+    if (/^Plugin directory checks\b/.test(l)) break
+    const v = /^Validating [^:]+: (.+?)\s*$/.exec(l)
+    if (v) fichier = toRoot(v[1]!, ctx)
+    if (v || /^\S/.test(l)) erreurs = /^✘ Found \d+ errors?:/.test(l)
+    const m = /^\s+❯ (.+?)\s*$/.exec(l)
+    if (erreurs && m) res.push({ outil: ctx.outil, fichier, code: 'validate', message: m[1]!.slice(0, MAX_MESSAGE) })
+  }
+  return res
+}
+
+/**
+ * Sortie texte : `Changed x.dart` (dart format --output=none), `[warn] x.ts` (prettier --check) et les erreurs de `claude plugin validate`.
+ * Rien de cela et un code de sortie non nul : une erreur bloquante, la dernière ligne utile (sortieNonNulle).
+ */
+function texte(out: Sortie, ctx: ParseCtx): Erreur[] {
+  const all = [...lines(out.stdout), ...lines(out.stderr)]
+  const res: Erreur[] = []
+  for (const l of all) {
     const d = /^Changed (.+\.dart)\s*$/.exec(l)
     if (d) res.push({ outil: ctx.outil, fichier: toRoot(d[1]!, ctx), code: 'format', message: 'formatage à refaire (dart format)' })
     const p = /^\[warn\] (.+?)\s*$/.exec(l)
     if (p && !/Code style issues|Run Prettier|--write/.test(p[1]!)) res.push({ outil: ctx.outil, fichier: toRoot(p[1]!, ctx), code: 'format', message: 'formatage à refaire (prettier)' })
   }
-  return res
+  res.push(...pluginValidate(all, out, ctx))
+  return res.length ? res : sortieNonNulle(out, ctx)
+}
+
+const BUN_FICHIER = /^(\S.*\.test\.[cm]?[jt]sx?):$/
+const BUN_FAIL = /^\(fail\) (.+?)(?: \[\d+(?:\.\d+)?m?s\])?$/
+
+/** Le détail d'un test rouge : la première ligne non vide, en retrait, sous la ligne « (fail) ». */
+function bunDetail(all: string[], i: number): string | undefined {
+  for (let j = i + 1; j < all.length && /^\s/.test(all[j]!); j++) {
+    const t = all[j]!.trim()
+    if (t) return t.slice(0, MAX_MESSAGE)
+  }
+  return undefined
+}
+
+/**
+ * `claude plugin test` (sortie de bun test) : en-tête « tests/a.test.ts: » puis une ligne « (fail) suite > nom [0.50ms] » par test rouge,
+ * la raison en retrait dessous ; « (fail) the file did not load » = fichier qui ne charge pas. Signature sans durée. Aucun (fail) et un
+ * code de sortie non nul (mod qui ne se charge pas) : sortieNonNulle.
+ */
+function bunTest(out: Sortie, ctx: ParseCtx): Erreur[] {
+  const res: Erreur[] = []
+  const all = lines(out.stdout)
+  let fichier = ''
+  for (let i = 0; i < all.length; i++) {
+    const l = all[i]!.trimEnd()
+    const f = BUN_FICHIER.exec(l)
+    if (f) fichier = toRoot(f[1]!, ctx)
+    const m = BUN_FAIL.exec(l)
+    if (!m) continue
+    const chargement = m[1] === 'the file did not load'
+    const e: Erreur = { outil: ctx.outil, fichier, code: chargement ? 'chargement' : 'echec', message: chargement ? 'le fichier de test ne se charge pas' : m[1]!.slice(0, MAX_MESSAGE) }
+    const d = bunDetail(all, i)
+    if (d) e.detail = d
+    res.push(e)
+  }
+  return res.length ? res : sortieNonNulle(out, ctx)
 }
 
 /** Les erreurs d'une sortie, chemins relatifs à la racine. Une sortie illisible (outil absent, config cassée) donne [] : c'est au runner d'en tirer l'état 'erreur'. */
@@ -291,6 +376,8 @@ export function parseOutput(format: VerifFormat, out: Sortie, ctx: ParseCtx): Er
       return dartMachine(out, ctx)
     case 'flutter-json':
       return flutterJson(out, ctx)
+    case 'bun-test':
+      return bunTest(out, ctx)
     default:
       return texte(out, ctx)
   }

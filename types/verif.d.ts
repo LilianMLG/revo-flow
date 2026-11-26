@@ -5,7 +5,8 @@ export type VerifOutil = 'lint' | 'typage' | 'tests' | 'format' | 'generation' |
 /** fichiers : reçoit les fichiers du flow ; lies : les tests liés aux fichiers du flow ; projet : tout le projet, une fois par porte. */
 export type VerifPortee = 'fichiers' | 'lies' | 'projet'
 export type VerifSource = 'ci' | 'script' | 'deduit' | 'orchestrateur'
-export type VerifFormat = 'eslint-json' | 'tsc' | 'vitest-json' | 'jest-json' | 'biome' | 'dart-machine' | 'flutter-json' | 'texte' | 'crap'
+/** bun-test : la sortie de `claude plugin test` (lignes « (fail) suite > nom » sous l'en-tête « fichier.test.ts: »). */
+export type VerifFormat = 'eslint-json' | 'tsc' | 'vitest-json' | 'jest-json' | 'biome' | 'dart-machine' | 'flutter-json' | 'texte' | 'bun-test' | 'crap'
 /** Une commande de vérification. argv sans shell, '{fichiers}' remplacé par les fichiers de la portée (relatifs au cwd) ; le préfixe Windows est ajouté à l'exécution. */
 export type VerifCommande = {
   id: string
@@ -18,6 +19,11 @@ export type VerifCommande = {
   declencheur?: string
   /** Moyenne glissante des durées, en ms. */
   dureeMs?: number
+  /**
+   * Tests liés avec '{fichiers}' : durée apprise par fichier passé, en ms (moyenne glissante, relevée d'un coup après un délai dépassé).
+   * Sert à découper les lancements en paquets qui tiennent dans le délai, et au délai de chaque paquet. Absent : pas de découpe par durée.
+   */
+  dureeParFichierMs?: number
   /** Motifs de tests exclus (tests qui demandent un service). */
   exclus?: string[]
   /** Où la commande a été trouvée, pour la question de confirmation : '.gitlab-ci.yml', 'script lint', 'biome.json'… (ajout de verif-coeur). */
@@ -80,8 +86,8 @@ export type TestGele = { p: string; h: string; par: string }
 // Lot 3 : preuve à l'exécution web (docs/rd-v3/README.md §3)
 /** Le serveur de dev d'un projet web (hooks/verif/web.ts, detectDevServer) : argv sans shell, port attendu, d'où il vient (« script dev », « script start »). */
 export type WebServeur = { argv: string[]; port?: number; origine: string }
-/** L'état de la preuve web d'un flow. */
-export type WebEtat = 'non-demande' | 'question' | 'demarrage' | 'pret' | 'refuse' | 'erreur' | 'arrete'
+/** L'état de la preuve web d'un flow : refuse = « Pas cette fois » ; ferme = question restée sans réponse (dialogue fermé, ou personne à qui demander). */
+export type WebEtat = 'non-demande' | 'question' | 'demarrage' | 'pret' | 'refuse' | 'ferme' | 'erreur' | 'arrete'
 /** La preuve web telle que le panneau, le rapport et le journal la voient. */
 export type WebView = {
   etat: WebEtat
@@ -109,8 +115,11 @@ export type Appareil = {
   sdk?: string
   capture?: boolean
 }
-/** L'état de la preuve mobile d'un flow : demarrage = l'émulateur s'allume, installation = l'app se construit et s'installe. */
-export type MobileEtat = 'non-demande' | 'question' | 'demarrage' | 'installation' | 'pret' | 'refuse' | 'erreur' | 'arrete'
+/**
+ * L'état de la preuve mobile d'un flow : demarrage = l'émulateur s'allume, installation = l'app se construit et s'installe ;
+ * refuse = « Pas cette fois » ; ferme = question restée sans réponse (dialogue fermé, ou personne à qui demander).
+ */
+export type MobileEtat = 'non-demande' | 'question' | 'demarrage' | 'installation' | 'pret' | 'refuse' | 'ferme' | 'erreur' | 'arrete'
 /** La preuve mobile telle que le panneau, le rapport et le journal la voient. */
 export type MobileView = {
   etat: MobileEtat
@@ -139,7 +148,10 @@ export type VerifJournal = {
   triches: number
   /** Terminé rouge sur décision de l'utilisateur. */
   accepte?: boolean
-  criteres?: { total: number; ok: number }
+  /** Les critères d'acceptation : leur nombre, ceux jugés ok et ceux jugés ko (absent sans ko). */
+  criteres?: { total: number; ok: number; ko?: number }
+  /** La porte n'a pas pu juger (v3.6) : les commandes en panne, une phrase chacune (« flutter-test : délai dépassé (10 min 00) »). */
+  pannes?: string[]
   /** Score CRAP à la dernière porte : fonctions au-dessus du seuil (fonctions = nouvelles + preexistantes), touchées par le flow (nouvelles) ou non (preexistantes). */
   crap?: { fonctions: number; nouvelles: number; preexistantes: number }
   /** La preuve web (v3) : son état, les captures écrites, les verdicts marqués web (web: true) et ceux parmi eux qui sont ko. */

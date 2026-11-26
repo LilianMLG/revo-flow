@@ -107,6 +107,48 @@ export function reportText(r: VerifResultat, opts: { max?: number; tentative?: n
   return t.length > MAX_CARACTERES ? `${t.slice(0, MAX_CARACTERES - 1)}…` : t
 }
 
+/** Les commandes en panne (état erreur) d'un résultat, une phrase chacune : « flutter-test : délai dépassé (10 min 00) » ; [] si aucune. */
+export function pannesOf(r: VerifResultat): string[] {
+  return r.commandes.filter(c => c.etat === 'erreur').map(c => (c.note ? `${c.id} : ${c.note}` : `${c.id} : en panne, voir la sortie complète`))
+}
+
+/** La panne d'une commande en peu de mots : la dernière note sans sa parenthèse (« délai dépassé (10 min 00) » → « délai dépassé »). */
+const panneCourte = (c: VerifEtatCommande) => couper(`${c.id}${c.note ? ` ${(c.note.split(' ; ').at(-1) ?? '').replace(/\s*\(.*$/, '')}` : ''}`, 60)
+
+/** « porte en panne : flutter-test délai dépassé » : la raison du verdict quand la porte n'a pas pu juger. */
+export function panneText(r: VerifResultat): string {
+  const courtes = r.commandes.filter(c => c.etat === 'erreur').map(panneCourte)
+  return `porte en panne : ${courtes.join(', ') || 'erreur'}`
+}
+
+/** La question d'une porte en panne : les pannes, puis le choix (sans relance quand elle a déjà été relancée deux fois). */
+export function panneQuestion(pannes: readonly string[], relancer: boolean): string {
+  const fin = relancer ? 'Relancer la porte, ou terminer non vérifié ?' : 'Elle a déjà été relancée deux fois : terminer non vérifié ?'
+  return `La porte n'a pas pu juger : ${pannes.join(' ; ') || 'une commande en panne'}. ${fin}`
+}
+
+/** « C2 Le total… : expected 10.005 to be 10.01 » : un critère ko et sa preuve, coupés pour tenir dans le block. */
+const koLine = (c: { id: string; texte?: string; preuve: string }) => `- ${c.id}${c.texte ? ` ${couper(c.texte, 120)}` : ''} : ${couper(c.preuve.replace(/\s*\n\s*/g, ' '), 300)}`
+
+/**
+ * Le block des critères ko (v3.6) pour l'orchestrateur : chaque critère ko et sa preuve, puis quoi faire. `aRevoir` : le code a changé
+ * depuis le verdict, un nouveau verdict du vérificateur est exigé. `outils` : le type du vérificateur et l'outil verif, à citer.
+ */
+export function criteresKoText(kos: readonly { id: string; texte?: string; preuve: string }[], total: number, aRevoir: boolean, outils: { verificateur: string; verif: string }): string {
+  const ids = kos.map(c => c.id).join(', ')
+  if (aRevoir) {
+    return [
+      `Critères d'acceptation (revo-flow) : le code a changé depuis le « ko » de ${ids} ; un nouveau verdict est obligatoire.`,
+      `Lance le vérificateur avec l’outil Agent (subagent_type « ${outils.verificateur} », description « Vérificateur ») : il rejuge les critères. Attends sa réponse, puis conclus.`,
+    ].join('\n')
+  }
+  return [
+    `Critères d'acceptation (revo-flow) : ${plural(kos.length, 'critère ko', 'critères ko')} sur ${total}.`,
+    ...kos.map(koLine),
+    `Corrige (toi-même, ou en reprenant l’agent concerné avec SendMessage), puis relance le vérificateur (subagent_type « ${outils.verificateur} ») pour un nouveau verdict ; ou demande une exception (${outils.verif} action exception, avec motif) si ce critère ne relève pas de ce flow.`,
+  ].join('\n')
+}
+
 /** Le segment de fin de flow : « vérifié ✓ », « non vérifié (typecheck ✗) », « non vérifié (codegen : erreur) ». */
 export function summaryLine(r: VerifResultat): string {
   if (r.etat === 'vert') return 'vérifié ✓'

@@ -9,8 +9,8 @@
  */
 import type { Appareil, MobileApp, MobileEtat } from '../../types/verif'
 
-/** Délai d'attente du lancement de l'app (build Gradle ou Xcode puis installation), en ms. */
-export const MOBILE_ATTENTE_MS = 300_000
+/** Délai d'attente du lancement de l'app (build Gradle ou Xcode puis installation), en ms : 15 min, le premier build Gradle dépasse souvent 5 min. */
+export const MOBILE_ATTENTE_MS = 900_000
 /** Délai d'attente du démarrage d'un émulateur ou d'un simulateur, en ms. */
 export const EMULATEUR_ATTENTE_MS = 180_000
 /** Intervalle entre deux lectures des appareils pendant le démarrage d'un émulateur, en ms. */

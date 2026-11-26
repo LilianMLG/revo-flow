@@ -5,7 +5,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, PluginOptions, Register, SessionContextUsage } from 'claude-code'
 
-import type { Activity, Context, Flow, FlowAgent, Lead } from '../types'
+import type { Activity, Context, Flow, FlowAgent, FlowBudget, Lead } from '../types'
 import type { AgentDef, CatalogueIo } from '../types/agents'
 import type { AgentInfo, CacheHit, CacheStats, DiffEntry, Feature, FlowCache, Graph, LearnContext, LearnInput, PerimeEntry } from '../types/cache'
 import type {
@@ -126,6 +126,15 @@ import {
   weekKey,
   addToJournal,
   historyText,
+  agentDeps,
+  criteresMark,
+  failedDeps,
+  failedDepsNote,
+  journalOf,
+  launchDenial,
+  outOfScope,
+  readyAgents,
+  readyText,
   type AgentCache,
   type JournalEntry,
   type PlanInput,
@@ -179,6 +188,22 @@ import {
 } from './livraison'
 import { brancheParDefaut, dossiersDuPush, mergeDenial, refusPrudent, type MergeContexte } from './merge'
 import { rapportMarkdown } from './rapport'
+import {
+  BUDGET_CHOIX,
+  budgetAction,
+  budgetAlert,
+  budgetOfFlow,
+  budgetOption,
+  budgetPlanLine,
+  budgetQuestion,
+  budgetSegment,
+  ceilingOf,
+  estimate,
+  estimateOf,
+  flowBudget,
+  flowCost,
+  raise,
+} from './budget'
 import { doctorText, manifestsOf, pluginVersion, versionText } from './doctor'
 import { addBase, baseFor } from './verif/base'
 import { CRAP_SEUIL } from './verif/crap'
@@ -210,7 +235,7 @@ import {
   parseNameStatus,
   placementHints,
 } from './verif/archi'
-import { reportText, summaryLine } from './verif/report'
+import { criteresKoText, panneQuestion, panneText, pannesOf, reportText, summaryLine } from './verif/report'
 import { purgeOutputs, runBase, runGate, type VerifIo } from './verif/runner'
 import { hasGenAnnotation, withShell } from './verif/scope'
 import {
@@ -302,6 +327,8 @@ const opts = {
   livraison: true,
   /** La revue d'architecture obligatoire du vérificateur (v3.2). */
   architecture: true,
+  /** Le budget par flow (v3.6) : auto (2 × l'estimation), off, ou un plafond en euros (« 12,5 »). */
+  budget: 'auto',
 }
 
 /** L'outil mobile de la preuve mobile (v3.1) : capture, arbre, journal, gestes, réservé au vérificateur. */
@@ -370,11 +397,11 @@ async function tick($: $) {
   }
 }
 
-/** La ligne d'état sous le prompt : « revo-flow · titre · 62 % · 3 actifs · 0,41 € ». */
+/** La ligne d'état sous le prompt : « revo-flow · titre · 62 % · 3 actifs · 0,41 € », « … · 0,41 € / 1,80 € » avec un plafond de budget. */
 async function statusOf($: $, flow: Flow, running: number) {
-  const cost = (await read($, leadA)).costUsd + flow.agents.reduce((n, a) => n + a.costUsd, 0)
+  const cost = flowCost(flow, await read($, leadA))
   const step = flow.phase === 'planning' ? 'plan en préparation' : flow.phase === 'dispatch' ? 'plan à valider' : `${flowPercent(flow)} %`
-  return `revo-flow · ${flow.title} · ${step}${running ? ` · ${running} actif${running > 1 ? 's' : ''}` : ''} · ${euros(cost)}`
+  return `revo-flow · ${flow.title} · ${step}${running ? ` · ${running} actif${running > 1 ? 's' : ''}` : ''} · ${budgetSegment(cost, flow.budget?.plafond)}`
 }
 
 // ── Flow ─────────────────────────────────────────────────────────────────
@@ -487,7 +514,7 @@ async function registerTools($: $) {
   await $.tool.register({
     name: 'plan',
     description:
-      "revo-flow, réservé à l'orchestrateur : enregistre le plan de la demande et l'équipe de sous-agents (modèle, effort et tâches de chacun). À appeler une fois, après avoir lu les specs et avant de lancer les agents.",
+      "revo-flow, réservé à l'orchestrateur : enregistre le plan de la demande et l'équipe de sous-agents (modèle, effort et tâches de chacun ; facultatifs : les agents qu'il attend et les fichiers qu'il modifiera). À appeler une fois, après avoir lu les specs et avant de lancer les agents.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -518,6 +545,17 @@ async function registerTools($: $) {
                   },
                   required: ['titre'],
                 },
+              },
+              apres: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Facultatif : les noms des agents du plan qui doivent avoir fini avant lui (le vérificateur passe après tous, sans le dire)',
+              },
+              fichiers: {
+                type: 'array',
+                maxItems: 20,
+                items: { type: 'string' },
+                description: 'Facultatif : les chemins ou motifs, relatifs à la racine, qu’il modifiera (« hooks/verif/** ») ; deux agents ne déclarent le même que s’ils sont ordonnés par apres',
               },
             },
             required: ['nom', 'modele', 'effort', 'taches'],
@@ -586,7 +624,7 @@ async function registerVerifTool($: $) {
   await $.tool.register({
     name: 'verif',
     description:
-      "revo-flow : la vérification du flow (lint, typage, tests liés ; comparée à la base de référence, seules les erreurs nouvelles comptent). Actions : lancer (orchestrateur : tout le flow, ou ceux de « fichiers » ; un sous-agent ne vérifie pas, la porte le fait une fois quand tous ont fini) ; resultat (le dernier rapport de la porte de fin) ; commandes (orchestrateur : commandes = la liste complète corrigée, ou commande + exclus = motifs de tests à exclure ; toujours reposée à l'utilisateur) ; exception (orchestrateur, motif → l'utilisateur décide de terminer non vérifié ou non) ; degeler (orchestrateur, fichiers + motif → l'utilisateur décide de dégeler des tests gelés) ; web : (vérificateur, projet web) demande le serveur de dev pour la preuve web → l’URL à utiliser, ou pourquoi non ; mobile : (vérificateur, app Flutter, React Native ou Expo) demande l’app sur un appareil (téléphone branché, émulateur ou simulateur) → quand elle est à l’écran, ou pourquoi non. Ta tâche dit laquelle des deux vaut pour ce projet.",
+      "revo-flow : la vérification du flow (lint, typage, tests liés ; comparée à la base de référence, seules les erreurs nouvelles comptent). Actions : lancer (orchestrateur : tout le flow, ou ceux de « fichiers » ; un sous-agent ne vérifie pas, la porte le fait une fois quand tous ont fini) ; resultat (le dernier rapport de la porte de fin) ; commandes (orchestrateur : commandes = la liste complète corrigée, ou commande + exclus = motifs de tests à exclure ; toujours reposée à l'utilisateur) ; exception (orchestrateur, motif → l'utilisateur décide de terminer malgré la porte rouge, un critère ko ou la revue d’architecture ko, ou non) ; degeler (orchestrateur, fichiers + motif → l'utilisateur décide de dégeler des tests gelés) ; web : (vérificateur, projet web) demande le serveur de dev pour la preuve web → l’URL à utiliser, ou pourquoi non ; mobile : (vérificateur, app Flutter, React Native ou Expo) demande l’app sur un appareil (téléphone branché, émulateur ou simulateur) → quand elle est à l’écran, ou pourquoi non. Ta tâche dit laquelle des deux vaut pour ce projet.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -605,7 +643,7 @@ async function registerVerifTool($: $) {
                 description: 'La commande mot à mot, sans shell ; "{fichiers}" = les fichiers du flow, "{sorties}" = le dossier des sorties du flow ; vide pour la commande crap',
               },
               portee: { type: 'string', enum: ['fichiers', 'lies', 'projet'] },
-              format: { type: 'string', enum: ['eslint-json', 'tsc', 'vitest-json', 'jest-json', 'biome', 'dart-machine', 'flutter-json', 'texte', 'crap'] },
+              format: { type: 'string', enum: ['eslint-json', 'tsc', 'vitest-json', 'jest-json', 'biome', 'dart-machine', 'flutter-json', 'texte', 'bun-test', 'crap'] },
               seuil: { type: 'number', description: 'Commande crap (outil qualite, format crap) : le seuil du score CRAP, 30 par défaut' },
               declencheur: { type: 'string', description: 'Motif glob : la commande ne tourne que si un fichier du flow y correspond' },
               exclus: { type: 'array', items: { type: 'string' } },
@@ -827,7 +865,7 @@ async function finishFlow($: $) {
   const blocked = flow.agents.filter(a => a.status === 'blocked').length
   const seg = g ? (isReady ? verifSegment(g) : 'vérification en cours') : ''
   const note = `${blocked ? ` · ${blocked} agent${blocked > 1 ? 's' : ''} en attente` : ''}${endNote ? ` · ${endNote}` : ''}`
-  await notify($, `« ${flow.title} » ${flow.isStopped ? 'arrêté' : 'terminé'}${seg ? ` · ${seg}` : ''} · ${fmtDuration(now - flow.startedAt)} · ${euros(cost)} · ${files} fichier${files > 1 ? 's' : ''}${note}`)
+  await notify($, `« ${flow.title} » ${flow.isStopped ? stoppedText(flow) : 'terminé'}${seg ? ` · ${seg}` : ''} · ${fmtDuration(now - flow.startedAt)} · ${euros(cost)} · ${files} fichier${files > 1 ? 's' : ''}${note}`)
   const journals = Promise.all([
     closeFlowCache($, verifP).catch(() => undefined),
     journalize($, { ...flow, endedAt: now }, lead, files, verifP).catch(() => undefined),
@@ -853,6 +891,9 @@ async function finishFlow($: $) {
     })
     .catch(() => undefined)
 }
+
+/** « arrêté », ou « arrêté (budget) » quand le plafond du budget l'a arrêté. */
+const stoppedText = (flow: Flow) => (flow.arret === 'budget' ? 'arrêté (budget)' : 'arrêté')
 
 // ── Livraison (v3.4) ─────────────────────────────────────────────────────
 
@@ -1062,7 +1103,15 @@ async function journalize($: $, flow: Flow, lead: Lead, files: number, verifP: P
   }
   const verif = await verifP.catch(() => undefined)
   const prev = await $.store.get(JOURNAL_KEY)
-  await $.store.set(JOURNAL_KEY, addToJournal(prev, verif ? { ...entry, verif } : entry))
+  await $.store.set(JOURNAL_KEY, addToJournal(prev, { ...entry, ...(verif ? { verif } : {}), ...budgetFields(flow, lead) }))
+}
+
+/** Le budget du flow pour le journal (v3.6) : estimé, plafond, réel, atteint ; et le motif d'un arrêt sur le plafond. */
+function budgetFields(flow: Flow, lead: Lead): Pick<JournalEntry, 'budget' | 'motif'> {
+  return {
+    ...(flow.budget ? { budget: budgetOfFlow(flow.budget, flowCost(flow, lead)) } : {}),
+    ...(flow.arret ? { motif: flow.arret } : {}),
+  }
 }
 
 // ── Cache projet ─────────────────────────────────────────────────────────
@@ -1767,6 +1816,12 @@ const SORTIES_GARDEES = 20
 const CONFIRM = ['Utiliser', 'Ajuster', 'Pas de vérification']
 /** Les choix de la question de fin, plafond atteint ou exception demandée (§4). */
 const FIN = ['Terminer non vérifié', 'Une tentative de plus', 'Voir le détail']
+/** Les choix de la question d'une porte en panne (v3.6) : une commande en délai dépassé ou plantée, sans erreur nouvelle. */
+const PANNE = ['Relancer la porte', 'Terminer non vérifié', 'Voir le détail']
+/** Les relances de la porte que l'utilisateur peut demander après une panne : le runner a déjà relancé la commande au délai maximal. */
+const MAX_RELANCES_PANNE = 2
+/** Les choix de la question des critères ko, plafond atteint ou exception demandée (v3.6). */
+const CRITERES_KO = ['Terminer malgré', 'Une tentative de plus']
 
 /**
  * La porte du flow courant, en mémoire : promesses (base, porte en cours) et décisions. Ce qui doit survivre à un
@@ -1825,6 +1880,14 @@ type Gate = {
   archiBlocks?: number
   /** Terminé sans revue d'architecture, sur décision de l'utilisateur. */
   archiPassee?: boolean
+  /** Le compteur de modifications au moment des derniers verdicts du vérificateur : un ko rendu avant une correction est à rejuger. */
+  verdictsSeq?: number
+  /** Les block rendus pour des critères ko (v3.6, plafond comme la porte). */
+  criteresBlocks?: number
+  /** Terminé malgré des critères ko, sur décision de l'utilisateur ou sans personne à qui demander. */
+  criteresPasses?: boolean
+  /** Les relances de la porte demandées par l'utilisateur après une panne (MAX_RELANCES_PANNE au plus). */
+  relancesPanne?: number
   /** La preuve web (v3) : le serveur de dev demandé par le vérificateur ; absente tant qu'il ne l'a pas demandé. */
   web?: GateWeb
   /** La preuve mobile (v3.1) : l'app lancée sur un appareil à la demande du vérificateur ; absente tant qu'il ne l'a pas demandée. */
@@ -2076,12 +2139,20 @@ async function askGate($: $, g: Gate, question: string, options: string[], fallb
   }
 }
 
-/** Les commandes détectées, en gardant ce que le projet avait appris de celles qui ne changent pas (durée, exclusions) et celles ajoutées par l'orchestrateur. */
+/** Les durées apprises d'une commande connue : la durée totale et, pour les tests liés, la durée par fichier (v3.6) ; rien sans elle. */
+function learnedOf(c: VerifCommande | undefined): Pick<VerifCommande, 'dureeMs' | 'dureeParFichierMs'> {
+  return {
+    ...(c?.dureeMs !== undefined ? { dureeMs: c.dureeMs } : {}),
+    ...(c?.dureeParFichierMs !== undefined ? { dureeParFichierMs: c.dureeParFichierMs } : {}),
+  }
+}
+
+/** Les commandes détectées, en gardant ce que le projet avait appris de celles qui ne changent pas (durées, exclusions) et celles ajoutées par l'orchestrateur. */
 function mergeCommands(found: VerifCommande[], prev: VerifCommande[] | undefined): VerifCommande[] {
   const old = new Map((prev ?? []).map(c => [c.id, c]))
   const merged = found.map(c => {
     const o = old.get(c.id)
-    return o ? { ...c, ...(o.dureeMs !== undefined ? { dureeMs: o.dureeMs } : {}), ...(o.exclus?.length ? { exclus: o.exclus } : {}) } : c
+    return o ? { ...c, ...learnedOf(o), ...(o.exclus?.length ? { exclus: o.exclus } : {}) } : c
   })
   const added = (prev ?? []).filter(c => c.source === 'orchestrateur' && !found.some(f => f.id === c.id))
   return [...merged, ...added]
@@ -2288,14 +2359,14 @@ async function onCommand($: $, g: Gate, c: VerifEtatCommande) {
   }
 }
 
-/** Les durées apprises et les tests instables d'une exécution, rangés dans projet.verif sans toucher aux commandes confirmées entre-temps. */
+/** Les durées apprises (totale et par fichier) et les tests instables d'une exécution, rangés dans projet.verif sans toucher aux commandes confirmées entre-temps. */
 async function keepLearned($: $, g: Gate, learnedVerif: ProjetVerif) {
   await saveVerif($, g.ref, v => {
     const cur = v ?? learnedVerif
-    const durees = new Map(learnedVerif.commandes.map(c => [c.id, c.dureeMs]))
+    const appris = new Map(learnedVerif.commandes.map(c => [c.id, learnedOf(c)]))
     return {
       ...cur,
-      commandes: cur.commandes.map(c => (durees.get(c.id) !== undefined ? { ...c, dureeMs: durees.get(c.id) } : c)),
+      commandes: cur.commandes.map(c => ({ ...c, ...appris.get(c.id) })),
       instables: [...new Set([...(cur.instables ?? []), ...(learnedVerif.instables ?? [])])],
     }
   })
@@ -2566,18 +2637,21 @@ async function endQuestion($: $, g: Gate, r: VerifResultat, motif?: string): Pro
 const waitsForAgents = (tasks: readonly { type: string; status: string }[] | undefined) =>
   (tasks ?? []).some(t => t.type === 'subagent' && !/^(completed|failed|killed|stopped|done)$/i.test(t.status))
 
+/** La porte de fin a-t-elle à juger cette fin de tour : flow vérifié en conclusion (tous les agents ont fini), tour qui n'attend pas ses agents ? */
+function gateApplies(g: Gate | undefined, flow: Flow | null, e: { background_tasks?: readonly { type: string; status: string }[] }): g is Gate {
+  if (!g || !flow || flow.id !== g.flowId || flow.isStopped || g.mode === 'off') return false
+  if (!(flow.phase === 'review' || (flow.phase === 'running' && allFinished(flow)))) return false
+  return !waitsForAgents(e.background_tasks)
+}
+
 /**
  * La porte de fin (classic.Stop de l'orchestrateur, §2 étapes 10 à 12). Seulement en conclusion d'un flow vérifié (tous les
- * agents ont fini) et pas pendant que le tour attend ses agents. Observer : la porte tourne, rien ne bloque. Bloquer : vert,
- * porte levée ou porte en erreur → le tour finit ; rouge → block avec le rapport, 3 fois au plus, puis la question de fin.
- * Rend le texte du block, ou rien.
+ * agents ont fini) et pas pendant que le tour attend ses agents. Observer : la porte tourne, rien ne bloque. Bloquer : la porte,
+ * puis le verdict (judgeGate). Rend le texte du block, ou rien.
  */
 async function stopGate($: $, e: { stop_hook_active?: boolean; background_tasks?: readonly { type: string; status: string }[] }): Promise<string | undefined> {
   const g = gate
-  const flow = await read($, flowA)
-  if (!g || !flow || flow.id !== g.flowId || flow.isStopped || g.mode === 'off') return undefined
-  if (!(flow.phase === 'review' || (flow.phase === 'running' && allFinished(flow)))) return undefined
-  if (waitsForAgents(e.background_tasks)) return undefined
+  if (!gateApplies(g, await read($, flowA), e)) return undefined
   if (g.mode === 'observer') {
     void ensureGate($).catch(() => undefined)
     return undefined
@@ -2593,9 +2667,17 @@ async function stopGate($: $, e: { stop_hook_active?: boolean; background_tasks?
   if (gate !== g || !r) return undefined
   if (g.premierRouge === undefined) g.premierRouge = !isGreen(g, r)
   await persistVerif($, g)
-  if (isGreen(g, r)) return archiGate($, g)
+  return judgeGate($, g, r)
+}
+
+/**
+ * Le verdict de la porte de fin, dans l'ordre : la porte (rouge : block avec le rapport, 3 fois au plus, puis la question de fin ;
+ * en panne : la question à l'utilisateur), puis les critères ko, puis la revue d'architecture. Rend le texte du block, ou rien.
+ */
+async function judgeGate($: $, g: Gate, r: VerifResultat): Promise<string | undefined> {
+  if (isGreen(g, r)) return (await criteresGate($, g)) ?? archiGate($, g)
   // Des commandes qui n'ont pas pu tourner, sans erreur nouvelle ni garde-fou : rien que l'orchestrateur puisse corriger.
-  if (r.etat === 'erreur' && !blockers(g).length) return undefined
+  if (r.etat === 'erreur' && !blockers(g).length) return panneGate($, g, r)
   if (g.blocks >= MAX_TENTATIVES + g.encore) {
     if ((await endQuestion($, g, r)) === 'terminer') return undefined
     g.encore++
@@ -2605,6 +2687,40 @@ async function stopGate($: $, e: { stop_hook_active?: boolean; background_tasks?
   return blockText(g, r)
 }
 
+/**
+ * La porte en panne (v3.6) : une commande en délai dépassé ou plantée, aucune erreur nouvelle. L'utilisateur décide : Relancer la
+ * porte (MAX_RELANCES_PANNE fois au plus : le runner a déjà relancé au délai maximal), Terminer non vérifié, ou Voir le détail (la
+ * sortie s'ouvre, la question revient, 3 fois au plus). Sans personne, dialogue fermé ou réponse libre : terminer non vérifié,
+ * « accepté » seulement sur une réponse de l'utilisateur. Rend le texte du block (après une relance), ou rien.
+ */
+async function panneGate($: $, g: Gate, r: VerifResultat): Promise<string | undefined> {
+  const pannes = pannesOf(r)
+  for (let i = 0; i < 3; i++) {
+    const relancer = (g.relancesPanne ?? 0) < MAX_RELANCES_PANNE
+    const options = relancer ? PANNE : PANNE.slice(1)
+    const { answer, how } = await askGate($, g, panneQuestion(pannes, relancer), options, { headless: FIN[0]!, dismissed: FIN[0]! }, 'Porte en panne')
+    if (answer === 'Voir le détail') await openVerif($)
+    else return answer === PANNE[0] && relancer ? relancePanne($, g) : finPanne($, g, how)
+  }
+  return finPanne($, g, 'ferme')
+}
+
+/** Relancer la porte en panne, à la demande de l'utilisateur : une porte neuve sur le même état, puis son verdict (judgeGate). */
+async function relancePanne($: $, g: Gate): Promise<string | undefined> {
+  g.relancesPanne = (g.relancesPanne ?? 0) + 1
+  const r = await ensureGate($, true)
+  if (gate !== g || !r) return undefined
+  return judgeGate($, g, r)
+}
+
+/** Terminer non vérifié après une panne : la porte est levée ; « accepté » seulement sur une réponse de l'utilisateur. */
+async function finPanne($: $, g: Gate, how: 'utilisateur' | 'headless' | 'ferme'): Promise<undefined> {
+  g.libre = true
+  g.accepte = g.accepte || how === 'utilisateur'
+  await persistVerif($, g)
+  return undefined
+}
+
 /** Le champ verif du journal (graphe et store) pour la porte de ce flow. */
 function verifJournal(g: Gate): VerifJournal {
   const r = g.dernier
@@ -2612,7 +2728,6 @@ function verifJournal(g: Gate): VerifJournal {
   const old = r?.erreurs.filter(x => x.statut === 'preexistante').length ?? 0
   const green = r ? isGreen(g, r) : false
   const etat: VerifJournal['etat'] = g.mode === 'off' ? 'off' : g.erreur ? 'erreur' : g.mode === 'observer' ? 'observe' : green ? 'verifie' : 'non-verifie'
-  const ok = g.verdicts?.filter(v => v.verdict === 'ok').length ?? 0
   const archi: VerifJournal['archi'] = g.archiPassee ? 'passee' : g.archi?.verdict
   return {
     ...(archi ? { archi } : {}),
@@ -2624,7 +2739,8 @@ function verifJournal(g: Gate): VerifJournal {
     dureeMs: g.dureeMs,
     triches: g.triches.length,
     ...(g.accepte && !green ? { accepte: true } : {}),
-    ...(g.criteres.length ? { criteres: { total: g.criteres.length, ok } } : {}),
+    ...(g.criteres.length ? { criteres: criteresCount(g) } : {}),
+    ...(r && pannesOf(r).length ? { pannes: pannesOf(r) } : {}),
     ...crapJournal(r),
     ...webJournal(g),
     ...mobileJournal(g),
@@ -2653,14 +2769,29 @@ function crapJournal(r: VerifResultat | undefined): Pick<VerifJournal, 'crap'> {
   return c ? { crap: { fonctions: c.nouvelles + c.preexistantes, nouvelles: c.nouvelles, preexistantes: c.preexistantes } } : {}
 }
 
-/** Le segment de la notification de fin : « vérifié ✓ », « non vérifié (typecheck ✗) », « non vérifié (erreur de revo-flow) ». */
+/** Les critères du flow pour le verdict et le journal : leur nombre, ceux jugés ok, et ceux jugés ko (absent sans ko). */
+function criteresCount(g: Gate): { total: number; ok: number; ko?: number } {
+  const ko = g.verdicts?.filter(v => v.verdict === 'ko').length ?? 0
+  return { total: g.criteres.length, ok: g.verdicts?.filter(v => v.verdict === 'ok').length ?? 0, ...(ko ? { ko } : {}) }
+}
+
+/**
+ * Le segment de la notification de fin : « vérifié ✓ », « non vérifié (typecheck ✗) », « non vérifié (porte en panne : flutter-test
+ * délai dépassé) », « non vérifié (erreur de revo-flow) » ; puis les critères s'il y en a : « vérifié ✓ · critères 6/8 · 1 ko ».
+ */
 function verifSegment(g: Gate): string {
   if (g.mode === 'off') return ''
   if (g.erreur) return 'non vérifié (erreur de revo-flow)'
   const r = g.dernier
   if (!r) return ''
-  const line = summaryLine(r)
+  const crit = criteresMark(criteresCount(g))
+  return crit ? `${gateLine(g, r)} · ${crit}` : gateLine(g, r)
+}
+
+/** Le verdict de la porte seule : vérifié, rouge, en panne, garde-fou refusé ; préfixé en observateur, « accepté » quand l'utilisateur l'a voulu. */
+function gateLine(g: Gate, r: VerifResultat): string {
   if (r.etat === 'vert' && blockers(g).length) return 'non vérifié (garde-fou refusé)'
+  const line = r.etat === 'erreur' && !blockers(g).length ? `non vérifié (${panneText(r)})` : summaryLine(r)
   const prefix = g.mode === 'observer' ? 'vérif observée : ' : ''
   return `${prefix}${line}${g.accepte && !isGreen(g, r) ? ' · accepté' : ''}`
 }
@@ -2791,6 +2922,7 @@ async function readVerdicts($: $, answer: string) {
   const archi = tous.find(v => v.id === ARCHI_ID)
   if (g.criteres.length && (verdicts.some(lisible) || !g.verdicts)) {
     g.verdicts = verdicts
+    g.verdictsSeq = g.seq
     await setView($, g, { criteres: { total: g.criteres.length, ok: verdicts.filter(v => v.verdict === 'ok').length, verdicts } })
   }
   // La revue d'architecture : un verdict lisible remplace le précédent ; une réponse sans ARCHI ne compte pas comme une revue.
@@ -2809,6 +2941,42 @@ async function verifierRunning($: $): Promise<boolean> {
     if (!info || ENDED.has(info.status)) pendingVerifiers.delete(id)
   }
   return pendingVerifiers.size > 0
+}
+
+/** Les critères jugés ko par le vérificateur, avec leur texte : ce que la porte renvoie à l'orchestrateur. */
+const koCriteres = (g: Gate) =>
+  (g.verdicts ?? []).filter(v => v.verdict === 'ko').map(v => ({ id: v.id, preuve: v.preuve, texte: g.criteres.find(c => c.id === v.id)?.texte ?? '' }))
+
+/**
+ * Les critères ko à la porte de fin (v3.6), une fois la porte verte et avant la revue d'architecture, sur le modèle d'archiGate : la
+ * conclusion est refusée, l'orchestrateur reçoit chaque critère ko et sa preuve ; un ko rendu avant une modification du code demande
+ * un nouveau verdict. Plafond comme la porte, puis la question (Terminer malgré / Une tentative de plus). Un critère non vérifiable ou
+ * sans verdict ne bloque pas. Rend le texte du block, ou rien.
+ */
+async function criteresGate($: $, g: Gate): Promise<string | undefined> {
+  const kos = koCriteres(g)
+  if (!kos.length || g.criteresPasses || (await verifierRunning($))) return undefined
+  g.criteresBlocks = (g.criteresBlocks ?? 0) + 1
+  if (g.criteresBlocks > MAX_TENTATIVES + g.encore && (await criteresQuestion($, g, kos)) === 'terminer') return undefined
+  return criteresKoText(kos, g.criteres.length, g.verdictsSeq !== undefined && g.verdictsSeq !== g.seq, { verificateur: VERIFIER_TYPE, verif: VERIF_TOOL })
+}
+
+/**
+ * La question des critères ko (plafond atteint, ou exception demandée avec `motif`) : Terminer malgré (les critères sont passés, accepté
+ * si l'utilisateur l'a dit) ou Une tentative de plus. Sans personne : terminer au plafond, une tentative de plus sur une exception (comme
+ * la revue d'architecture) ; dialogue fermé : une tentative de plus.
+ */
+async function criteresQuestion($: $, g: Gate, kos: ReturnType<typeof koCriteres>, motif?: string): Promise<'terminer' | 'encore'> {
+  const q = `${plural(kos.length, 'critère')} ko : ${kos.map(k => `${k.id} (${k.preuve.slice(0, 120)})`).join(' ; ')}.${motif ? ` L’orchestrateur demande une exception : « ${motif} ».` : ''} Terminer quand même ?`
+  const { answer, how } = await askGate($, g, q, CRITERES_KO, { headless: motif ? CRITERES_KO[1]! : CRITERES_KO[0]!, dismissed: CRITERES_KO[1]! }, 'Critères ko')
+  if (answer !== CRITERES_KO[0]) {
+    g.encore++
+    return 'encore'
+  }
+  g.criteresPasses = true
+  g.accepte = g.accepte || how === 'utilisateur'
+  await persistVerif($, g)
+  return 'terminer'
 }
 
 /**
@@ -2984,7 +3152,7 @@ function commandOf(raw: unknown, known: VerifCommande[]): VerifCommande | string
   const id = text(o.id)
   const outils: VerifOutil[] = ['lint', 'typage', 'tests', 'format', 'generation', 'qualite']
   const portees: VerifPortee[] = ['fichiers', 'lies', 'projet']
-  const formats: VerifFormat[] = ['eslint-json', 'tsc', 'vitest-json', 'jest-json', 'biome', 'dart-machine', 'flutter-json', 'texte', 'crap']
+  const formats: VerifFormat[] = ['eslint-json', 'tsc', 'vitest-json', 'jest-json', 'biome', 'dart-machine', 'flutter-json', 'texte', 'bun-test', 'crap']
   const argv = Array.isArray(o.argv) ? o.argv.filter((x): x is string => typeof x === 'string' && x.length > 0) : []
   if (!id) return 'une commande sans « id »'
   if (!outils.includes(text(o.outil) as VerifOutil)) return `« ${id} » : outil doit être lint, typage, tests, format, generation ou qualite`
@@ -3005,7 +3173,7 @@ function commandOf(raw: unknown, known: VerifCommande[]): VerifCommande | string
     format,
     source: same && unchanged ? same.source : 'orchestrateur',
     ...(text(o.declencheur) ? { declencheur: text(o.declencheur) } : {}),
-    ...(same?.dureeMs !== undefined ? { dureeMs: same.dureeMs } : {}),
+    ...learnedOf(same),
     ...(texts(o.exclus).length ? { exclus: texts(o.exclus) } : same?.exclus?.length ? { exclus: same.exclus } : {}),
     ...(same?.origine ? { origine: same.origine } : {}),
     ...(crap ? { seuil: seuil ?? same?.seuil ?? CRAP_SEUIL } : {}),
@@ -3040,6 +3208,51 @@ async function commandesTool($: $, g: Gate, e: Record<string, unknown>): Promise
 }
 
 /**
+ * `verif exception` (orchestrateur) : terminer malgré ce qui bloque, sur décision de l'utilisateur, dans l'ordre de la porte de fin :
+ * la porte rouge (question de fin), puis les critères ko (v3.6), puis la revue d'architecture ko.
+ */
+async function exceptionTool($: $, g: Gate, motif: string): Promise<string> {
+  if (!motif) return 'revo-flow verif : « motif » manquant (pourquoi terminer malgré la porte rouge, en une phrase).'
+  const r = g.dernier
+  if (r && !isGreen(g, r)) return exceptionPorte($, g, r, motif)
+  if (r && koCriteres(g).length && !g.criteresPasses) return exceptionCriteres($, g, motif)
+  if (r && g.archi?.verdict === 'ko' && !g.archiPassee) return exceptionArchi($, g, g.archi.preuve, motif)
+  return 'revo-flow verif : la porte n’est pas rouge, pas d’exception à demander.'
+}
+
+/** L'exception sur une porte rouge : la question de fin (Terminer non vérifié, Une tentative de plus, Voir le détail). */
+async function exceptionPorte($: $, g: Gate, r: VerifResultat, motif: string): Promise<string> {
+  const choice = await endQuestion($, g, r, motif)
+  if (choice === 'terminer') return 'revo-flow verif : l’utilisateur accepte de terminer non vérifié ; conclus (le flow sera marqué non vérifié).'
+  if (g.blocks >= MAX_TENTATIVES + g.encore) g.encore++
+  await persistVerif($, g)
+  return 'revo-flow verif : l’utilisateur veut une tentative de plus : corrige, puis conclus.'
+}
+
+/** L'exception sur des critères ko (v3.6) : Terminer malgré (critères passés) ou Une tentative de plus ; sans personne, une tentative de plus. */
+async function exceptionCriteres($: $, g: Gate, motif: string): Promise<string> {
+  if ((await criteresQuestion($, g, koCriteres(g), motif)) === 'encore') return 'revo-flow verif : l’utilisateur veut que les critères ko soient corrigés : corrige, relance le vérificateur, puis conclus.'
+  return 'revo-flow verif : l’utilisateur accepte de terminer malgré les critères ko ; conclus.'
+}
+
+/** L'exception sur une revue d'architecture « ko » : Terminer sans (revue passée) ou Une tentative de plus ; sans personne, une tentative de plus. */
+async function exceptionArchi($: $, g: Gate, preuve: string, motif: string): Promise<string> {
+  const { answer, how } = await askGate(
+    $,
+    g,
+    `L’orchestrateur demande de terminer malgré la revue d’architecture « ko » (${preuve}) : « ${motif} ». Terminer quand même ?`,
+    ['Terminer sans', 'Une tentative de plus'],
+    { headless: 'Une tentative de plus', dismissed: 'Une tentative de plus' },
+    'Revue d’architecture',
+  )
+  if (answer !== 'Terminer sans') return 'revo-flow verif : l’utilisateur veut que l’architecture soit corrigée : corrige, relance le vérificateur, puis conclus.'
+  g.archiPassee = true
+  g.accepte = g.accepte || how === 'utilisateur'
+  await setView($, g, { archi: { verdict: 'passee', preuve } })
+  return 'revo-flow verif : l’utilisateur accepte de terminer malgré la revue d’architecture ; conclus.'
+}
+
+/**
  * L'outil verif : lancer, resultat, commandes, exception, degeler, web. commandes, exception et degeler sont réservées à l'orchestrateur,
  * web au vérificateur (et à l'orchestrateur).
  */
@@ -3061,34 +3274,8 @@ async function verifTool($: $, e: Record<string, unknown> & { agentId?: string }
     }
     case 'commandes':
       return leadOnly('commandes') ?? commandesTool($, g, e)
-    case 'exception': {
-      const denied = leadOnly('exception')
-      if (denied) return denied
-      const motif = text(e.motif)
-      if (!motif) return 'revo-flow verif : « motif » manquant (pourquoi terminer malgré la porte rouge, en une phrase).'
-      const r = g.dernier
-      if (r && isGreen(g, r) && g.archi?.verdict === 'ko' && !g.archiPassee) {
-        const { answer, how } = await askGate(
-          $,
-          g,
-          `L’orchestrateur demande de terminer malgré la revue d’architecture « ko » (${g.archi.preuve}) : « ${motif} ». Terminer quand même ?`,
-          ['Terminer sans', 'Une tentative de plus'],
-          { headless: 'Une tentative de plus', dismissed: 'Une tentative de plus' },
-          'Revue d’architecture',
-        )
-        if (answer !== 'Terminer sans') return 'revo-flow verif : l’utilisateur veut que l’architecture soit corrigée : corrige, relance le vérificateur, puis conclus.'
-        g.archiPassee = true
-        g.accepte = g.accepte || how === 'utilisateur'
-        await setView($, g, { archi: { verdict: 'passee', preuve: g.archi.preuve } })
-        return 'revo-flow verif : l’utilisateur accepte de terminer malgré la revue d’architecture ; conclus.'
-      }
-      if (!r || isGreen(g, r)) return 'revo-flow verif : la porte n’est pas rouge, pas d’exception à demander.'
-      const choice = await endQuestion($, g, r, motif)
-      if (choice === 'terminer') return 'revo-flow verif : l’utilisateur accepte de terminer non vérifié ; conclus (le flow sera marqué non vérifié).'
-      if (g.blocks >= MAX_TENTATIVES + g.encore) g.encore++
-      await persistVerif($, g)
-      return 'revo-flow verif : l’utilisateur veut une tentative de plus : corrige, puis conclus.'
-    }
+    case 'exception':
+      return leadOnly('exception') ?? exceptionTool($, g, text(e.motif))
     case 'degeler': {
       const denied = leadOnly('degeler')
       if (denied) return denied
@@ -3137,6 +3324,9 @@ const WEB_SORTIE_MAX = 8000
 const CAPTURE_MAX = 1_500_000
 /** La note d'une preuve web sans serveur de dev détecté : la réponse au vérificateur le dit à part. */
 const NO_DEV_SERVER = 'aucun serveur de dev détecté'
+
+/** Les états d'une preuve à l'exécution (web ou mobile) qui n'ont rien à arrêter : ni demandée, refusée, restée sans réponse, en erreur. */
+const PREUVE_CLOSE = new Set<string>(['non-demande', 'refuse', 'ferme', 'erreur'])
 
 /** La preuve web de la porte, créée à la première demande. */
 function webOf(g: Gate): GateWeb {
@@ -3222,6 +3412,7 @@ function webAnswer(w: GateWeb): string {
     return `revo-flow verif : serveur prêt sur ${w.url} (${commande}, ${w.existant ? 'déjà en marche' : 'démarré par revo-flow'}) — navigue seulement sur cette origine ; cite dans chaque preuve l’URL, l’élément vu, le nombre d’erreurs console et de réponses 4xx/5xx ; une capture par critère (computer screenshot).`
   }
   if (w.etat === 'refuse') return 'revo-flow verif : l’utilisateur ne démarre pas le serveur : preuve web non vérifiable, dis-le dans tes preuves.'
+  if (w.etat === 'ferme') return `revo-flow verif : la question du serveur de dev est restée sans réponse (${w.note ?? 'dialogue fermé'}) : preuve web non vérifiable, dis-le dans tes preuves.`
   if (w.etat === 'erreur' && w.note === NO_DEV_SERVER) {
     return 'revo-flow verif : aucun serveur de dev détecté (pas de script dev dans package.json) : preuve web impossible, juge non vérifiable.'
   }
@@ -3266,7 +3457,7 @@ async function startWeb($: $, g: Gate, w: GateWeb): Promise<void> {
   if (port !== undefined && (await portTaken($, port))) {
     await setWeb($, g, { etat: 'question' })
     const url = `http://localhost:${port}`
-    const { answer } = await askGate(
+    const { answer, how } = await askGate(
       $,
       g,
       `Le port ${port} est déjà pris : un serveur tourne sans doute. Utiliser ${url} pour la preuve web ? (revo-flow n’arrête rien)`,
@@ -3276,11 +3467,11 @@ async function startWeb($: $, g: Gate, w: GateWeb): Promise<void> {
     )
     // Arrêtée pendant la question (fin de flow, porte remplacée) : rien ne change.
     if (w.etat !== 'question') return
-    return setWeb($, g, answer === 'Utiliser' ? { etat: 'pret', existant: true, url } : { etat: 'refuse' })
+    return setWeb($, g, answer === 'Utiliser' ? { etat: 'pret', existant: true, url } : noAnswer(how))
   }
   await setWeb($, g, { etat: 'question' })
   const commande = commandeText(serveur)
-  const { answer } = await askGate(
+  const { answer, how } = await askGate(
     $,
     g,
     `Démarrer « ${commande} » pour ${g.ref.nom}${port !== undefined ? ` (port ${port})` : ''} ? Le vérificateur l’ouvrira dans le navigateur pour la preuve web.`,
@@ -3289,7 +3480,7 @@ async function startWeb($: $, g: Gate, w: GateWeb): Promise<void> {
     'Preuve web : démarrer le serveur de dev ?',
   )
   if (w.etat !== 'question') return
-  if (answer !== 'Démarrer') return setWeb($, g, { etat: 'refuse' })
+  if (answer !== 'Démarrer') return setWeb($, g, noAnswer(how))
   await setWeb($, g, { etat: 'demarrage' })
   await spawnServer($, g, w, serveur)
 }
@@ -3429,7 +3620,7 @@ async function stopWeb($: $, g: Gate | undefined) {
     // arrêt au mieux : le serveur meurt aussi avec le module
   }
   w.stop = undefined
-  if (w.etat === 'refuse' || w.etat === 'erreur' || w.etat === 'non-demande') return
+  if (PREUVE_CLOSE.has(w.etat)) return
   w.etat = 'arrete'
   await setView($, g, { web: webView(g) }).catch(() => undefined)
 }
@@ -3596,6 +3787,7 @@ function mobileAnswer(m: GateMobile): string {
     return `revo-flow verif : app ${m.app ? frameworkLabel(m.app.framework) : ''} à l’écran sur ${ou} (${m.commande ?? 'lancée'}${m.emulateur ? ', émulateur démarré par revo-flow' : ''}). L’utilisateur la regarde en direct. Observe avec l’outil mcp__revo-flow__mobile : capture (puis Read), arbre, journal, toucher, glisser, texte, touche — une action à la fois ; cite dans chaque preuve l’écran vu, les exceptions, débordements et erreurs du journal, et « capture n ».`
   }
   if (m.etat === 'refuse') return 'revo-flow verif : l’utilisateur ne lance pas l’app : preuve mobile non vérifiable, dis-le dans tes preuves.'
+  if (m.etat === 'ferme') return `revo-flow verif : la question de lancer l’app est restée sans réponse (${m.note ?? 'dialogue fermé'}) : preuve mobile non vérifiable, dis-le dans tes preuves.`
   if (m.etat === 'erreur' && m.note === NO_MOBILE_APP) {
     return 'revo-flow verif : aucune app mobile détectée (ni pubspec.yaml Flutter, ni react-native ou expo dans package.json) : preuve mobile impossible, juge non vérifiable.'
   }
@@ -3650,9 +3842,10 @@ async function startMobile($: $, g: Gate, m: GateMobile): Promise<void> {
   const no = { headless: 'Pas cette fois', dismissed: 'Pas cette fois' }
   const nom = frameworkLabel(app.framework)
   let choisi: Appareil | undefined
+  let how: 'utilisateur' | 'headless' | 'ferme' = 'utilisateur'
   if (candidats.length === 1) {
     const d = candidats[0]!
-    const { answer } = await askGate(
+    const r = await askGate(
       $,
       g,
       d.etat === 'connecte'
@@ -3663,10 +3856,11 @@ async function startMobile($: $, g: Gate, m: GateMobile): Promise<void> {
       'Preuve mobile : lancer l’app sur l’appareil ?',
     )
     if (m.etat !== 'question') return
-    if (answer === 'Lancer') choisi = d
+    how = r.how
+    if (r.answer === 'Lancer') choisi = d
   } else {
     const options = candidats.slice(0, APPAREILS_MAX)
-    const { answer } = await askGate(
+    const r = await askGate(
       $,
       g,
       `Lancer l’app ${nom} de ${g.ref.nom} pour la preuve mobile : sur quel appareil ? Le vérificateur l’observera en direct (un émulateur éteint est démarré avec sa fenêtre).`,
@@ -3675,9 +3869,10 @@ async function startMobile($: $, g: Gate, m: GateMobile): Promise<void> {
       'Preuve mobile : sur quel appareil ?',
     )
     if (m.etat !== 'question') return
-    choisi = options.find(d => deviceLabel(d) === answer)
+    how = r.how
+    choisi = options.find(d => deviceLabel(d) === r.answer)
   }
-  if (!choisi) return setMobile($, g, { etat: 'refuse' })
+  if (!choisi) return setMobile($, g, noAnswer(how))
   m.appareil = choisi
   if (choisi.etat !== 'connecte') {
     await setMobile($, g, { etat: 'demarrage' })
@@ -3693,7 +3888,17 @@ async function startMobile($: $, g: Gate, m: GateMobile): Promise<void> {
     m.emulateur = allume
   }
   await setMobile($, g, { etat: 'installation', commande: commandeMobile(runCommand(app, m.appareil)) })
+  $.ui.toast(`revo-flow : lancement de l’app sur ${m.appareil.nom} ; le premier build peut être long (${Math.round(MOBILE_ATTENTE_MS / 60_000)} min au plus)`, { timeoutMs: 10_000 })
   await spawnApp($, g, m, app, m.appareil)
+}
+
+/**
+ * Une preuve à l'exécution non accordée (v3.6) : refuse sur « Pas cette fois » (ou une réponse libre) de l'utilisateur ; ferme quand la
+ * question est restée sans réponse (dialogue fermé, ou personne à qui demander), avec la raison en note.
+ */
+function noAnswer(how: 'utilisateur' | 'headless' | 'ferme'): { etat: 'refuse' | 'ferme'; note?: string } {
+  if (how === 'utilisateur') return { etat: 'refuse' }
+  return { etat: 'ferme', note: how === 'headless' ? 'personne à qui demander' : 'dialogue fermé' }
 }
 
 /**
@@ -3758,7 +3963,8 @@ async function androidBooted($: $, d: Appareil, os: 'windows' | 'posix'): Promis
 
 /**
  * Lance l'app sur l'appareil ($.process.spawn, cmd /c sous Windows) et lit sa sortie en fond, comme spawnServer : app à l'écran
- * (appReadyFromOutput) → pret ; échec de build ou de pose, processus mort ou 5 min sans signe → erreur (le processus est arrêté). Rend
+ * (appReadyFromOutput) → pret ; échec de build ou de pose, processus mort ou 15 min sans signe (MOBILE_ATTENTE_MS : le premier build Gradle
+ * est long) → erreur (le processus est arrêté). Rend
  * quand l'issue est connue ; la lecture continue ensuite (le journal du vérificateur la lit). Jamais d'exception.
  */
 async function spawnApp($: $, g: Gate, m: GateMobile, app: MobileApp, d: Appareil): Promise<void> {
@@ -3805,7 +4011,7 @@ async function spawnApp($: $, g: Gate, m: GateMobile, app: MobileApp, d: Apparei
       if (patch.etat === 'pret') $.ui.toast(`revo-flow : app à l’écran sur ${d.nom}, le vérificateur la regarde`)
       resolve()
     }
-    timer = $.clock.after(MOBILE_ATTENTE_MS, () => void settle({ etat: 'erreur', note: `l’app n’est pas à l’écran après ${Math.round(MOBILE_ATTENTE_MS / 1000)} s` }, true)) as unknown as
+    timer = $.clock.after(MOBILE_ATTENTE_MS, () => void settle({ etat: 'erreur', note: `l’app n’est pas à l’écran après ${Math.round(MOBILE_ATTENTE_MS / 60_000)} min` }, true)) as unknown as
       | { cancel?: () => void }
       | undefined
     void (async () => {
@@ -3859,7 +4065,7 @@ async function stopMobile($: $, g: Gate | undefined) {
     }
     m.stopEmulateur = undefined
   }
-  if (m.etat === 'refuse' || m.etat === 'erreur' || m.etat === 'non-demande') return
+  if (PREUVE_CLOSE.has(m.etat)) return
   m.etat = 'arrete'
   await setView($, g, { mobile: mobileView(g) }).catch(() => undefined)
 }
@@ -4286,6 +4492,7 @@ async function afterEnd($: $, key: string, outcome: Outcome) {
   if (outcome === 'done' && isTester(a)) await freezeTester($, a).catch(() => undefined)
   if (outcome === 'done') {
     for (const x of dependents) await relaunch($, x.key, `« ${a.name} » a fini, « ${x.name} » l’attendait :`)
+    announceReady($, flow, a)
     return
   }
   if (outcome === 'failed') {
@@ -4298,6 +4505,43 @@ async function afterEnd($: $, key: string, outcome: Outcome) {
   if (target.status === 'done') return relaunch($, key, `« ${target.name} » a déjà fini, « ${a.name} » l’attendait :`)
   if (target.status === 'failed') return blockedNote($, a, 'en échec')
   if (target.status === 'blocked' && waitsFor(flow, target.key, key)) return blockedNote($, a, 'attente croisée')
+}
+
+/**
+ * La fin de `a` rend prêts les agents pas encore lancés dont tous les « apres » ont fini (v3.6) : l'orchestrateur est prévenu de les
+ * lancer, en un message, comme pour un agent en attente relancé. `flow` est lu avant les relances : un agent en attente de `a` (blocked)
+ * n'y est pas prêt, sa relance a déjà son message.
+ */
+function announceReady($: $, flow: Flow, a: FlowAgent) {
+  const ready = readyAgents(flow).filter(x => agentDeps(flow.agents, x).includes(a.key))
+  if (!ready.length) return
+  void $.prompt.submit({ text: readyText(a, ready), asUser: true }).catch(() => undefined)
+}
+
+/** Un agent lancé alors qu'un agent dont il dépend a échoué (v3.6) : un toast, et l'avertissement ajouté à sa consigne ('' sinon). */
+function orderNote($: $, flow: Flow, a: FlowAgent): string {
+  const note = failedDepsNote(failedDeps(flow, a))
+  if (!note) return ''
+  $.ui.toast(`revo-flow : « ${a.name} » part alors qu’un agent qu’il devait attendre a échoué`)
+  return `\n\n${note}`
+}
+
+/** La racine du projet du flow : celle de la porte, du cache, sinon du dépôt de la session ; undefined hors dépôt. */
+async function projectRoot($: $): Promise<string | undefined> {
+  return gate?.ref.racine ?? flowRef?.racine ?? (await $.session.repo().catch(() => null))?.root
+}
+
+/**
+ * Un agent modifie un fichier hors des « fichiers » que le plan lui a donnés (v3.6) : un toast, une fois par agent et par fichier, et le
+ * fichier gardé sur l'agent (horsPlan) pour le rapport. Rien pour un agent sans fichiers déclarés, ni pour un fichier hors du dépôt.
+ */
+async function noteScope($: $, key: string, path: string) {
+  const a = (await read($, flowA))?.agents.find(x => x.key === key)
+  const root = a?.files?.length ? await projectRoot($) : undefined
+  const rel = root ? relTo(root, path) : undefined
+  if (!a || !rel || a.horsPlan?.includes(rel) || !outOfScope(a, [rel]).length) return
+  await setAgent($, key, x => ({ ...x, horsPlan: [...(x.horsPlan ?? []), rel] }))
+  $.ui.toast(`revo-flow : « ${a.name} » modifie ${rel}, hors des fichiers que le plan lui donne`)
 }
 
 /** `from` attend-il `key`, directement ou par une chaîne d'agents en attente (A attend B qui attend C qui attend A) ? */
@@ -4561,10 +4805,10 @@ async function abandonFlow($: $, snap: FlowSnapshot) {
 const CANCELLED =
   'revo-flow : plan annulé par l’utilisateur. Demande-lui ce qu’il faut changer, puis propose un nouveau plan avec l’outil plan.'
 
-/** Le plan est refusé : retour à la planification, sans agents. */
+/** Le plan est refusé : retour à la planification, sans agents ni budget (le prochain plan aura le sien). */
 async function resetPlan($: $) {
   claimed.clear()
-  await setFlow($, f => ({ ...f, phase: 'planning', agents: [], isApproved: false }))
+  await setFlow($, ({ budget: _b, ...f }) => ({ ...f, phase: 'planning', agents: [], isApproved: false }))
 }
 
 /** Bouton « Lancer » : répond au dialogue en attente, sinon valide le plan posé. */
@@ -4587,7 +4831,7 @@ async function cancelPlan($: $) {
  * Sans personne à qui demander (-p), le plan part : la validation ne doit jamais bloquer le flow. Dialogue fermé
  * (Échap) : annulé, aucun agent ne part sans accord. Un texte libre (« Other ») vaut refus, transmis au modèle.
  */
-function decide($: $, plan: PlanInput): Promise<Decision> {
+function decide($: $, plan: PlanInput, budget?: string): Promise<Decision> {
   return new Promise(resolve => {
     let isSettled = false
     const settle = (d: Decision) => {
@@ -4597,7 +4841,7 @@ function decide($: $, plan: PlanInput): Promise<Decision> {
       if (pendingPreview?.question === question) pendingPreview = undefined
       resolve(d)
     }
-    const question = planQuestion(plan)
+    const question = planQuestion(plan, budget)
     pendingDecision = settle
     pendingPreview = { question, markdown: planMarkdown(plan) }
     void askOr($, question, ['Lancer', 'Annuler'], { headless: 'Lancer', dismissed: 'Annuler' }).then(answer =>
@@ -4606,24 +4850,100 @@ function decide($: $, plan: PlanInput): Promise<Decision> {
   })
 }
 
-/** Le plan en markdown, à côté des graphes : ~/.claude/revo-flow/plans/<titre>.md, réécrit à chaque nouveau plan. */
-async function writePlanFile($: $, plan: PlanInput, flow: Flow): Promise<string | undefined> {
+/** Le plan en markdown, à côté des graphes : ~/.claude/revo-flow/plans/<titre>.md, réécrit à chaque nouveau plan ; avec la ligne du budget. */
+async function writePlanFile($: $, plan: PlanInput, flow: Flow, budget?: string): Promise<string | undefined> {
   const home = await ioOf($).home()
   if (!home) return undefined
   const d = new Date(await $.clock.now())
   const p = (n: number) => String(n).padStart(2, '0')
   const date = `${dayKey(d)} ${p(d.getHours())}:${p(d.getMinutes())}`
   const path = `${normalizePath(home)}/.claude/revo-flow/plans/${slug(plan.title) || 'plan'}.md`
-  await $.fs.write(path, planMarkdown(plan, { request: flow.request, project: flow.project, branch: flow.branch, date }))
+  await $.fs.write(path, planMarkdown(plan, { request: flow.request, project: flow.project, branch: flow.branch, date, ...(budget ? { budget } : {}) }))
   return path
 }
 
 /**
+ * Le budget d'un plan (v3.6) : l'estimation tirée du journal des flows (sinon les valeurs par défaut), le plafond que l'option en tire
+ * (auto : 2 × l'estimation ; un nombre : ce plafond en euros ; off : rien), et la ligne du dialogue de validation et du plan.md.
+ */
+async function planBudget($: $, plan: PlanInput): Promise<{ budget: FlowBudget | undefined; line: string | undefined }> {
+  if (opts.budget === 'off') return { budget: undefined, line: undefined }
+  const est = estimate(plan, journalOf(await $.store.get(JOURNAL_KEY)))
+  const plafond = ceilingOf(est.usd, opts.budget)
+  return { budget: flowBudget(est, plafond), line: budgetPlanLine(est, plafond) }
+}
+
+/** Change le budget du flow en cours (s'il en a un) ; `sansPlafond` retire le plafond (« Laisser finir »). */
+function setBudget($: $, patch: Partial<FlowBudget>, sansPlafond = false) {
+  return setFlow($, f => {
+    if (!f.budget) return f
+    const { plafond: _p, ...rest } = f.budget
+    return { ...f, budget: sansPlafond ? { ...rest, ...patch } : { ...f.budget, ...patch } }
+  })
+}
+
+/**
+ * Les signaux du budget déjà donnés dans ce chargement (« flow|alerte|plafond », « flow|question|plafond »), réservés avant tout await :
+ * deux requêtes simultanées (agents en parallèle) n'en donnent qu'un, et la question n'est jamais ouverte deux fois.
+ */
+const budgetSignals = new Set<string>()
+const claimBudget = (key: string) => !budgetSignals.has(key) && !!budgetSignals.add(key)
+
+/**
+ * Le budget après chaque requête (v3.6, turn.step) : à 80 % du plafond, un toast ; à 100 %, la question (Arrêter, +50 %, Laisser finir),
+ * posée en fond. Chacun une fois par plafond : gardé dans le flow (survit au rechargement et à la reprise) et réservé en mémoire.
+ */
+async function checkBudget($: $) {
+  const flow = await read($, flowA)
+  const b = flow?.budget
+  if (!flow || !b || flow.phase === 'done' || flow.isStopped) return
+  const spent = flowCost(flow, await read($, leadA))
+  const action = budgetAction(b, spent)
+  const plafond = b.plafond
+  if (!action || plafond === undefined || !claimBudget(`${flow.id}|${action}|${plafond}`)) return
+  if (action === 'alerte') return alertBudget($, spent, plafond)
+  await setBudget($, { question: plafond, atteint: true })
+  void askBudget($, spent, plafond).catch(() => undefined)
+}
+
+/** L'alerte à 80 % du plafond : notée dans le flow, et un toast. */
+async function alertBudget($: $, spent: number, plafond: number) {
+  await setBudget($, { alerte: plafond })
+  $.ui.toast(`revo-flow : ${budgetAlert(spent, plafond)}`, { timeoutMs: 10_000 })
+}
+
+/**
+ * La question du plafond atteint : Arrêter (ce que fait Tout arrêter, sans redemander ; le flow est journalisé arrêté, motif budget),
+ * +50 % (le plafond est relevé), Laisser finir (plus de plafond). Sans personne : arrêter ; dialogue fermé ou réponse libre : laisser
+ * finir (jamais un flow tué sur une touche Échap). Rien si le flow a fini ou changé entre-temps.
+ */
+async function askBudget($: $, spent: number, plafond: number) {
+  const id = (await read($, flowA))?.id
+  const { answer } = await askHow($, budgetQuestion(spent, plafond), [...BUDGET_CHOIX], { headless: BUDGET_CHOIX[0], dismissed: BUDGET_CHOIX[2] })
+  const flow = await read($, flowA)
+  if (!flow || flow.id !== id || flow.phase === 'done' || flow.isStopped) return
+  if (answer === BUDGET_CHOIX[0]) return stopForBudget($)
+  if (answer === BUDGET_CHOIX[1]) return setBudget($, { plafond: raise(plafond) })
+  return setBudget($, {}, true)
+}
+
+/** Arrêter sur le plafond du budget : le flow est marqué arrêté par le budget, puis tout s'arrête comme avec « Tout arrêter ». */
+async function stopForBudget($: $) {
+  const isLeadTurn = leadTurnId !== undefined
+  await setFlow($, f => ({ ...f, arret: 'budget' }))
+  $.ui.toast('revo-flow : plafond du budget atteint, flow arrêté')
+  await stopAll($)
+  // Sans tour de l'orchestrateur à interrompre, aucune fin de tour ne clôturera le flow : il est clos ici, et journalisé.
+  if (!isLeadTurn) await finishFlow($)
+}
+
+/**
  * Le rapport de flow (rapportMarkdown) à côté des plans : ~/.claude/revo-flow/rapports/<titre>.md, écrit une fois la vérification connue.
- * Un flow arrêté n'a pas de rapport ; le chemin est gardé dans le flow (rapportFile) pour le bouton « rapport.md ».
+ * Un flow arrêté n'a pas de rapport, sauf arrêté par le budget (le dossier est écrit quand même) ; le chemin est gardé dans le flow
+ * (rapportFile) pour le bouton « rapport.md ».
  */
 async function writeRapport($: $, flow: Flow, lead: Lead, verifP: Promise<VerifJournal | undefined>, g: Gate | undefined): Promise<string | undefined> {
-  if (flow.isStopped) return undefined
+  if (flow.isStopped && flow.arret !== 'budget') return undefined
   const home = await ioOf($).home()
   if (!home) return undefined
   const verif = await verifP.catch(() => undefined)
@@ -4643,11 +4963,23 @@ async function writeRapport($: $, flow: Flow, lead: Lead, verifP: Promise<VerifJ
     cache: (await read($, cacheStatsA))?.flow,
     ...(g?.web ? { web: webView(g) } : {}),
     ...(g?.mobile ? { mobile: mobileView(g) } : {}),
+    ...(await rapportExtras($, flow, lead)),
   })
   const path = `${normalizePath(home)}/.claude/revo-flow/rapports/${slug(flow.title) || 'rapport'}.md`
   await $.fs.write(path, text)
   await setFlow($, f => (f.id === flow.id ? { ...f, rapportFile: path } : f))
   return path
+}
+
+/** Ce que le rapport reçoit en plus (v3.6) : les fichiers touchés hors du plan, le budget, la racine du dépôt (fichiers hors dépôt écartés). */
+async function rapportExtras($: $, flow: Flow, lead: Lead): Promise<{ horsPlan?: { agent: string; fichiers: string[] }[]; budget?: ReturnType<typeof budgetOfFlow>; racine?: string }> {
+  const horsPlan = flow.agents.filter(a => a.horsPlan?.length).map(a => ({ agent: a.name, fichiers: a.horsPlan! }))
+  const racine = await projectRoot($)
+  return {
+    ...(horsPlan.length ? { horsPlan } : {}),
+    ...(flow.budget ? { budget: budgetOfFlow(flow.budget, flowCost(flow, lead)) } : {}),
+    ...(racine ? { racine } : {}),
+  }
 }
 
 /** Bouton « rapport.md » : ouvre le rapport de fin de flow, comme plan.md. */
@@ -4719,6 +5051,8 @@ function readOptions(o: PluginOptions) {
   opts.livraison = (o as { livraison?: unknown }).livraison !== false
   // La revue d'architecture (v3.2) : obligatoire par défaut, à chaque flow vérifié.
   opts.architecture = (o as { architecture?: unknown }).architecture !== false
+  // Le budget par flow (v3.6) : auto par défaut (2 × l'estimation du plan), off, ou un plafond en euros.
+  opts.budget = budgetOption((o as { budget?: unknown }).budget)
 }
 
 /**
@@ -5101,6 +5435,8 @@ export const register: Register = (on, options) => {
             costUsd: x.costUsd + costUsd(step.model, u),
           }))
         }
+        // Le budget du flow (v3.6) : l'alerte à 80 %, la question à 100 % (posée en fond, sans retenir la requête).
+        await checkBudget($)
       }
     } catch {
       // le comptage ne doit jamais gêner le tour
@@ -5158,10 +5494,14 @@ export const register: Register = (on, options) => {
       }
       return r
     }
+    // L'ordre du plan (v3.6) : un agent part quand ceux de son « apres » ont fini (le vérificateur, quand tous les autres ont fini).
+    const denied = launchDenial(flow, a)
+    if (denied) return { deny: denied }
     // Le vérificateur part comme les autres agents, au premier plan ou en arrière-plan : l'outil Agent de l'application de bureau ne
     // propose que l'arrière-plan (v3.1.1). Sa preuve se suit en direct quand même : chaque action va au panneau et sur l'appareil.
     claimed.add(a.key)
     const others = flow.agents.filter(x => x.key !== a.key).map(x => x.name)
+    const failedNote = orderNote($, flow, a)
     // L'extrait de la fiche servie qui concerne cet agent, après ses consignes.
     const extract = await agentCacheExtract($, a, e.prompt)
     // La vérification (v2) : la consigne « verif lancer » si la porte est active ; la consigne du testeur et les critères pour un
@@ -5170,7 +5510,7 @@ export const register: Register = (on, options) => {
     const criteres = gate?.flowId === flow.id ? gate.criteres : []
     const tester = isTester(a) ? `\n\n${TESTER_BRIEF}${criteres.length ? `\n\nCritères d'acceptation du plan :\n${criteres.map(c => `- ${c.id} : ${c.texte}`).join('\n')}` : ''}` : ''
     const verifier = isVerifier(a) ? await verifierBrief($).catch(() => undefined) : undefined
-    const prompt = `${e.prompt}\n\n${agentBrief(a, await agentCacheMode($), others, isVerifOn, opts.crap)}${tester}${verifier ? `\n\n${verifier}` : ''}${extract ? `\n\n${extract.text}` : ''}`
+    const prompt = `${e.prompt}\n\n${agentBrief(a, await agentCacheMode($), others, isVerifOn, opts.crap)}${failedNote}${tester}${verifier ? `\n\n${verifier}` : ''}${extract ? `\n\n${extract.text}` : ''}`
     const r = await next({ ...e, prompt, ...spawnType(a) })
     if (r.deny !== undefined || !r.agentId) {
       claimed.delete(a.key)
@@ -5239,9 +5579,11 @@ export const register: Register = (on, options) => {
         return g.criteres.length ? { ...rest, criteres: { total: g.criteres.length, ok: 0, verdicts: [] } } : rest
       })
     }
+    // Le budget (v3.6) : l'estimation du plan et son plafond, dans le dialogue et le plan.md ; jamais bloquant.
+    const { budget, line } = await planBudget($, plan).catch(() => ({ budget: undefined, line: undefined }))
     // Le plan en .md : un fichier à garder ou à rouvrir (bouton « plan.md » du panneau) ; il ne bloque jamais le plan.
-    const planFile = await writePlanFile($, plan, flow).catch(() => undefined)
-    await setFlow($, f => ({
+    const planFile = await writePlanFile($, plan, flow, line).catch(() => undefined)
+    await setFlow($, ({ budget: _b, ...f }) => ({
       ...f,
       title: plan.title,
       summary: plan.summary,
@@ -5249,9 +5591,10 @@ export const register: Register = (on, options) => {
       isApproved: !opts.validerPlan,
       planFile,
       agents: plan.agents.map(a => ({ ...a, status: 'waiting' as const, tokens: EMPTY, costUsd: 0 })),
+      ...(budget ? { budget } : {}),
     }))
     if (opts.validerPlan) {
-      const d = await decide($, plan)
+      const d = await decide($, plan, line)
       if (!d.isLaunched) {
         await resetPlan($)
         return { result: (d.note ? `${CANCELLED} Sa réponse : « ${d.note} »` : CANCELLED) as never }
@@ -5446,6 +5789,8 @@ export const register: Register = (on, options) => {
       if (!failed && (path || (tool === 'Bash' && !verifierBashAllowed(text(input.command), [])))) touchVerif(Boolean(path) || flow?.phase !== 'planning')
       if (!failed && path) {
         await markFile($, path, who, e.tool_use_id, e.agentId)
+        // Hors des fichiers que le plan donne à l'agent (v3.6) : signalé une fois, repris dans le rapport.
+        if (who !== 'lead') await noteScope($, who, path)
         // Un fichier du projet vient de changer : le graphe gardé est revérifié au prochain appel, pas dans 30 s (L17).
         staleGraph((await read($, flowCacheA))?.cle ?? flowRef?.cle)
       }

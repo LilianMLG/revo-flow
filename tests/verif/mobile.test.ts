@@ -294,8 +294,8 @@ describe('sortie du lancement', () => {
     expect(tailLines('\x1b[31mrouge\x1b[0m\n\n', 5)).toBe('rouge')
   })
 
-  test('délais : 5 min pour l’app, 3 min pour l’émulateur', () => {
-    expect(MOBILE_ATTENTE_MS).toBe(300_000)
+  test('délais : 15 min pour l’app (le premier build Gradle est long), 3 min pour l’émulateur', () => {
+    expect(MOBILE_ATTENTE_MS).toBe(900_000)
     expect(EMULATEUR_ATTENTE_MS).toBe(180_000)
   })
 })
