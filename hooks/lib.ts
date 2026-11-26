@@ -947,6 +947,8 @@ const VERBS: Record<string, string> = {
   WebSearch: 'Recherche',
   Skill: 'Skill',
   TodoWrite: 'Planifie',
+  // Code Mode : le seul outil du modèle, un script qui enchaîne les appels (chacun passe ensuite sous son propre nom).
+  REPL: 'Exécute un script',
 }
 
 /** Une phrase courte pour l'action en cours : « Lit components/Basket.vue ». */

@@ -51,7 +51,15 @@ export type DoctorInput = {
   mobile?: MobileDispo
   /** La livraison (v3.4) : la ligne déjà écrite (doctorLivraison) ; absent = rubrique non affichée. */
   livraison?: string
+  /** Code Mode de Claude Code (expérimental) actif dans cette session ; absent = rubrique non affichée. */
+  codeMode?: boolean
 }
+
+/** La variable d'environnement qui active Code Mode dans Claude Code (v2.1.323 et suivantes). */
+export const CODE_MODE_ENV = 'CLAUDE_CODE_EXPERIMENTAL_CODE_MODE'
+
+/** La valeur de la variable active-t-elle Code Mode (« 1 » ou « true ») ? */
+export const isCodeMode = (valeur: string | undefined) => /^(1|true)$/i.test((valeur ?? '').trim())
 
 const LIBELLE: Record<VerifOutil, string> = { generation: 'Génération', format: 'Format', lint: 'Lint', typage: 'Typage', tests: 'Tests', qualite: 'CRAP' }
 
@@ -209,6 +217,21 @@ function mobileLines(m: MobileDispo): string[] {
 }
 
 /**
+ * La rubrique Code Mode : en Code Mode le modèle n'a qu'un outil, REPL, et tous ses appels (shell, fichiers, MCP) partent d'un script.
+ * Essayé sur Claude Code 2.1.332 : les appels du script passent par les hooks du mod sous le nom habituel de l'outil (la garde anti-merge
+ * refuse un push sur main par tools.Bash, Bash et $`…`), un outil retiré à un agent n'existe pas dans son script, et un flow complet tourne.
+ */
+function codeModeLines(actif: boolean, web: WebDispo | undefined): string[] {
+  if (!actif) return [ligne('Code Mode', `inactif (${CODE_MODE_ENV} absent)`)]
+  const repli = web?.option === 'devtools' ? 'le repli Chrome DevTools MCP reste' : 'option web « devtools » pour le repli Chrome DevTools MCP'
+  return [
+    ligne('Code Mode', 'actif (expérimental) : les appels faits depuis un script passent par les gardes de revo-flow (anti-merge, gel des tests, lecture seule du vérificateur)'),
+    suite(`preuve web : l’extension Claude in Chrome n’est pas disponible en Code Mode (documentation de Claude Code) ; ${repli}`),
+    suite(`reprise : claude --resume et --continue exigent la même variable (${CODE_MODE_ENV}=1)`),
+  ]
+}
+
+/**
  * Le texte de /revo-flow doctor. Sans projet : le dit, et dit que la porte ne fera rien. Avec un projet : stack, porte, une ligne par
  * commande, CRAP, base de référence, cache, agents, pièges.
  */
@@ -235,6 +258,7 @@ export function doctorText(input: DoctorInput): string {
   if (input.mobile?.app || (input.mobile && !input.web)) lignes.push(...mobileLines(input.mobile))
   else if (input.web) lignes.push(...webLines(input.web))
   if (input.livraison) lignes.push(ligne('Livraison', input.livraison))
+  if (input.codeMode !== undefined) lignes.push(...codeModeLines(input.codeMode, input.web))
   if (input.pieges.length === 0) lignes.push(ligne('Pièges', 'aucun'))
   else input.pieges.forEach((p, i) => lignes.push(i === 0 ? ligne('Pièges', p) : suite(p)))
   return lignes.join('\n')

@@ -205,7 +205,7 @@ import {
   flowCost,
   raise,
 } from './budget'
-import { doctorText, manifestsOf, pluginVersion, versionText } from './doctor'
+import { doctorText, isCodeMode, manifestsOf, pluginVersion, versionText } from './doctor'
 import { addBase, baseFor } from './verif/base'
 import { CRAP_SEUIL } from './verif/crap'
 import { MANIFESTES, SONDES, commandsQuestion, detectCommands, flutterVersionTrap, fvmVersion, manifestPaths, needsConfirm, withoutCrap } from './verif/detect'
@@ -5079,7 +5079,9 @@ function readOptions(o: PluginOptions) {
 async function doctorCommand($: $): Promise<string> {
   const ref = await resolveProject(ioOf($)).catch(() => undefined)
   const agents = await loadAgents($).catch(() => [])
-  const common = { mode: opts.verif, crap: opts.crap, cache: opts.cache, agentsActif: opts.agents, agents }
+  // Le nom de la variable est écrit en clair : $.env.get n'accepte qu'un littéral (c'est CODE_MODE_ENV de doctor.ts).
+  const codeMode = isCodeMode(await $.env.get('CLAUDE_CODE_EXPERIMENTAL_CODE_MODE').catch(() => undefined))
+  const common = { mode: opts.verif, crap: opts.crap, cache: opts.cache, agentsActif: opts.agents, agents, codeMode }
   if (!ref) return doctorText({ ...common, manifestes: [], commandes: [], confirmation: 'a-confirmer', stats: null, journal: 0, pieges: [] })
   const io = ioOf($)
   const graph = graphCache.get(ref.cle)?.graph ?? (await loadGraph(io, ref).catch(() => null)) ?? (await buildMechanical(io, ref).catch(() => null))

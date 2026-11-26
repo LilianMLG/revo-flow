@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { doctorText, manifestsOf, pluginVersion, versionText, type DoctorInput } from '../hooks/doctor'
+import { CODE_MODE_ENV, doctorText, isCodeMode, manifestsOf, pluginVersion, versionText, type DoctorInput } from '../hooks/doctor'
 import { detectCommands } from '../hooks/verif/detect'
 import { computeStats } from '../hooks/cache/graph'
 import type { AgentDef } from '../types/agents'
@@ -215,6 +215,24 @@ describe('doctorText : pièges', () => {
     const t = doctorText(complet({ commandes: f.commandes, pieges: f.pieges }))
     expect(find(t, 'Pièges')).toContain('@vitest/coverage-v8')
     expect(find(t, 'CRAP')).toMatch(/aucun score/)
+  })
+})
+
+describe('doctorText : Code Mode', () => {
+  test('isCodeMode : « 1 » ou « true » ; absent, « 0 » ou autre chose : non', () => {
+    expect(CODE_MODE_ENV).toBe('CLAUDE_CODE_EXPERIMENTAL_CODE_MODE')
+    expect(['1', 'true', ' TRUE '].map(isCodeMode)).toEqual([true, true, true])
+    expect([undefined, '', '0', 'false', 'oui'].map(isCodeMode)).toEqual([false, false, false, false, false])
+  })
+
+  test('absent de l’entrée : pas de rubrique ; inactif : une ligne ; actif : les gardes, la preuve web et la reprise', () => {
+    expect(doctorText(complet())).not.toMatch(/^Code Mode/m)
+    expect(find(doctorText(complet({ codeMode: false })), 'Code Mode')).toBe('Code Mode    inactif (CLAUDE_CODE_EXPERIMENTAL_CODE_MODE absent)')
+    const actif = lines(doctorText(complet({ codeMode: true })))
+    const i = actif.findIndex(l => l.startsWith('Code Mode'))
+    expect(actif[i]).toMatch(/^Code Mode    actif \(expérimental\) : les appels faits depuis un script passent par les gardes de revo-flow \(anti-merge, gel des tests, lecture seule du vérificateur\)$/)
+    expect(actif[i + 1]).toMatch(/preuve web : l’extension Claude in Chrome n’est pas disponible en Code Mode/)
+    expect(actif[i + 2]).toMatch(/reprise : claude --resume et --continue exigent la même variable \(CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1\)/)
   })
 })
 
