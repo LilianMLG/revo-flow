@@ -63,6 +63,8 @@ A red flow means the gate still finds new lint, type or test errors, or a functi
 
 Without `/revo-flow`, the mod does nothing, except the merge guard.
 
+**Delivery (v3.4).** At the end of a verified flow, on a GitHub repository with `gh` logged in, revo-flow offers to open the PR (Draft, Ready for review, or Not now; on a branch that already has an open PR, Push to the PR). With your consent it runs the commands itself: a `revo/<title>` branch when you are on the default branch, a commit of the flow's files only, in the style of your recent commits, a named push, and `gh pr create` with the flow report as the description. It never merges: type `/ship` for the review and the watch, merging stays with you. GitLab (`glab`) comes in a later version.
+
 **Merge guard (v3.3).** In every session, in a flow or not, revo-flow refuses any Claude command that would merge a PR or MR (`gh pr merge`, `glab mr merge`, the GitHub and GitLab merge APIs), arm auto-merge (`--auto`, `merge_when_pipeline_succeeds`, GitLab push options), or push to the default branch (`main`, `master`, `origin/HEAD`, `--all`, `--branches`, `--mirror`, direct writes through the API). A push must name its branch: `git push` or `git push origin HEAD` is refused, `git push -u origin <branch>` passes. Fixing, pushing a work branch, opening or updating a PR or MR still pass; merging stays with you. It also covers the commands Claude types while `/ship` or `/steward` watches a PR. It is a second barrier, not the guarantee: protect the branch on the server (approval required, merge restricted to maintainers).
 
 ## `/revo-flow doctor`
@@ -107,6 +109,7 @@ Set in `/config`.
 | `cache` | yes | inject the project cache brief and feature excerpts, and offer the `cache` tool |
 | `web` | `extension` | web proof by the verifier: `extension` starts the dev server (after confirmation) and browses with Claude in Chrome, `devtools` also declares the Chrome DevTools MCP as a fallback, `off` disables it |
 | `mobile` | `appareil` | mobile proof by the verifier (v3.1): `appareil` picks the device (plugged-in phone, else an emulator or simulator started with its window), launches the app after confirmation and observes it live with the `mobile` tool, `mcp` also declares the mobile-mcp server, `off` disables it |
+| `livraison` | yes | delivery (v3.4): at the end of a verified flow on GitHub, offer to open the PR (draft or ready); revo-flow branches, commits the flow's files, pushes the named branch and runs `gh pr create` with the report; never merges; `no` offers nothing |
 | `gardeMerge` | yes | merge guard (v3.3): refuse any Claude command that merges a PR or MR, arms auto-merge or pushes to the default branch, in a flow or not; `no` turns it off |
 | `architecture` | on | mandatory architecture review by the verifier at the end of each verified flow (v3.2): files in the right place, project conventions, nothing redefined; the gate waits for its verdict; off makes the verifier optional again |
 | `agents` | yes | offer your installed agents (project, personal, enabled plugins) to the orchestrator |

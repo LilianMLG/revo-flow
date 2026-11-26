@@ -87,6 +87,8 @@ export type Flow = {
   planFile?: string
   /** Le rapport de fin de flow en markdown (~/.claude/revo-flow/rapports/<titre>.md), écrit quand la vérification est connue ; absent d'un flow arrêté. */
   rapportFile?: string
+  /** La livraison (v3.4) : la PR ouverte ou mise à jour en fin de flow vérifié, et sa branche. */
+  livraison?: { url: string; branche: string }
   /** Arrêté par l'utilisateur (Tout arrêter) : sa fin n'est ni une conclusion, ni une fiche à apprendre. */
   isStopped?: boolean
 }

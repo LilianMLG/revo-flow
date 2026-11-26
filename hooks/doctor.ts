@@ -49,6 +49,8 @@ export type DoctorInput = {
   web?: WebDispo
   /** La preuve mobile : option, app détectée, appareils vus ; absent = rubrique non affichée. */
   mobile?: MobileDispo
+  /** La livraison (v3.4) : la ligne déjà écrite (doctorLivraison) ; absent = rubrique non affichée. */
+  livraison?: string
 }
 
 const LIBELLE: Record<VerifOutil, string> = { generation: 'Génération', format: 'Format', lint: 'Lint', typage: 'Typage', tests: 'Tests', qualite: 'CRAP' }
@@ -232,6 +234,7 @@ export function doctorText(input: DoctorInput): string {
   // Un projet a l'une ou l'autre : la rubrique Mobile remplace la rubrique Web quand une app mobile est détectée.
   if (input.mobile?.app || (input.mobile && !input.web)) lignes.push(...mobileLines(input.mobile))
   else if (input.web) lignes.push(...webLines(input.web))
+  if (input.livraison) lignes.push(ligne('Livraison', input.livraison))
   if (input.pieges.length === 0) lignes.push(ligne('Pièges', 'aucun'))
   else input.pieges.forEach((p, i) => lignes.push(i === 0 ? ligne('Pièges', p) : suite(p)))
   return lignes.join('\n')

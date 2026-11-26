@@ -194,6 +194,17 @@ Depuis la v3.1, le même vérificateur peut **voir une app mobile tourner**, sur
 - **Mesure** : le journal du graphe note la preuve mobile de chaque flow (état, captures, verdicts mobile, ko mobile), comme la preuve web.
 - **Limites** : Flutter, Expo et React Native seulement ; pas de geste ni d'arbre des vues sur iOS (capture et journal seulement) ; pas de hot reload ; un iPhone branché n'a de capture qu'avec Flutter ; iOS demande macOS ; le premier build Gradle ou Xcode peut dépasser les 5 minutes (relance l'action `mobile`, l'app est alors déjà construite).
 
+### Livraison : la PR en fin de flow (v3.4)
+
+À la fin d'un flow **vérifié**, sur un dépôt GitHub avec `gh` connecté, revo-flow propose d'ouvrir la PR : « Flow vérifié. Commiter 3 fichiers du flow sur une nouvelle branche revo/code-promo, la pousser et ouvrir une PR vers main ? » avec **Brouillon**, **Prête à relire** ou **Pas maintenant**. Sur une branche qui a déjà une PR ouverte : **Pousser sur la PR**.
+
+- **revo-flow fait les commandes lui-même**, pas l'orchestrateur : sur la branche par défaut, il crée `revo/<titre>` (suffixée `-2`, `-3`… si le nom est pris) ; sur une branche de travail, il la garde. Il commite **les seuls fichiers du flow** (ceux que ses agents ont modifiés, et ceux que git voit changés depuis le lancement), jamais `git add -A` sur tout le dépôt ; une suppression ou un renommage du flow part en entier, une modification faite avant le flow reste à toi. La question signale un fichier qui avait déjà des modifications avant le flow, un fichier changé hors des outils du flow (commande d'un agent, ton éditeur), et les commits de la branche pas encore poussés. Le message suit le style de tes derniers commits (gitmoji, commits conventionnels, ou le titre seul), avec le résumé du plan en corps. Tes hooks git tournent.
+- **Push nommé, PR, rapport** : `git push -u origin <branche>:<branche>` (la garde anti-merge le laisse passer ; une branche qui suit déjà une autre branche d'`origin` pousse là où est sa PR), puis `gh pr create --base <branche par défaut> --body-file <rapport du flow>` (avec `--draft` pour un brouillon). La branche par défaut vient d'`origin/HEAD`, sinon de `gh repo view` ; illisible, rien n'est proposé. Un rapport plus long que ce que GitHub accepte est coupé dans `<titre>.pr.md`, avec le chemin du rapport complet. La question arrive en fin de flow sans retenir la fin du tour. Le lien de la PR est ajouté au rapport (section « Livraison ») et donné dans un toast et une notification.
+- **Jamais de merge** : le toast dit de taper `/ship` pour la revue et le suivi (CI, conflits, commentaires) ; le merge reste à toi. `/ship` ne peut être lancé que par toi.
+- **Une étape qui échoue** (hook de commit, push refusé, `gh` en erreur) arrête la livraison et le dit dans un toast ; rien n'est défait.
+- **Rien n'est proposé** pour un flow non vérifié, observé ou arrêté, sans `gh` connecté, hors GitHub, ou sans personne à qui demander (`claude -p`). GitLab (`glab`) arrive dans une prochaine version ; `/revo-flow doctor` le dit sur la ligne `Livraison`.
+- **Option `livraison`** (`/config`, oui par défaut) : `non` : rien n'est proposé.
+
 ### Garde anti-merge (v3.3)
 
 revo-flow refuse toute commande de Claude qui **fusionnerait** une PR ou une MR, ou **pousserait sur la branche par défaut**. Le merge reste à toi, depuis GitHub ou GitLab. Corriger, pousser sur une branche de travail, ouvrir ou mettre à jour une PR ou une MR, approuver : tout cela passe.
@@ -249,6 +260,7 @@ Depuis la v2.2, revo-flow découvre les agents déjà installés sur ton Claude 
 | `cache` | oui | brief du cache projet au lancement, extrait de fiche dans le prompt de chaque agent et outil `cache` proposé ; `non` : ni brief, ni extrait, ni outil, la commande `cache` reste et les flows comptent dans la mesure « sans cache » |
 | `web` | `extension` | preuve web du vérificateur (v3.0) : `extension` démarre le serveur de dev du projet après confirmation et navigue avec Claude in Chrome ; `devtools` déclare en plus le MCP Chrome DevTools en repli ; `off` : aucune preuve web |
 | `mobile` | `appareil` | preuve mobile du vérificateur (v3.1) : `appareil` choisit l'appareil (téléphone branché, sinon émulateur ou simulateur démarré avec sa fenêtre), lance l'app après confirmation et l'observe en direct avec l'outil `mobile` ; `mcp` déclare en plus le MCP mobile-mcp ; `off` : aucune preuve mobile |
+| `livraison` | oui | livraison (v3.4) : en fin de flow vérifié sur GitHub, propose d'ouvrir la PR (brouillon ou prête) ; revo-flow fait branche, commit des fichiers du flow, push nommé et `gh pr create` avec le rapport ; jamais de merge ; `non` : rien n'est proposé |
 | `gardeMerge` | oui | garde anti-merge (v3.3) : refuse toute commande de Claude qui fusionnerait une PR ou une MR, armerait l'auto-merge ou pousserait sur la branche par défaut, dans un flow ou non ; `non` : aucune garde |
 | `architecture` | oui | revue d'architecture obligatoire du vérificateur à la fin de chaque flow vérifié (v3.2) : fichiers au bon endroit, conventions, rien de redéfini ; la porte attend son verdict ; `non` la rend facultative |
 | `agents` | oui | catalogue des agents installés (projet, dossier personnel, plugins activés) proposé à l'orchestrateur ; un sous-agent du plan peut en prendre le type, avec son modèle et son effort ; `non` : rien n'est lu ni proposé, `general-purpose` comme avant |
@@ -278,6 +290,7 @@ revo-flow/
 │   ├── doctor.ts          /revo-flow doctor : ce que le mod a détecté et fera sur le projet
 │   ├── rapport.ts         le rapport de flow en markdown
 │   ├── reprise.ts         reprise d'un flow après redémarrage : instantané, flow restauré, question
+│   ├── livraison.ts       livraison en fin de flow : forge, branche, message de commit, fichiers du flow, question, gh pr create
 │   ├── merge.ts           garde anti-merge : lecture de la commande shell, refus du merge et du push sur la branche par défaut
 │   ├── lib.ts             logique pure du flow : plan, tâches, progression, consignes, coûts
 │   ├── ui/
