@@ -205,7 +205,7 @@ import {
   flowCost,
   raise,
 } from './budget'
-import { doctorText, manifestsOf, pluginVersion, versionText } from './doctor'
+import { doctorText, isCodeMode, manifestsOf, pluginVersion, versionText } from './doctor'
 import { addBase, baseFor } from './verif/base'
 import { CRAP_SEUIL } from './verif/crap'
 import { MANIFESTES, SONDES, commandsQuestion, detectCommands, flutterVersionTrap, fvmVersion, manifestPaths, needsConfirm, withoutCrap } from './verif/detect'
@@ -4884,7 +4884,9 @@ async function writePlanFile($: $, plan: PlanInput, flow: Flow, budget?: string)
  */
 async function planBudget($: $, plan: PlanInput): Promise<{ budget: FlowBudget | undefined; line: string | undefined }> {
   if (opts.budget === 'off') return { budget: undefined, line: undefined }
-  const est = estimate(plan, journalOf(await $.store.get(JOURNAL_KEY)))
+  // Le modèle de la session : l'orchestrateur est estimé sur les flows du journal menés par la même famille de modèle.
+  const leadModel = (await read($, leadA))?.modelId
+  const est = estimate(plan, journalOf(await $.store.get(JOURNAL_KEY)), leadModel)
   const plafond = ceilingOf(est.usd, opts.budget)
   return { budget: flowBudget(est, plafond), line: budgetPlanLine(est, plafond) }
 }
@@ -5079,7 +5081,9 @@ function readOptions(o: PluginOptions) {
 async function doctorCommand($: $): Promise<string> {
   const ref = await resolveProject(ioOf($)).catch(() => undefined)
   const agents = await loadAgents($).catch(() => [])
-  const common = { mode: opts.verif, crap: opts.crap, cache: opts.cache, agentsActif: opts.agents, agents }
+  // Le nom de la variable est écrit en clair : $.env.get n'accepte qu'un littéral (c'est CODE_MODE_ENV de doctor.ts).
+  const codeMode = isCodeMode(await $.env.get('CLAUDE_CODE_EXPERIMENTAL_CODE_MODE').catch(() => undefined))
+  const common = { mode: opts.verif, crap: opts.crap, cache: opts.cache, agentsActif: opts.agents, agents, codeMode }
   if (!ref) return doctorText({ ...common, manifestes: [], commandes: [], confirmation: 'a-confirmer', stats: null, journal: 0, pieges: [] })
   const io = ioOf($)
   const graph = graphCache.get(ref.cle)?.graph ?? (await loadGraph(io, ref).catch(() => null)) ?? (await buildMechanical(io, ref).catch(() => null))
@@ -5782,6 +5786,9 @@ export const register: Register = (on, options) => {
     const flow = await read($, flowA)
     const who = flow && flow.phase !== 'done' ? whoIs(flow, e.agentId) : undefined
     if (!who) return kept(await next(e))
+    // Code Mode : REPL n'est que l'enveloppe du script ; chaque appel qu'il fait repasse ici sous son propre nom et tient l'activité.
+    // Le suivre aussi doublerait l'historique, et la fin du premier appel interne marquerait l'acteur inactif, script encore en cours.
+    if (tool === 'REPL') return kept(await next(e))
     const label = describeCall(tool, input)
     const isEdit = tool === 'Edit' || tool === 'Write' || tool === 'NotebookEdit'
     const path = isEdit ? String(input.file_path ?? input.notebook_path ?? '') : ''

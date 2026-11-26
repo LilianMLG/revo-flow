@@ -66,6 +66,21 @@ test('revue de la PR #5 · estimate : un flow arrêté et un agent qui n\'a pas 
   expect(e.flows).toBe(3)
 })
 
+test('revue de la PR #6 · estimate : un orchestrateur compté à 0 ne tire pas la moyenne ; l\'orchestrateur s\'estime sur sa famille de modèle', () => {
+  const mene = (id: string, modelId: string, lead: number) => ({ ...flow(id, lead), lead: { modelId, costUsd: lead, tokens: 0 } }) as JournalEntry
+  const p = plan()
+  // Dix flows menés par Fable et comptés à 0 (avant que Fable ait un tarif) : ignorés, la valeur par défaut de Fable (2 × celle d'Opus).
+  const zeros = Array.from({ length: 10 }, (_, i) => mene(`z${i}`, 'claude-fable-5-2', 0))
+  proche(estimate(p, zeros, 'claude-fable-5-2').usd, DEFAUT_LEAD_USD * 2)
+  // Des flows menés par Opus ne disent rien d'un orchestrateur Fable ; un flow mené par Fable au vrai tarif, si.
+  const opus = [mene('o1', 'claude-opus-5-5', 1), mene('o2', 'claude-opus-5-5', 3)]
+  proche(estimate(p, [...zeros, ...opus], 'claude-fable-5-2').usd, DEFAUT_LEAD_USD * 2)
+  proche(estimate(p, [...zeros, ...opus, mene('f', 'claude-mythos-5-2', 6)], 'claude-fable-5-2').usd, 6)
+  proche(estimate(p, [...zeros, ...opus], 'claude-opus-5-5').usd, 2)
+  // Sans modèle de session : tous les orchestrateurs au coût connu comptent, les zéros toujours pas.
+  proche(estimate(p, [...zeros, ...opus]).usd, 2)
+})
+
 test('estimate : moins de 3 agents du modèle, retour à la valeur par défaut (mais le lead vient du journal)', () => {
   const journal = [flow('1', 2, ['sonnet', 'low', 1]), flow('2', 2, ['sonnet', 'low', 1])]
   const e = estimate(plan(['sonnet', 'low']), journal)
@@ -79,8 +94,9 @@ test('estimate : affinage par effort avec au moins 3 agents du même effort, sin
     flow('2', 0, ['opus', 'low', 1]),
   ]
   // 3 opus high à 4 : un agent high coûte 4 ; un agent low retombe sur la moyenne du modèle (13 / 4 = 3,25).
-  proche(estimate(plan(['opus', 'high']), journal).usd, 4)
-  proche(estimate(plan(['opus', 'low']), journal).usd, 3.25)
+  // Les orchestrateurs du journal sont à 0 : ils ne comptent pas (un orchestrateur ne coûte jamais 0), la valeur par défaut s'ajoute.
+  proche(estimate(plan(['opus', 'high']), journal).usd, 4 + DEFAUT_LEAD_USD)
+  proche(estimate(plan(['opus', 'low']), journal).usd, 3.25 + DEFAUT_LEAD_USD)
 })
 
 test('ceilingOf : auto = 2 × l\'estimation, plancher de 2 €', () => {

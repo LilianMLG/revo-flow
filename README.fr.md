@@ -63,7 +63,7 @@ Sans `/revo-flow`, le mod ne fait rien, sauf la **garde anti-merge** (voir plus 
 | `/revo-flow panneau` | affiche ou masque le panneau latéral |
 | `/revo-flow historique [n]` | les n derniers flows (10 par défaut) : date, durée, coût, agents, échecs et relances, puis par modèle le coût moyen d'un agent, son taux d'échec et ses relances |
 | `/revo-flow stop` | arrête vraiment : les agents en cours (TaskStop) et le tour de l'orchestrateur, après confirmation (Échap : rien ne change), puis retire la barre et le panneau |
-| `/revo-flow doctor` | ce que le mod a trouvé sur le projet courant : stack, commandes de vérification, base de référence, cache, agents installés, preuve à l'exécution (ligne `Web` : commande et port détectés, d'où ils viennent, outils, état de `REVO_WEB_LOGIN` ; ou « aucun serveur de dev détecté (pas de script dev) : pas de preuve web » ; ou « preuve web désactivée (option web) » ; sur une app mobile, ligne `Mobile` à la place : framework, plateformes, appareils vus (téléphone branché, émulateur, simulateur) ; c'est la seule commande qui liste les appareils), pièges ; lecture seule, rien n'est lancé ni modifié |
+| `/revo-flow doctor` | ce que le mod a trouvé sur le projet courant : stack, commandes de vérification, base de référence, cache, agents installés, preuve à l'exécution (ligne `Web` : commande et port détectés, d'où ils viennent, outils, état de `REVO_WEB_LOGIN` ; ou « aucun serveur de dev détecté (pas de script dev) : pas de preuve web » ; ou « preuve web désactivée (option web) » ; sur une app mobile, ligne `Mobile` à la place : framework, plateformes, appareils vus (téléphone branché, émulateur, simulateur) ; c'est la seule commande qui liste les appareils), Code Mode (actif ou non), pièges ; lecture seule, rien n'est lancé ni modifié |
 | `/revo-flow version` | la version du mod |
 | `/revo-flow cache` | le graphe du projet courant : panneau (section « Cache » dépliée) et texte dans le terminal |
 | `/revo-flow cache <projet>` | le graphe de n'importe quel projet de `Documents/Front` ou `Documents/Back` (`reservation-tool`, `back/graphql`) |
@@ -236,6 +236,17 @@ revo-flow refuse toute commande de Claude qui **fusionnerait** une PR ou une MR,
 - **Lu, pas exécuté** : la commande est analysée (chaînes `&&` `;` `|`, sous-shells, `$(…)` et backticks même entre guillemets doubles, `sh -c`, `cmd /c`, `eval`, heredoc, here-string ou tube donné à un shell, `sudo`/`env`/`xargs`/`timeout`, redirections comme `2>&1`, commentaires, backtick de PowerShell qui échappe ou continue la ligne, chemins Windows comme `C:\…\gh.exe`) ; un message de commit, un heredoc cité, le `--body` ou le `--title` d'une PR, ou un `grep` qui cite ces commandes passe. Pour un push, revo-flow lit la branche par défaut d'`origin/HEAD` avec git, là où le push tourne (en suivant les `cd` et `git -C` qui le précèdent) ; `main` et `master` sont protégées de toute façon.
 - **Une deuxième barrière, pas la garantie** : une commande assez détournée peut passer. La vraie garantie est la **protection de branche côté serveur** : sur GitLab, *Allowed to merge* réservé aux Maintainers et une approbation requise ; sur GitHub, une règle de branche qui demande une approbation.
 - **Option `gardeMerge`** (`/config`, « Garde anti-merge ») : activée par défaut ; `non` coupe la garde.
+
+### Code Mode (v3.6.1)
+
+Claude Code a un mode expérimental, **Code Mode** (`CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1`, v2.1.323 et suivantes ; v2.1.327 pour les mods qui interceptent les appels) : le modèle n'a plus qu'un outil, `REPL`, et tous ses appels (shell, fichiers, MCP) partent d'un script JavaScript. revo-flow y tourne sans réglage.
+
+- **Essayé sur Claude Code 2.1.332**, dans un dépôt jetable sans remote : `git push origin main` et `gh pr merge` sont refusés par la garde anti-merge sous les trois formes d'appel (`tools.Bash`, `Bash`, `` $`…` ``) ; un outil retiré à un agent (`Edit`, `Write`) n'existe pas dans son script, et le script ne peut ni importer un module ni atteindre `process`, `require`, `Bun` ou `fetch` ; un flow complet (plan, agent lancé et suivi, fichier attribué à l'agent, rapport) se déroule.
+- **Pas essayé** : un flow avec porte, tests gelés et vérificateur en Code Mode. Ils passent par le même hook que la garde anti-merge, mais ce n'est pas une preuve.
+- **Preuve web** : d'après la documentation de Claude Code, l'extension Claude in Chrome n'est pas disponible en Code Mode ; l'option `web` à `devtools` garde le repli Chrome DevTools MCP.
+- **Reprise** : `claude --resume` et `--continue` exigent la même variable que la session d'origine.
+- **`/revo-flow doctor`** : la ligne `Code Mode` dit s'il est actif, et rappelle ces deux points quand il l'est.
+- **Activer** : `{"env": {"CLAUDE_CODE_EXPERIMENTAL_CODE_MODE": "1"}}` dans `~/.claude/settings.json` (les réglages d'un projet sont ignorés pour cette variable) ; avec `claude -p`, la passer par `--settings`. Le mode est expérimental et peut changer ou disparaître.
 
 ### Revue d'architecture
 
