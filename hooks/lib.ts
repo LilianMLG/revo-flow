@@ -224,6 +224,8 @@ const isDeep = (p: string) => /\*\*|\//.test(p.slice(globDir(p).length))
 
 /** Deux motifs : un motif à plat n'attrape que son propre dossier, que l'autre doit pouvoir atteindre ; deux profonds, préfixe l'un de l'autre. */
 function globsOverlap(a: string, b: string): boolean {
+  // Un motif sans « / » (« *.md ») porte sur le nom du fichier, dans n'importe quel dossier (globMatch) : il peut recouvrir tout autre motif.
+  if (!a.includes('/') || !b.includes('/')) return true
   const [da, db] = [globDir(a), globDir(b)]
   if (!isDeep(a) && !isDeep(b)) return da === db
   if (!isDeep(a)) return da.startsWith(db)
@@ -286,18 +288,23 @@ export function readyAgents(flow: Pick<Flow, 'agents'>): FlowAgent[] {
   return flow.agents.filter(a => a.status === 'waiting' && !a.agentId && pendingDeps(flow, a).length === 0 && failedDeps(flow, a).length === 0)
 }
 
+/** `b`, bloqué, attend-il `a` lui-même ? Alors refuser `a` à cause de `b` ne se dénouerait jamais. */
+const waitsOn = (b: FlowAgent, a: FlowAgent) => b.waitingFor?.key === a.key
+
 /**
  * Les dépendances de `a` qui n'ont pas fini et n'ont pas échoué (en attente, en cours, bloquées). Pour le vérificateur, une dépendance
  * bloquée (elle attend un agent qui ne viendra pas la relancer) compte comme finie, comme dans allFinished : sinon il ne partirait jamais.
+ * Une dépendance bloquée qui attend `a` lui-même ne le retient pas non plus (attente croisée) : elle est signalée par failedDeps.
  */
 function pendingDeps(flow: Pick<Flow, 'agents'>, a: FlowAgent): FlowAgent[] {
-  const over = (b: FlowAgent) => b.status === 'done' || b.status === 'failed' || (b.status === 'blocked' && isVerifier(a))
+  const over = (b: FlowAgent) => b.status === 'done' || b.status === 'failed' || (b.status === 'blocked' && (isVerifier(a) || waitsOn(b, a)))
   return agentDeps(flow.agents, a).flatMap(k => flow.agents.find(b => b.key === k && !over(b)) ?? [])
 }
 
-/** Les dépendances de `a` qui ont échoué (failed) : l'orchestrateur décide de lancer quand même ou de reprendre. */
+/** Les dépendances de `a` qui ont échoué (failed) ou qui, bloquées, l'attendent lui-même : l'orchestrateur décide de lancer quand même ou de reprendre. */
 export function failedDeps(flow: Pick<Flow, 'agents'>, a: FlowAgent): FlowAgent[] {
-  return agentDeps(flow.agents, a).flatMap(k => flow.agents.find(b => b.key === k && b.status === 'failed') ?? [])
+  const lost = (b: FlowAgent) => b.status === 'failed' || (b.status === 'blocked' && waitsOn(b, a))
+  return agentDeps(flow.agents, a).flatMap(k => flow.agents.find(b => b.key === k && lost(b)) ?? [])
 }
 
 /**
@@ -312,6 +319,12 @@ export function launchDenial(flow: Pick<Flow, 'agents'>, a: FlowAgent): string |
   return `revo-flow : « ${a.name} » passe après ${names}, qui ${has} pas fini. Lance-le quand ${names} ${will} rapport.`
 }
 
+/** L'agent du plan déjà lancé (parmi `claimed`, au travail) que cet appel Agent nomme exactement une seconde fois, ou rien. */
+export function runningTwin(claimed: readonly FlowAgent[], description: string, name?: string): FlowAgent | undefined {
+  const asked = [slug(description), slug(name ?? '')].filter(Boolean)
+  return claimed.find(a => a.status === 'running' && asked.includes(a.key))
+}
+
 /** Le message à l'orchestrateur quand la fin de `a` rend d'autres agents prêts (tous leurs « apres » ont fini). */
 export function readyText(a: Pick<FlowAgent, 'name'>, ready: readonly Pick<FlowAgent, 'name'>[]): string {
   return `revo-flow : « ${a.name} » a fini : lance maintenant ${joinNames(ready.map(r => r.name))} avec l’outil Agent (description = son nom exact).`
@@ -320,7 +333,7 @@ export function readyText(a: Pick<FlowAgent, 'name'>, ready: readonly Pick<FlowA
 /** L'avertissement ajouté à la consigne d'un agent lancé alors qu'un agent dont il dépend a échoué ; '' sans échec. */
 export function failedDepsNote(failed: readonly Pick<FlowAgent, 'name'>[]): string {
   if (!failed.length) return ''
-  const [has, its] = failed.length > 1 ? ['ont échoué', 'leur travail'] : ['a échoué', 'son travail']
+  const [has, its] = failed.length > 1 ? ['ont échoué ou restent bloqués', 'leur travail'] : ['a échoué ou reste bloqué', 'son travail']
   return `Attention (revo-flow) : ${joinNames(failed.map(f => f.name))}, que tu devais attendre, ${has} : ${its} peut manquer ou être incomplet ; vérifie ce dont tu as besoin avant de t’en servir.`
 }
 
@@ -566,7 +579,8 @@ export function dispatchText(plan: PlanInput): string {
   const names = plan.agents.map(a => `« ${a.name} » (${a.subagentType}, ${MODELS[a.model].label})`).join(', ')
   const head = `revo-flow : plan « ${plan.title} » enregistré, ${plan.agents.length} sous-agent${plan.agents.length > 1 ? 's' : ''} : ${names}.`
   const tail = `avec l'outil Agent (description = le nom exact entre guillemets). Un agent dont la description ne reprend pas un de ces noms n'est pas suivi.`
-  if (!plan.agents.some(a => a.after?.length)) return [head, `Lance-les maintenant ${tail}`].join('\n')
+  // Dès qu'il y a plus d'une vague (un « apres », ou le vérificateur, qui passe après tous les autres), ne faire lancer que la première.
+  if (waves(plan.agents).length < 2) return [head, `Lance-les maintenant ${tail}`].join('\n')
   return [head, `Lance maintenant ${joinNames(waves(plan.agents)[0] ?? [])} ${tail}`, ...followUps(plan.agents)].join('\n')
 }
 

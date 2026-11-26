@@ -526,6 +526,10 @@ test('enClair : le non vérifié réunit critères, commandes en panne ou sauté
     archi: { verdict: 'ko' },
   })
   expect(lines[1]).toBe('Vérifié : porte verte (tsc), critères 1/4.')
+  // Revue de la PR #5 : sur une porte rouge, « porte verte » ne s'écrit pas ; seules les commandes vertes sont nommées.
+  const rouge = porteAvec(cmd('lint', 'ko'), cmd('tsc', 'ok'))
+  rouge.resultat = { ...rouge.resultat!, etat: 'rouge' }
+  expect(enClair({ ...BASE, verif: { ...VERIF_OK, etat: 'non-verifie' }, porte: rouge })[1]).toBe('Vérifié : commandes vertes de la porte (tsc).')
   const nv = lines[2]!
   for (const part of ['flow arrêté', 'fini rouge sur décision de l\'utilisateur', '2 triches détectées', '1 test gelé modifié, accepté', 'flutter-test : délai dépassé', 'crap : rien à mesurer', 'lint : ko', 'C1 ko', 'C2 non vérifiable', 'C4 sans verdict', 'revue d\'architecture ko'])
     expect(nv).toContain(part)

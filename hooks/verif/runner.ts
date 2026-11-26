@@ -309,7 +309,8 @@ async function runCommand(
       execs.push(...titres('relance des tests rouges', l, essais))
       const e = essais.at(-1)!
       const errs = lire(cmd, e, { outil: cmd.id, cwd: l.cwd, racine: io.racine, argv: l.argv })
-      if (illisible(e, errs.length)) continue
+      // Une relance qui plante (code non nul sans test lu : seule l'erreur « sortie ») n'a rien rejugé : les rouges restent rouges, jamais instables.
+      if (illisible(e, errs.length) || (errs.length > 0 && errs.every(x => x.code === 'sortie'))) continue
       // Une commande sur tout le projet (claude plugin test) ne sait pas viser un fichier : elle a relancé tous les tests rouges.
       for (const f of l.fichiers.length ? l.fichiers : aRelancer) relues.add(f)
       for (const x of errs) encore.add(signatureKey(x))

@@ -3,7 +3,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import type { ProjetVerif, VerifBase, VerifCommande, VerifErreur, VerifEtatCommande, VerifResultat } from '../../types/verif'
 import { MANIFESTES, PLUGIN_JSON, SONDES, argvText, commandLabel, commandsQuestion, detectCommands, flutterVersionTrap, fvmVersion, manifestPaths, modCommands, needsConfirm, withoutCrap } from '../../hooks/verif/detect'
 import { PAQUET_MS, dartTests, globMatch, hasGenAnnotation, paquetMax, parFichierOf, plan, relative, withShell } from '../../hooks/verif/scope'
-import { normalizeMessage, parseOutput, signatureKey, toRoot } from '../../hooks/verif/parse'
+import { normalizeMessage, parseOutput, signatureKey, SORTIE_MESSAGE, toRoot } from '../../hooks/verif/parse'
 import { addBase, baseFor, classify } from '../../hooks/verif/base'
 import { criteresKoText, panneQuestion, panneText, pannesOf, reportText, summaryLine } from '../../hooks/verif/report'
 import { durationOf, fillSorties, glisse, projectArgv, purgeOutputs, runBase, runGate, timeoutFor, timeoutOf, type VerifIo } from '../../hooks/verif/runner'
@@ -504,12 +504,17 @@ for (const os of OSES) {
 
     test('C3 · format texte : code de sortie non nul sans ligne lisible → une erreur bloquante, message = dernière ligne utile', () => {
       const codegen = ctx('codegen')
-      expect(parseOutput('texte', { stdout: 'Error: schema unreachable', stderr: '', exitCode: 1 }, codegen)).toEqual([{ outil: 'codegen', fichier: '', code: 'sortie', message: 'Error: schema unreachable' }])
+      expect(parseOutput('texte', { stdout: 'Error: schema unreachable', stderr: '', exitCode: 1 }, codegen)).toEqual([{ outil: 'codegen', fichier: '', code: 'sortie', message: SORTIE_MESSAGE, detail: 'Error: schema unreachable' }])
       // stderr d'abord ; bruit de npm écarté ; durée retirée (signature stable).
       const npm = ['✖ GraphQL Document Validation failed with 2 errors in 1.2s', 'npm ERR! code ELIFECYCLE', 'npm ERR! A complete log of this run can be found in: /x.log', ''].join(eol)
       const e = parseOutput('texte', { stdout: 'Parsing schema…', stderr: npm, exitCode: 2 }, codegen)
-      expect(e).toEqual([{ outil: 'codegen', fichier: '', code: 'sortie', message: '✖ GraphQL Document Validation failed with 2 errors in' }])
-      expect(parseOutput('texte', { stdout: '', stderr: '', exitCode: 3 }, codegen)[0]!.message).toBe('code de sortie 3, sortie vide')
+      expect(e).toEqual([{ outil: 'codegen', fichier: '', code: 'sortie', message: SORTIE_MESSAGE, detail: '✖ GraphQL Document Validation failed with 2 errors in' }])
+      expect(parseOutput('texte', { stdout: '', stderr: '', exitCode: 3 }, codegen)).toEqual([{ outil: 'codegen', fichier: '', code: 'sortie', message: SORTIE_MESSAGE }])
+      // Revue de la PR #5 : le compte de la dernière ligne diffère entre la base (tout le projet) et la porte (les fichiers du flow) ; il
+      // reste hors signature, pour qu'une commande déjà en échec avant le flow soit préexistante et non nouvelle.
+      const [base] = parseOutput('texte', { stdout: 'Found 12 errors.', stderr: '', exitCode: 1 }, codegen)
+      const [porte] = parseOutput('texte', { stdout: 'Found 2 errors.', stderr: '', exitCode: 1 }, codegen)
+      expect(signatureKey(porte!)).toBe(signatureKey(base!))
       // Introuvable (127, 9009) et délai dépassé (code -1) : une panne pour le runner, pas une erreur du code.
       expect(parseOutput('texte', { stdout: '', stderr: 'sh: codegen: not found', exitCode: 127 }, codegen)).toEqual([])
       expect(parseOutput('texte', { stdout: '', stderr: "'x' n'est pas reconnu", exitCode: 9009 }, codegen)).toEqual([])
@@ -588,7 +593,7 @@ for (const os of OSES) {
       // Tout vert : rien ; mod qui ne se charge pas (aucun test, code 1) : erreur bloquante avec la dernière ligne.
       expect(parseOutput('bun-test', { stdout: ['tests/a.test.ts:', '(pass) ok [1.00ms]', ' 1 pass', ' 0 fail'].join(eol), stderr: '', exitCode: 0 }, b)).toEqual([])
       expect(parseOutput('bun-test', { stdout: '', stderr: 'claude plugin test: x: no hooks module to load', exitCode: 1 }, b)).toEqual([
-        { outil: 'plugin-test', fichier: '', code: 'sortie', message: 'claude plugin test: x: no hooks module to load' },
+        { outil: 'plugin-test', fichier: '', code: 'sortie', message: SORTIE_MESSAGE, detail: 'claude plugin test: x: no hooks module to load' },
       ])
     })
 
@@ -1221,7 +1226,7 @@ for (const os of OSES) {
       const { resultat } = await runGate(io, verifOf([cmd]), input)
       expect(resultat.etat).toBe('rouge')
       expect(resultat.commandes[0]).toMatchObject({ etat: 'ko', nouvelles: 1 })
-      expect(resultat.erreurs).toEqual([{ outil: 'check', fichier: '', code: 'sortie', message: 'Error: 3 problems found', statut: 'nouvelle?' }])
+      expect(resultat.erreurs).toEqual([{ outil: 'check', fichier: '', code: 'sortie', message: SORTIE_MESSAGE, detail: 'Error: 3 problems found', statut: 'nouvelle?' }])
       expect(pannesOf(resultat)).toEqual([])
     })
 
@@ -1239,6 +1244,17 @@ for (const os of OSES) {
       const b = await runBase(base.io, verifOf([validate, tests]), 'abc')
       expect(base.calls).toHaveLength(1)
       expect(b.commandes).toEqual(['plugin-validate'])
+    })
+
+    test('revue de la PR #5 · une relance des tests rouges qui plante ne rejuge rien : les rouges restent rouges, jamais instables', async () => {
+      const [, tests] = modCommands(['tests/a.test.ts'], true) as [VerifCommande, VerifCommande]
+      const rouge = ['', 'tests/a.test.ts:', '(fail) panier > total [3.10ms]', '  Error: attendu 45', ' 0 pass', ' 1 fail'].join(ui.eol)
+      // 1er lancement : un test rouge ; la relance sort en 1 sans aucun (fail) (le mod ne se charge plus).
+      const { io } = fakeIo(os, ui.racine, (_a, _c, n) => (n === 1 ? { exitCode: 1, stdout: rouge } : { exitCode: 1, stdout: '', stderr: 'claude plugin test: x: no hooks module to load' }))
+      const { resultat, verif } = await runGate(io, verifOf([tests!]), { changed: ['hooks/a.ts'], files: [], commit: 'abc' })
+      expect(resultat.etat).toBe('rouge')
+      expect(resultat.erreurs.map(e => [e.fichier, e.statut])).toEqual([['tests/a.test.ts', 'nouvelle?']])
+      expect(verif.instables ?? []).toEqual([])
     })
   })
 }

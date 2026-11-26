@@ -132,6 +132,7 @@ import {
   failedDepsNote,
   journalOf,
   launchDenial,
+  runningTwin,
   outOfScope,
   readyAgents,
   readyText,
@@ -1971,6 +1972,11 @@ async function persistVerif($: $, g: Gate) {
     blocks: g.blocks,
     portes: g.portes,
     ...(g.accepte ? { accepte: true } : {}),
+    // Les critères jugés (v3.6) : sans eux, un critère ko ne bloquerait plus après un rechargement du mod.
+    ...(g.verdicts ? { verdicts: g.verdicts } : {}),
+    ...(g.criteresBlocks ? { criteresBlocks: g.criteresBlocks } : {}),
+    ...(g.criteresPasses ? { criteresPasses: true } : {}),
+    ...(g.relancesPanne ? { relancesPanne: g.relancesPanne } : {}),
   }))
 }
 
@@ -2923,6 +2929,7 @@ async function readVerdicts($: $, answer: string) {
   if (g.criteres.length && (verdicts.some(lisible) || !g.verdicts)) {
     g.verdicts = verdicts
     g.verdictsSeq = g.seq
+    await persistVerif($, g)
     await setView($, g, { criteres: { total: g.criteres.length, ok: verdicts.filter(v => v.verdict === 'ok').length, verdicts } })
   }
   // La revue d'architecture : un verdict lisible remplace le précédent ; une réponse sans ARCHI ne compte pas comme une revue.
@@ -2957,6 +2964,7 @@ async function criteresGate($: $, g: Gate): Promise<string | undefined> {
   const kos = koCriteres(g)
   if (!kos.length || g.criteresPasses || (await verifierRunning($))) return undefined
   g.criteresBlocks = (g.criteresBlocks ?? 0) + 1
+  await persistVerif($, g)
   if (g.criteresBlocks > MAX_TENTATIVES + g.encore && (await criteresQuestion($, g, kos)) === 'terminer') return undefined
   return criteresKoText(kos, g.criteres.length, g.verdictsSeq !== undefined && g.verdictsSeq !== g.seq, { verificateur: VERIFIER_TYPE, verif: VERIF_TOOL })
 }
@@ -2970,7 +2978,10 @@ async function criteresQuestion($: $, g: Gate, kos: ReturnType<typeof koCriteres
   const q = `${plural(kos.length, 'critère')} ko : ${kos.map(k => `${k.id} (${k.preuve.slice(0, 120)})`).join(' ; ')}.${motif ? ` L’orchestrateur demande une exception : « ${motif} ».` : ''} Terminer quand même ?`
   const { answer, how } = await askGate($, g, q, CRITERES_KO, { headless: motif ? CRITERES_KO[1]! : CRITERES_KO[0]!, dismissed: CRITERES_KO[1]! }, 'Critères ko')
   if (answer !== CRITERES_KO[0]) {
-    g.encore++
+    // Seule la question du plafond accorde une tentative de plus : une exception demandée (motif) ne repousse jamais le plafond, sinon,
+    // sans personne à qui demander, un orchestrateur qui la redemande à chaque block ne serait jamais libéré.
+    if (!motif) g.encore++
+    await persistVerif($, g)
     return 'encore'
   }
   g.criteresPasses = true
@@ -3053,6 +3064,11 @@ async function restoreVerif($: $) {
     decisions: new Map(),
     criteres: saved.criteres,
     ...(saved.accepte ? { accepte: true, libre: true } : {}),
+    // Les verdicts reviennent avec la porte : un critère ko bloque encore (verdictsSeq = seq : pas de « code changé depuis » inventé).
+    ...(saved.verdicts ? { verdicts: saved.verdicts, verdictsSeq: 0 } : {}),
+    ...(saved.criteresBlocks ? { criteresBlocks: saved.criteresBlocks } : {}),
+    ...(saved.criteresPasses ? { criteresPasses: true } : {}),
+    ...(saved.relancesPanne ? { relancesPanne: saved.relancesPanne } : {}),
   }
   // La preuve web : un serveur en question, en démarrage ou prêt est mort avec le module (arrete) ; les captures restent.
   const view = await read($, verifA)
@@ -5484,6 +5500,10 @@ export const register: Register = (on, options) => {
       e.name,
     )
     if (!a) {
+      // Un agent du plan déjà au travail, lancé une seconde fois sous le même nom (un « lance maintenant » arrivé en retard) : refusé,
+      // sinon le double partirait hors plan, sans suivi, sur les mêmes fichiers.
+      const twin = runningTwin(flow.agents.filter(x => claimed.has(x.key)), e.description, e.name)
+      if (twin) return { deny: `revo-flow : « ${twin.name} » est déjà lancé et travaille. Ne le lance pas une seconde fois ; attends son rapport.` }
       // Un vérificateur lancé hors plan : sa tâche (critères, diff, commandes) s'ajoute à son prompt et son Bash sera filtré.
       if (e.subagentType !== VERIFIER_TYPE) return next(e)
       const task = await verifierBrief($).catch(() => undefined)

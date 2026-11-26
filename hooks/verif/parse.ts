@@ -277,14 +277,19 @@ function derniereLigne(text: string): string {
   return (utiles.at(-1) ?? '').replace(/\b\d+(?:\.\d+)?\s?m?s\b/g, '').trim().slice(0, MAX_MESSAGE)
 }
 
+/** Le message, constant, d'une sortie en code non nul sans rien de lisible : c'est lui qui entre dans la signature. */
+export const SORTIE_MESSAGE = 'code de sortie non nul sans erreur lisible : voir le détail et la sortie complète'
+
 /**
- * Une commande sortie en code non nul sans rien de lisible : une erreur bloquante (code 'sortie'), message = la dernière ligne utile de
- * stderr, sinon de stdout. Rien pour un code nul, négatif (délai dépassé, lancement impossible : le runner en fait une panne) ou « introuvable ».
+ * Une commande sortie en code non nul sans rien de lisible : une erreur bloquante (code 'sortie'), au message constant ; la dernière ligne
+ * utile de stderr, sinon de stdout, va dans le détail, hors signature : elle porte souvent un compte (« Found 12 errors ») qui diffère entre
+ * la base (tout le projet) et la porte (les fichiers du flow), et une commande déjà en échec avant le flow doit rester préexistante.
+ * Rien pour un code nul, négatif (délai dépassé, lancement impossible : le runner en fait une panne) ou « introuvable ».
  */
 function sortieNonNulle(out: Sortie, ctx: ParseCtx): Erreur[] {
   if (out.exitCode <= 0 || INTROUVABLE.has(out.exitCode)) return []
-  const message = derniereLigne(out.stderr) || derniereLigne(out.stdout) || `code de sortie ${out.exitCode}, sortie vide`
-  return [{ outil: ctx.outil, fichier: '', code: 'sortie', message }]
+  const detail = derniereLigne(out.stderr) || derniereLigne(out.stdout)
+  return [{ outil: ctx.outil, fichier: '', code: 'sortie', message: SORTIE_MESSAGE, ...(detail ? { detail } : {}) }]
 }
 
 /**

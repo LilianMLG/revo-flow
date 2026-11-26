@@ -401,6 +401,12 @@ export type VerifFlow = {
   blocks: number
   portes: number
   accepte?: boolean
+  /** Les verdicts du vérificateur et l'état de la porte des critères (v3.6) : un critère ko bloque encore après un rechargement du mod. */
+  verdicts?: CritereVerdict[]
+  criteresBlocks?: number
+  criteresPasses?: boolean
+  /** Les relances de la porte en panne déjà demandées par l'utilisateur. */
+  relancesPanne?: number
 }
 
 declare module 'claude-code' {

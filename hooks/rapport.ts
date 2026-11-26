@@ -80,7 +80,8 @@ function verifieLine({ porte, criteres, verdicts, archi, web, mobile }: RapportI
   const ok = verdicts?.filter(v => v.verdict === 'ok').length ?? 0
   const captures = (web?.captures.length ?? 0) + (mobile?.captures.length ?? 0)
   const parts = [
-    vertes.length ? `porte verte (${vertes.join(', ')})` : '',
+    // « porte verte » seulement quand toute la porte l'est : sur une porte rouge ou en panne, seules les commandes vertes sont nommées.
+    vertes.length ? `${porte?.resultat?.etat === 'vert' ? 'porte verte' : 'commandes vertes de la porte'} (${vertes.join(', ')})` : '',
     criteres?.length && ok ? `critères ${ok}/${criteres.length}` : '',
     archi?.verdict === 'ok' ? 'revue d\'architecture' : '',
     captures ? `preuve ${mobile?.captures.length ? 'mobile' : 'web'} (${plural(captures, 'capture', 'captures')})` : '',

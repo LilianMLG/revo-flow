@@ -39,9 +39,15 @@ export type BudgetJournal = { estime: number; plafond?: number; reel: number; at
 type Stat = { sum: number; n: number }
 const moyenne = (xs: readonly number[]): Stat => ({ sum: xs.reduce((a, b) => a + b, 0), n: xs.length })
 
-/** Le coût moyen d'un agent de ce modèle : affiné par effort avec assez d'agents de même effort, sinon par modèle ; undefined sans assez d'historique. */
+/**
+ * Les flows allés au bout : un flow arrêté (par le budget, par l'utilisateur) porte des coûts partiels et des agents jamais lancés à 0 ;
+ * les compter tirerait l'estimation, donc le plafond auto, vers le bas d'un flow arrêté à l'autre.
+ */
+const finis = (journal: readonly JournalEntry[]) => journal.filter(e => !e.isStopped)
+
+/** Le coût moyen d'un agent de ce modèle (agents qui ont fini leur travail seulement) : affiné par effort avec assez d'agents de même effort, sinon par modèle ; undefined sans assez d'historique. */
 function agentHistorique(journal: readonly JournalEntry[], model: ModelKey, effort: Effort): { usd: number; ids: string[] } | undefined {
-  const all = journal.flatMap(e => e.agents.filter(a => a.model === model).map(a => ({ id: e.id, effort: a.effort, usd: a.costUsd })))
+  const all = finis(journal).flatMap(e => e.agents.filter(a => a.model === model && a.status === 'done').map(a => ({ id: e.id, effort: a.effort, usd: a.costUsd })))
   const same = all.filter(a => a.effort === effort)
   const pool = same.length >= HISTORIQUE_MIN ? same : all
   if (pool.length < HISTORIQUE_MIN) return undefined
@@ -50,7 +56,8 @@ function agentHistorique(journal: readonly JournalEntry[], model: ModelKey, effo
 }
 
 /** Le coût moyen de l'orchestrateur sur les flows du journal, ou la valeur par défaut. */
-function leadMoyen(journal: readonly JournalEntry[]): number {
+function leadMoyen(tous: readonly JournalEntry[]): number {
+  const journal = finis(tous)
   if (!journal.length) return DEFAUT_LEAD_USD
   const s = moyenne(journal.map(e => e.lead.costUsd))
   return s.sum / s.n

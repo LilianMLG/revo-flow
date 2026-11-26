@@ -34,7 +34,7 @@ const plan = (...agents: [string, string][]): PlanInput =>
 
 /** Un flow du journal : l'orchestrateur à `lead` dollars, des agents [modèle, effort, coût]. */
 const flow = (id: string, lead: number, ...agents: [string, string, number][]): JournalEntry =>
-  ({ id, lead: { modelId: 'm', costUsd: lead, tokens: 0 }, agents: agents.map(([model, effort, costUsd]) => ({ name: 'x', model, effort, costUsd })) }) as never
+  ({ id, lead: { modelId: 'm', costUsd: lead, tokens: 0 }, agents: agents.map(([model, effort, costUsd]) => ({ name: 'x', model, effort, costUsd, status: 'done' })) }) as never
 
 test('estimate : sans historique, les valeurs par défaut par modèle et effort, plus l\'orchestrateur', () => {
   const e = estimate(plan(['sonnet', 'medium'], ['opus', 'high']), [])
@@ -49,6 +49,20 @@ test('estimate : avec au moins 3 agents du modèle, la moyenne du journal ; l\'o
   // 3 agents sonnet, aucun en xhigh : moyenne par modèle (2) ; orchestrateur moyen (1).
   proche(e.usd, 3)
   expect(e.base).toBe('historique')
+  expect(e.flows).toBe(3)
+})
+
+test('revue de la PR #5 · estimate : un flow arrêté et un agent qui n\'a pas fini n\'entrent pas dans la moyenne', () => {
+  const journal = [flow('1', 0.5, ['sonnet', 'low', 1]), flow('2', 1.5, ['sonnet', 'high', 2]), flow('3', 1, ['sonnet', 'medium', 3])]
+  const base = estimate(plan(['sonnet', 'xhigh']), journal).usd
+  // Un flow arrêté par le budget : deux agents jamais lancés à 0 $, un orchestrateur coupé court.
+  const arrete = { ...flow('4', 0.1, ['sonnet', 'low', 0], ['sonnet', 'low', 0]), isStopped: true } as JournalEntry
+  // Un flow allé au bout, dont un agent a échoué en route (coût partiel).
+  const echec = flow('5', 1, ['sonnet', 'low', 0.01])
+  ;(echec.agents[0] as { status: string }).status = 'failed'
+  const e = estimate(plan(['sonnet', 'xhigh']), [...journal, arrete, echec])
+  // Les agents : toujours la moyenne des 3 finis (2) ; l'orchestrateur : les 4 flows allés au bout (0,5 + 1,5 + 1 + 1) / 4 = 1.
+  proche(e.usd, base)
   expect(e.flows).toBe(3)
 })
 

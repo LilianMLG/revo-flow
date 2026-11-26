@@ -2605,7 +2605,7 @@ test('C6 · apres : une dépendance en échec ne refuse pas le lancement ; l’a
   expect(w.sent.some(x => /lance maintenant « Front panier »/.test(x.text))).toBe(false)
   const front = await spawn($, 'Front panier')
   expect(front.deny).toBeUndefined()
-  expect(w.prompts.at(-1)).toMatch(/Attention \(revo-flow\) : « API promo », que tu devais attendre, a échoué : son travail peut manquer/)
+  expect(w.prompts.at(-1)).toMatch(/Attention \(revo-flow\) : « API promo », que tu devais attendre, a échoué ou reste bloqué : son travail peut manquer/)
   expect(w.toasts.some(t => /« Front panier » part alors qu’un agent qu’il devait attendre a échoué/.test(t))).toBe(true)
 })
 
@@ -2757,6 +2757,40 @@ test('C8 · critère ko : la porte verte ne conclut pas, l’orchestrateur reço
   expect(w.notified.join('\n')).toMatch(/terminé · vérifié ✓ · critères 1\/2 · 1 ko/)
   expect(await run($, 'historique')).toMatch(/· vérif ✓ · critères 1\/2 · 1 ko/)
   expect(rapportOf(w)).toMatch(/Non vérifié : .*C2 ko/)
+})
+
+test('revue de la PR #5 · critère ko sans personne : une exception redemandée à chaque block ne repousse pas le plafond ; les verdicts sont gardés pour un rechargement du mod', async ($, on) => {
+  const w = world(on)
+  seedVerif(w, WINDOWS)
+  w.ctl.answer = 'Utiliser'
+  await launch($, w)
+  w.ctl.answer = 'Lancer'
+  await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN_C8 } as never)
+  const front = (await spawn($, 'Front panier')).agentId!
+  const api = (await spawn($, 'API promo')).agentId!
+  await $.tool.call({ tool: 'Edit', file_path: FILE, agentId: front, tool_use_id: 'u1' } as never)
+  w.verifRun.tsc = GREEN
+  await endTurn($, w, front, 'completed')
+  await endTurn($, w, api, 'completed')
+  const juge = (await spawn($, 'Vérificateur')).agentId!
+  w.status[juge] = 'completed'
+  const verdicts = '```json\n[{"id":"C1","verdict":"ok","preuve":"vu"},{"id":"C2","verdict":"ko","preuve":"expected 10.005 to be 10.01"}]\n```'
+  await $.turn.complete({ answer: verdicts, durationMs: 1, isAborted: false, turnId: 'v', reason: 'answer', agentId: juge } as never)
+  await w.clock.settle()
+  // Plus personne à qui demander (claude -p) : chaque block est suivi d'une demande d'exception, qui rend « une tentative de plus ».
+  w.surfaces.length = 0
+  w.ctl.answer = DISMISS
+  const exception = async () => JSON.stringify(await $.tool.call({ tool: 'mcp__revo-flow__verif', action: 'exception', motif: 'pas le temps' } as never))
+  expect((await stop($)).block).toMatch(/1 critère ko sur 2/)
+  // Les verdicts et le compte des blocks sont dans l'atom gardé : un critère ko bloque encore après un rechargement du mod.
+  expect(w.states.verifFlow).toMatchObject({ criteresBlocks: 1, verdicts: [{ id: 'C1', verdict: 'ok' }, { id: 'C2', verdict: 'ko' }] })
+  expect(await exception()).toMatch(/critères ko soient corrigés/)
+  expect((await stop($, { stop_hook_active: true })).block).toMatch(/1 critère ko sur 2/)
+  expect(await exception()).toMatch(/critères ko soient corrigés/)
+  expect((await stop($, { stop_hook_active: true })).block).toMatch(/1 critère ko sur 2/)
+  expect(await exception()).toMatch(/critères ko soient corrigés/)
+  // 4e fin de tour : le plafond (3) n'a pas bougé, la question du plafond se termine sans personne, le tour finit.
+  expect((await stop($, { stop_hook_active: true })).block).toBeUndefined()
 })
 
 test('C8 · sans critère ko, la porte verte conclut ; un critère non vérifiable ne bloque pas mais s’affiche', async ($, on) => {

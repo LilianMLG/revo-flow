@@ -13,6 +13,7 @@ import {
   planMarkdown,
   planQuestion,
   readyAgents,
+  runningTwin,
   waves,
 } from '../hooks/lib'
 import type { PlanInput } from '../hooks/lib'
@@ -179,6 +180,27 @@ describe('waves, readyAgents, launchDenial, outOfScope', () => {
     expect(launchDenial(flowOf(agents), integration)).toBeUndefined()
   })
 
+  test('revue de la PR #5 · attente croisée : une dépendance bloquée qui attend l’agent lui-même ne le retient pas, et il en est averti', () => {
+    const agents = ok([ag('A', { apres: ['B'] }), ag('B')]).agents.map(a => live(a))
+    const [a, b] = agents as [FlowAgent, FlowAgent]
+    b.status = 'blocked'
+    b.waitingFor = { key: a.key, name: a.name, since: 0 }
+    expect(launchDenial(flowOf(agents), a)).toBeUndefined()
+    expect(failedDeps(flowOf(agents), a).map(x => x.name)).toEqual(['B'])
+    // Bloquée sur un tiers : elle sera relancée, « A » attend encore.
+    b.waitingFor = { key: 'c', name: 'C', since: 0 }
+    expect(launchDenial(flowOf(agents), a)).toMatch(/« A » passe après « B », qui n'a pas fini/)
+  })
+
+  test('revue de la PR #5 · runningTwin : un agent du plan déjà au travail, nommé une seconde fois, est reconnu ; fini ou autre nom, non', () => {
+    const agents = ok([ag('Front panier'), ag('API promo')]).agents.map(a => live(a, 'running', 'id'))
+    expect(runningTwin(agents, 'Front panier')?.name).toBe('Front panier')
+    expect(runningTwin(agents, 'autre chose', 'api-promo')?.name).toBe('API promo')
+    expect(runningTwin(agents, 'Revue rapide')).toBeUndefined()
+    agents[0]!.status = 'done'
+    expect(runningTwin(agents, 'Front panier')).toBeUndefined()
+  })
+
   test('launchDenial : le vérificateur attend tous les autres sans le déclarer', () => {
     const agents = p.agents.map(a => live(a, 'done'))
     const verif = agents.find(a => a.name === 'verificateur')!
@@ -240,9 +262,20 @@ describe('les textes', () => {
     expect(planMarkdown(sans)).toMatch(/## 1\. Front panier\n\nSonnet 5\.5 · effort medium · general-purpose\n\n/)
   })
 
-  test('un vérificateur seul ne change pas dispatchText (son ordre est implicite)', () => {
+  test('un vérificateur passe après les autres : dispatchText ne fait lancer que la première vague (revue de la PR #5)', () => {
     const p = ok([ag('A'), ag('V', { type: 'revo-flow:verifier' })])
-    expect(dispatchText(p)).toMatch(/^Lance-les maintenant avec/m)
+    const lines = dispatchText(p).split('\n')
+    expect(lines[1]).toMatch(/^Lance maintenant « A » avec/)
+    expect(lines[2]).toBe('Ensuite, quand « A » aura fini : « V ».')
+    // Sans vérificateur ni « apres » : une seule vague, le texte d'avant.
+    expect(dispatchText(ok([ag('A'), ag('B')]))).toMatch(/^Lance-les maintenant avec/m)
+  })
+
+  test('revue de la PR #5 : un motif sans « / » porte sur le nom du fichier partout, donc recouvre tout autre motif', () => {
+    expect(pathsOverlap('*.test.ts', 'tests/**')).toBe(true)
+    expect(pathsOverlap('hooks/**', '*.md')).toBe(true)
+    // Deux motifs avec dossier restent jugés par leurs dossiers.
+    expect(pathsOverlap('hooks/*.ts', 'hooks/verif/**')).toBe(false)
   })
 
   test('dispatchText : ce qu’il faut lancer maintenant, puis ce qui suit', () => {
