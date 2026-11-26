@@ -38,6 +38,7 @@ import {
   fmtDuration,
   leadTasks,
   modelKey,
+  priceKey,
   modelLabel,
   progress,
   resetLabel,
@@ -138,7 +139,7 @@ const isPendingPlan = (d: ViewData) => d.flow?.phase === 'dispatch' && !d.flow.i
 const whoName = (d: ViewData, key: string) => (key === 'lead' ? 'orchestrateur' : (d.flow?.agents.find(a => a.key === key)?.name ?? key))
 const ctxColor = (percent: number) => (percent >= 85 ? PALETTE.red : percent >= 70 ? PALETTE.orange : PALETTE.silver)
 const cacheOf = (t: Tally) => t.cacheRead + t.cacheWrite
-const turnCost = (t: LastTurn) => (t.costUsd === 0 && !modelKey(t.modelId) ? '—' : euros(t.costUsd))
+const turnCost = (t: LastTurn) => (t.costUsd === 0 && !priceKey(t.modelId) ? '—' : euros(t.costUsd))
 /** « 3,2k ↑ · 850 ↓ · 41k cache · 0,04 € » */
 const promptText = (t: LastTurn) => `${fmt(t.tokens.input)} ↑ · ${fmt(t.tokens.output)} ↓ · ${fmt(cacheOf(t.tokens))} cache API · ${turnCost(t)}`
 const planCount = (a: FlowAgent) => `${a.tasks.length} tâche${a.tasks.length > 1 ? 's' : ''}`

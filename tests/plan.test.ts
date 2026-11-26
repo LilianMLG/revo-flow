@@ -2,6 +2,7 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import {
   agentBrief,
+  costUsd,
   dispatchText,
   failedDeps,
   flowRecap,
@@ -12,6 +13,7 @@ import {
   pathsOverlap,
   planMarkdown,
   planQuestion,
+  priceKey,
   readyAgents,
   runningTwin,
   waves,
@@ -328,5 +330,24 @@ describe('les textes', () => {
     expect(brief).toMatch(/« non vérifiable »/)
     expect(brief.match(/sans modifier les mêmes fichiers/g)).toHaveLength(1)
     expect(leadBrief(true, false)).not.toMatch(/non vérifiable/)
+  })
+})
+
+describe('coût par modèle', () => {
+  const proche = (a: number, b: number) => expect(Math.abs(a - b)).toBeLessThan(1e-9)
+  const million = { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_read_input_tokens: 1_000_000, cache_creation_input_tokens: 1_000_000 }
+
+  test('priceKey : Fable et Mythos ont leur tarif ; haiku, sonnet, opus le leur ; un modèle inconnu, aucun', () => {
+    expect(['claude-fable-5-2', 'claude-mythos-5-2', 'Claude-Fable-5-2[1m]'].map(priceKey)).toEqual(['fable', 'fable', 'fable'])
+    expect(['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'].map(priceKey)).toEqual(['opus', 'sonnet', 'haiku'])
+    expect(priceKey('gpt-x')).toBeUndefined()
+  })
+
+  test('costUsd : un orchestrateur sur Fable n’est plus compté à 0 (8 $ entrée, 40 $ sortie, 0,20 $ lecture, 10 $ écriture par million)', () => {
+    proche(costUsd('claude-fable-5-2', million), 8 + 40 + 0.2 + 10)
+    proche(costUsd('claude-opus-5-5', million), 4 + 20 + 0.2 + 5)
+    // Sonnet 5.5 : lecture de cache à 0,10 $.
+    proche(costUsd('claude-sonnet-5-5', million), 2 + 10 + 0.1 + 2.5)
+    expect(costUsd('modele-inconnu', million)).toBe(0)
   })
 })
