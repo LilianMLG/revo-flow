@@ -90,7 +90,11 @@ function world(on: On, os: Os = WINDOWS, store: Record<string, unknown> = {}) {
   // Les hash git des fichiers (hash-object) et la sortie de tsc, que les tests de la vérification font varier.
   const hashes: Record<string, string> = {}
   const verifRun = { tsc: { exitCode: 0, stdout: '', stderr: '' } }
+  // Un test peut répondre lui-même à certaines commandes (le moteur n'accepte qu'un process.run) : undefined = la suite.
+  const runAvant: { repond?: (argv: string[]) => unknown } = {}
   on('process.run', (_$, e) => {
+    const avant = runAvant.repond?.([...e.argv])
+    if (avant !== undefined) return avant as never
     runs.push([...e.argv])
     const out = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     if (e.argv.includes('--unified=3')) {
@@ -253,6 +257,7 @@ function world(on: On, os: Os = WINDOWS, store: Record<string, unknown> = {}) {
     gitDiff,
     haiku,
     runs,
+    runAvant,
     hashes,
     verifRun,
     surfaces,
@@ -2336,4 +2341,100 @@ test('revue d’architecture désactivée (option architecture) : la porte verte
   await endTurn($, w, front, 'completed')
   await endTurn($, w, api, 'completed')
   expect((await stop($)).block).toBeUndefined()
+})
+
+// ── La livraison (v3.4) ──────────────────────────────────────────────────
+
+/** Un dépôt GitHub sur main, gh connecté : les commandes de la livraison, enregistrées, et le statut git après le flow. */
+function depotGithub(w: ReturnType<typeof world>, etat: { fini: boolean; prOuverte?: string; ghAbsent?: boolean }) {
+  const cmds: string[][] = []
+  w.runAvant.repond = a => {
+    const res = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+    const j = a.join(' ')
+    if (/remote get-url origin/.test(j)) return res('git@github.com:moi/boutique.git\n')
+    if (a[0] === 'gh' && a[1] === 'auth') return etat.ghAbsent ? res('', 127) : res('github.com\n  ✓ Logged in to github.com account moi\n')
+    if (/symbolic-ref --short refs\/remotes\/origin\/HEAD/.test(j)) return res('origin/main\n')
+    if (etat.fini && /status --porcelain -z/.test(j)) return res(' M components/Basket.vue\0?? lib/promo.ts\0')
+    if (etat.fini && /rev-parse --abbrev-ref HEAD/.test(j)) return res('main\n')
+    if (/branch -a --format/.test(j)) return res('main\norigin/main\n')
+    if (/log --format=%s -10/.test(j)) return res('✨ feat: v3.2, garde\n🐛 fix: x\n')
+    if (a[0] === 'gh' && a[1] === 'pr' && a[2] === 'list') return res(etat.prOuverte ? `${etat.prOuverte}\n` : '\n')
+    if (/switch -c|add -A|commit -m|push -u/.test(j) || (a[0] === 'gh' && a[2] === 'create')) {
+      cmds.push(a)
+      return a[0] === 'gh' ? res('https://github.com/moi/boutique/pull/42\n') : res('')
+    }
+    return undefined
+  }
+  return cmds
+}
+
+async function finirVerifie($: Engine, w: ReturnType<typeof world>, etat: { fini: boolean }, reponse: string) {
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  seedVerif(w, WINDOWS)
+  const { front, api } = await launchVerif($, w)
+  await $.tool.call({ tool: 'Edit', file_path: FILE, agentId: front, tool_use_id: 'u1' } as never)
+  w.verifRun.tsc = GREEN
+  await endTurn($, w, front, 'completed')
+  await endTurn($, w, api, 'completed')
+  expect((await stop($)).block).toBeUndefined()
+  etat.fini = true
+  w.ctl.answer = reponse
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't9', reason: 'answer' } as never)
+  await w.clock.settle()
+}
+
+const questionsLivraison = (w: ReturnType<typeof world>) => w.asked.filter(q => q.includes('Flow vérifié.'))
+
+test('livraison : flow vérifié sur main → question ; « Brouillon » → revo/<titre>, commit des fichiers du flow, push nommé, PR en brouillon, lien au rapport', { options: { architecture: false } }, async ($, on) => {
+  const w = world(on)
+  const etat = { fini: false }
+  const cmds = depotGithub(w, etat)
+  await finirVerifie($, w, etat, 'Brouillon')
+  expect(questionsLivraison(w)).toHaveLength(1)
+  expect(questionsLivraison(w)[0]).toContain('nouvelle branche revo/')
+  const branche = cmds.find(c => c.includes('switch'))!.at(-1)!
+  expect(branche).toMatch(/^revo\//)
+  expect(cmds.find(c => c.includes('add'))!.slice(-3)).toEqual(['--', 'components/Basket.vue', 'lib/promo.ts'])
+  const commit = cmds.find(c => c.includes('commit'))!
+  expect(commit[commit.indexOf('-m') + 1]).toMatch(/^✨ feat: /)
+  expect(commit.slice(-3)).toEqual(['--', 'components/Basket.vue', 'lib/promo.ts'])
+  expect(cmds.find(c => c.includes('push'))!.slice(-3)).toEqual(['-u', 'origin', `${branche}:${branche}`])
+  const pr = cmds.find(c => c[0] === 'gh')!
+  expect(pr).toContain('--draft')
+  expect(pr[pr.indexOf('--base') + 1]).toBe('main')
+  expect(pr[pr.indexOf('--body-file') + 1]).toMatch(/\/rapports\/.+\.md$/)
+  // Dans cet ordre : branche, ajout, commit, push, PR.
+  expect(cmds.map(c => (c[0] === 'gh' ? 'pr' : c.find(x => ['switch', 'add', 'commit', 'push'].includes(x))))).toEqual(['switch', 'add', 'commit', 'push', 'pr'])
+  expect((w.states.flow as Flow).livraison).toEqual({ url: 'https://github.com/moi/boutique/pull/42', branche })
+  const rapport = Object.entries(w.disk).find(([k]) => k.includes('/rapports/'))?.[1] ?? ''
+  expect(rapport).toContain('## Livraison')
+  expect(rapport).toContain('PR ouverte en brouillon : https://github.com/moi/boutique/pull/42')
+})
+
+test('livraison : « Pas maintenant » ne lance rien', { options: { architecture: false } }, async ($, on) => {
+  const w = world(on)
+  const etat = { fini: false, ghAbsent: false }
+  const cmds = depotGithub(w, etat)
+  await finirVerifie($, w, etat, 'Pas maintenant')
+  expect(questionsLivraison(w)).toHaveLength(1)
+  expect(cmds).toEqual([])
+  expect((w.states.flow as Flow).livraison).toBeUndefined()
+})
+
+test('livraison : gh non connecté → pas de question ni de commande', { options: { architecture: false } }, async ($, on) => {
+  const w = world(on)
+  const etat = { fini: false, ghAbsent: true }
+  const cmds = depotGithub(w, etat)
+  await finirVerifie($, w, etat, 'Brouillon')
+  expect(questionsLivraison(w)).toEqual([])
+  expect(cmds).toEqual([])
+})
+
+test('livraison : option coupée → pas de question', { options: { architecture: false, livraison: false } as never }, async ($, on) => {
+  const w = world(on)
+  const etat = { fini: false }
+  const cmds = depotGithub(w, etat)
+  await finirVerifie($, w, etat, 'Brouillon')
+  expect(questionsLivraison(w)).toEqual([])
+  expect(cmds).toEqual([])
 })

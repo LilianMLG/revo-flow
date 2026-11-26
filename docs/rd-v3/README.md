@@ -314,6 +314,15 @@ de `glab`) : lui passer la branche de base.
 | Tests | `mergeDenial` (module pur, chaque ligne du tableau et des faux positifs : `git merge` local, `gh pr view`) ; détection de forge ; flow complet avec de faux `gh` et `glab` (branche par défaut, branche existante, CLI absente, refus de l'utilisateur) |
 | Effort | Garde ½ jour, livraison GitHub 1 jour, GitLab ½ jour |
 
+### Décisions à la livraison GitHub (v3.4)
+
+- **Où** : `finishFlow`, une fois le rapport écrit, seulement si `VerifJournal.etat` vaut `verifie` (porte verte, garde-fous, revue d'architecture). Un flow observé, non vérifié ou arrêté ne propose rien.
+- **Module pur** `hooks/livraison.ts` (forge, branche, message, fichiers, question, `gh pr create`, ligne du rapport et de doctor) ; `livrer` dans register.tsx lance les commandes avec `$.process.run`, hors du hook `tool.call` (la garde anti-merge ne s'applique pas à revo-flow lui-même, et il ne fusionne jamais).
+- **Fichiers** : ceux marqués par les outils du flow et ceux que git voit changés depuis le lancement, filtrés par `git status` (suppressions comprises) ; `git add -A -- <fichiers>` puis `git commit -- <fichiers>` : le reste de l'index n'est pas commité.
+- **Option** booléenne `livraison` (oui par défaut), comme `gardeMerge`, plutôt que `demander`/`off`.
+- **Version 3.4.0** : la 3.2.0 est la revue d'architecture, la 3.3.0 la garde anti-merge.
+- **Reste** : GitLab (`glab mr create`, hôte auto-hébergé, `GITLAB_HOST`).
+
 ## 4. Écarté ou différé
 
 | Piste | Verdict | Pourquoi |
