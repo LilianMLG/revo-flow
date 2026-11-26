@@ -425,7 +425,7 @@ async function projectHeader($: $): Promise<{ project: string; branch: string }>
 }
 
 /**
- * La garde anti-merge (v3.2) : le texte du refus d'une commande Bash ou PowerShell qui fusionnerait une PR ou une MR, ou
+ * La garde anti-merge (v3.3) : le texte du refus d'une commande Bash ou PowerShell qui fusionnerait une PR ou une MR, ou
  * pousserait sur une branche protégée ou sans branche nommée. Pour une commande qui pousse, la branche par défaut est lue
  * avec git dans le dossier du push (les `cd` et `git -C` qui le précèdent, depuis le dossier de la session) ; main et master
  * sont protégées de toute façon.
@@ -4485,7 +4485,7 @@ function readOptions(o: PluginOptions) {
   // La preuve mobile (v3.1) : l'outil mobile de revo-flow par défaut ; mcp ajoute le serveur mobile-mcp au vérificateur.
   const mobile = (o as { mobile?: unknown }).mobile
   opts.mobile = mobile === 'mcp' || mobile === 'off' ? mobile : 'appareil'
-  // La garde anti-merge (v3.2) : active par défaut.
+  // La garde anti-merge (v3.3) : active par défaut.
   opts.gardeMerge = (o as { gardeMerge?: unknown }).gardeMerge !== false
   // La revue d'architecture (v3.2) : obligatoire par défaut, à chaque flow vérifié.
   opts.architecture = (o as { architecture?: unknown }).architecture !== false
@@ -5142,7 +5142,7 @@ export const register: Register = (on, options) => {
     if (tool === PLAN_TOOL || tool === STEP_TOOL || tool === VERIF_TOOL || tool === MOBILE_TOOL) return next(e)
     if (tool === 'SendMessage' && e.agentId === undefined) await noteRework($, e as unknown as Record<string, unknown>).catch(() => undefined)
     const input = e as unknown as Record<string, unknown>
-    // La garde anti-merge (v3.2) : dans un flow ou non, pour l'orchestrateur comme pour un sous-agent.
+    // La garde anti-merge (v3.3) : dans un flow ou non, pour l'orchestrateur comme pour un sous-agent.
     if (opts.gardeMerge && (tool === 'Bash' || tool === 'PowerShell')) {
       // Un contrôle en échec refuse par prudence une commande qui parle de merge ou de push.
       const deny = await mergeCheck($, text(input.command), tool === 'PowerShell' ? 'powershell' : 'bash').catch(() => refusPrudent(input.command))

@@ -2221,7 +2221,7 @@ test('redémarrage : dialogue fermé, l’instantané attend ; celui d’un autr
   expect(w.store.journal).toBeUndefined()
 })
 
-// ── La garde anti-merge (v3.2) ───────────────────────────────────────────
+// ── La garde anti-merge (v3.3) ───────────────────────────────────────────
 
 let appelBash = 0
 const bash = async ($: Engine, command: string, extra: Record<string, unknown> = {}) =>

@@ -218,7 +218,7 @@ projet (web ou mobile), et **l'utilisateur voit la vérification en direct**, ja
 | Limites connues | Pas de geste ni d'arbre sur iOS ; pas de hot reload (demanderait `--pid-file` et SIGUSR1) ; un iPhone branché n'a de capture qu'avec Flutter ; le premier build peut dépasser 5 min |
 | Tests | `tests/verif/mobile.test.ts` (module pur) et `tests/verif/mobile-flow.test.ts` (flow complet, Windows et macOS : téléphone branché, émulateur démarré puis éteint, échec de build, projet Nuxt, option off, vérificateur en arrière-plan refusé) |
 
-## 3 ter. Lot D : v3.2, « livraison : la PR ou la MR, jamais le merge »
+## 3 ter. Lot D : v3.3, « livraison : la PR ou la MR, jamais le merge »
 
 > Étude du 2026-11-26, sur la v3.1.0 (commit f3d4bd7). Aucun fichier de code n'a été modifié.
 > Entrées : la doc de `/ship` et de `/steward` (code.claude.com/docs/en/ship-command, ship-command-troubleshooting,

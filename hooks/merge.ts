@@ -1,5 +1,5 @@
 /**
- * La garde anti-merge (v3.2, docs/rd-v3/README.md §3 ter) : une commande Bash ou PowerShell de Claude qui fusionnerait une PR
+ * La garde anti-merge (v3.3, docs/rd-v3/README.md §3 ter) : une commande Bash ou PowerShell de Claude qui fusionnerait une PR
  * ou une MR, armerait l'auto-merge, ou pousserait sur une branche protégée est refusée. Le merge reste à l'utilisateur.
  * Au mieux : une commande détournée peut passer ; la vraie garantie est la protection de branche côté serveur.
  * Un push doit nommer sa branche de destination : `git push`, `git push origin` ou `git push origin HEAD` dépendent du

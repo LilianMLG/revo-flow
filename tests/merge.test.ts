@@ -1,4 +1,4 @@
-// La garde anti-merge (v3.2, docs/rd-v3/README.md §3 ter), module pur : ce qui est refusé, ce qui passe, et la lecture du shell.
+// La garde anti-merge (v3.3, docs/rd-v3/README.md §3 ter), module pur : ce qui est refusé, ce qui passe, et la lecture du shell.
 // Écrits d'après le tableau de la spec, pas d'après le code.
 import { describe, expect, test } from 'claude-code/testing'
 

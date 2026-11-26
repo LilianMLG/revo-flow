@@ -194,7 +194,7 @@ Depuis la v3.1, le même vérificateur peut **voir une app mobile tourner**, sur
 - **Mesure** : le journal du graphe note la preuve mobile de chaque flow (état, captures, verdicts mobile, ko mobile), comme la preuve web.
 - **Limites** : Flutter, Expo et React Native seulement ; pas de geste ni d'arbre des vues sur iOS (capture et journal seulement) ; pas de hot reload ; un iPhone branché n'a de capture qu'avec Flutter ; iOS demande macOS ; le premier build Gradle ou Xcode peut dépasser les 5 minutes (relance l'action `mobile`, l'app est alors déjà construite).
 
-### Garde anti-merge (v3.2)
+### Garde anti-merge (v3.3)
 
 revo-flow refuse toute commande de Claude qui **fusionnerait** une PR ou une MR, ou **pousserait sur la branche par défaut**. Le merge reste à toi, depuis GitHub ou GitLab. Corriger, pousser sur une branche de travail, ouvrir ou mettre à jour une PR ou une MR, approuver : tout cela passe.
 
@@ -249,7 +249,7 @@ Depuis la v2.2, revo-flow découvre les agents déjà installés sur ton Claude 
 | `cache` | oui | brief du cache projet au lancement, extrait de fiche dans le prompt de chaque agent et outil `cache` proposé ; `non` : ni brief, ni extrait, ni outil, la commande `cache` reste et les flows comptent dans la mesure « sans cache » |
 | `web` | `extension` | preuve web du vérificateur (v3.0) : `extension` démarre le serveur de dev du projet après confirmation et navigue avec Claude in Chrome ; `devtools` déclare en plus le MCP Chrome DevTools en repli ; `off` : aucune preuve web |
 | `mobile` | `appareil` | preuve mobile du vérificateur (v3.1) : `appareil` choisit l'appareil (téléphone branché, sinon émulateur ou simulateur démarré avec sa fenêtre), lance l'app après confirmation et l'observe en direct avec l'outil `mobile` ; `mcp` déclare en plus le MCP mobile-mcp ; `off` : aucune preuve mobile |
-| `gardeMerge` | oui | garde anti-merge (v3.2) : refuse toute commande de Claude qui fusionnerait une PR ou une MR, armerait l'auto-merge ou pousserait sur la branche par défaut, dans un flow ou non ; `non` : aucune garde |
+| `gardeMerge` | oui | garde anti-merge (v3.3) : refuse toute commande de Claude qui fusionnerait une PR ou une MR, armerait l'auto-merge ou pousserait sur la branche par défaut, dans un flow ou non ; `non` : aucune garde |
 | `architecture` | oui | revue d'architecture obligatoire du vérificateur à la fin de chaque flow vérifié (v3.2) : fichiers au bon endroit, conventions, rien de redéfini ; la porte attend son verdict ; `non` la rend facultative |
 | `agents` | oui | catalogue des agents installés (projet, dossier personnel, plugins activés) proposé à l'orchestrateur ; un sous-agent du plan peut en prendre le type, avec son modèle et son effort ; `non` : rien n'est lu ni proposé, `general-purpose` comme avant |
 
