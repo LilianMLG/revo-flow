@@ -16,10 +16,12 @@ import {
   brancheDeLivraison,
   cheminsChanges,
   cibleDistante,
+  conseilCli,
   corpsDePr,
   defautDeGlab,
   demandeDe,
   doctorLivraison,
+  etatCli,
   finLivraison,
   fichiersDeLivraison,
   forgeDe,
@@ -27,7 +29,10 @@ import {
   hotesGh,
   ligneRapport,
   messageCommit,
+  poidsArgument,
+  projetDuRemote,
   questionLivraison,
+  repoPour,
   urlDansListeMr,
   urlDeMr,
   urlDePr,
@@ -181,6 +186,8 @@ describe('question, gh, rapport, doctor', () => {
     // revue PR #3, point 10 : sans remote, pas d'hôte inventé ; un hôte inconnu peut être un GitHub Enterprise pas connecté
     expect(doctorLivraison({ option: true, forge: { forge: 'autre' } })).toBe('aucun remote origin : pas de livraison')
     expect(doctorLivraison({ option: true, forge: { forge: 'autre', hote: 'ghe.corp' } })).toContain('gh auth login --hostname ghe.corp')
+    // revue PR #4, point 6 : un hôte non reconnu peut aussi être un GitLab pas encore connecté
+    expect(doctorLivraison({ option: true, forge: { forge: 'autre', hote: 'git.entreprise.local' } })).toContain('un GitLab : glab auth login --hostname git.entreprise.local')
   })
 })
 
@@ -225,5 +232,42 @@ describe('GitLab (v3.5)', () => {
     expect(r.coupe).toBe(true)
     expect(r.texte.length).toBeLessThanOrEqual(CORPS_MAX_GLAB + 200)
     expect(r.texte).toContain('Rapport coupé pour GitLab')
+  })
+})
+
+describe('revue de la PR #4', () => {
+  test('point 1 : une description de MR est mesurée une fois échappée (guillemets et antislashs comptent double)', () => {
+    expect(poidsArgument('a"b\\c')).toBe(7)
+    // 6 caractères bruts, 9 une fois échappés : sous la limite en longueur, au-dessus en poids.
+    const rapport = `${'"x\\y" '.repeat(1700)}\n`.repeat(2)
+    expect(rapport.length).toBeLessThan(CORPS_MAX_GLAB)
+    expect(poidsArgument(rapport)).toBeGreaterThan(CORPS_MAX_GLAB)
+    const r = corpsDePr(rapport, '/h/r.md', CORPS_MAX_GLAB, 'GitLab', poidsArgument)
+    expect(r.coupe).toBe(true)
+    expect(poidsArgument(r.texte)).toBeLessThanOrEqual(CORPS_MAX_GLAB)
+    // sans guillemets ni antislash, rien ne change
+    expect(corpsDePr('court', '/h/r.md', CORPS_MAX_GLAB, 'GitLab', poidsArgument)).toEqual({ texte: 'court', coupe: false })
+  })
+
+  test('point 2 : le projet d’origin pour --repo, https, ssh, scp, sous-groupes ; gh sans schéma, glab en URL', () => {
+    expect(projetDuRemote('git@git.entreprise.local:equipe/web/boutique.git')).toEqual({ hote: 'git.entreprise.local', chemin: 'equipe/web/boutique' })
+    expect(projetDuRemote('ssh://git@git.entreprise.local:2222/equipe/boutique.git')).toEqual({ hote: 'git.entreprise.local', chemin: 'equipe/boutique' })
+    expect(projetDuRemote('https://github.com/moi/app.git')).toEqual({ hote: 'github.com', chemin: 'moi/app' })
+    expect(projetDuRemote('https://github.com/moi')).toBeUndefined()
+    expect(projetDuRemote('/srv/depot.git')).toBeUndefined()
+    expect(repoPour('gh', { hote: 'github.com', chemin: 'moi/app' })).toBe('github.com/moi/app')
+    expect(repoPour('glab', { hote: 'g.local', chemin: 'e/b' })).toBe('https://g.local/e/b')
+    expect(argsMrList('f', 'https://g.local/e/b')).toEqual(['glab', 'mr', 'list', '--repo', 'https://g.local/e/b', '--source-branch', 'f', '--output', 'json'])
+    expect(argsPrCreate({ base: 'main', branche: 'b', titre: 't', corps: 'r.md', brouillon: false, repo: 'github.com/o/r' }).slice(3, 5)).toEqual(['--repo', 'github.com/o/r'])
+  })
+
+  test('point 4 : absent seulement s’il n’a pas pu être lancé ; une erreur de certificat ou de réseau est une erreur', () => {
+    expect(etatCli({ ok: true, lance: true, code: 0, sortie: '' })).toBe('connecte')
+    expect(etatCli({ ok: false, lance: false, sortie: 'spawn glab ENOENT' })).toBe('absent')
+    expect(etatCli({ ok: false, lance: true, code: 127, sortie: '' })).toBe('absent')
+    expect(etatCli({ ok: false, lance: true, code: 1, sortie: 'x git.corp: no token found' })).toBe('non-connecte')
+    expect(etatCli({ ok: false, lance: true, code: 1, sortie: 'x509: certificate signed by unknown authority' })).toBe('erreur')
+    expect(conseilCli('glab', 'erreur', 'git.corp', 'x509: certificate signed by unknown authority\nautre')).toBe('glab en erreur sur git.corp (x509: certificate signed by unknown authority)')
+    expect(doctorLivraison({ option: true, forge: { forge: 'gitlab', hote: 'git.corp' }, glab: 'erreur', detail: 'dial tcp: i/o timeout' })).toContain('glab en erreur sur git.corp (dial tcp: i/o timeout)')
   })
 })

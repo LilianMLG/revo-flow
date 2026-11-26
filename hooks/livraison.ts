@@ -117,13 +117,48 @@ export const CORPS_MAX = 60_000
  */
 export const CORPS_MAX_GLAB = 25_000
 
-/** La description de la PR ou de la MR : le rapport, coupé au-delà de `max` avec le chemin du rapport complet. */
-export function corpsDePr(rapport: string, chemin: string, max = CORPS_MAX, forge = 'GitHub'): { texte: string; coupe: boolean } {
-  if (rapport.length <= max) return { texte: rapport, coupe: false }
-  const debut = rapport.slice(0, max)
-  const fin = debut.lastIndexOf('\n')
-  return { texte: `${debut.slice(0, fin > 0 ? fin : max)}\n\n…\n\n_Rapport coupé pour ${forge} ; le rapport complet est sur le poste de l'auteur : ${chemin}_\n`, coupe: true }
+/**
+ * Le poids d'un texte passé en argument : sous Windows, chaque guillemet et chaque antislash peut doubler une fois échappé.
+ * On compte donc large : un caractère, plus un pour chacun d'eux.
+ */
+export const poidsArgument = (s: string) => s.length + (s.match(/["\\]/g)?.length ?? 0)
+
+/**
+ * La description de la PR ou de la MR : le rapport, coupé au-delà de `max` avec le chemin du rapport complet. `poids` mesure
+ * le texte (sa longueur, ou son poids une fois échappé pour un argument de ligne de commande).
+ */
+export function corpsDePr(rapport: string, chemin: string, max = CORPS_MAX, forge = 'GitHub', poids: (s: string) => number = s => s.length): { texte: string; coupe: boolean } {
+  if (poids(rapport) <= max) return { texte: rapport, coupe: false }
+  const note = `\n\n…\n\n_Rapport coupé pour ${forge} ; le rapport complet est sur le poste de l'auteur : ${chemin}_\n`
+  let taille = Math.min(rapport.length, Math.max(0, max - poids(note)))
+  let texte = ''
+  for (let essai = 0; essai < 8; essai++) {
+    const debut = rapport.slice(0, taille)
+    const fin = debut.lastIndexOf('\n')
+    texte = `${debut.slice(0, fin > 0 ? fin : taille)}${note}`
+    const exces = poids(texte) - max
+    if (exces <= 0) break
+    taille = Math.max(0, taille - exces)
+  }
+  return { texte, coupe: true }
 }
+
+/**
+ * Le projet du remote origin (hôte, et groupe/sous-groupe/projet), pour `--repo` de gh (`hote/proprietaire/depot`) et de glab
+ * (`https://hote/groupe/projet`) : sans lui, ils choisissent le projet dans les remotes et préfèrent `upstream` à `origin`, où
+ * revo-flow pousse. undefined : remote illisible.
+ */
+export function projetDuRemote(url: string): { hote: string; chemin: string } | undefined {
+  const u = (url ?? '').trim()
+  const hote = hoteDuRemote(u)
+  if (!hote) return undefined
+  const brut = /^(?:https?|ssh|git):\/\/(?:[^@/]+@)?[^/]+\/(.+)$/i.exec(u)?.[1] ?? /^(?:[^@/]+@)?[^/:]+:(.+)$/.exec(u)?.[1]
+  const chemin = brut?.replace(/\.git\/?$/, '').replace(/^\/+|\/+$/g, '')
+  return chemin && chemin.includes('/') ? { hote, chemin } : undefined
+}
+
+/** `--repo` pour gh (`hote/proprietaire/depot`) ou glab (URL web complète). */
+export const repoPour = (cli: 'gh' | 'glab', p: { hote: string; chemin: string }) => (cli === 'gh' ? `${p.hote}/${p.chemin}` : `https://${p.hote}/${p.chemin}`)
 
 /** Ce que la forge appelle une demande de fusion : PR sur GitHub, MR sur GitLab. */
 export type Demande = 'PR' | 'MR'
@@ -173,8 +208,8 @@ export function questionLivraison(o: {
 }
 
 /** Les arguments de `gh pr create` : base, branche, titre, rapport du flow en description, brouillon ou non. */
-export function argsPrCreate(o: { base: string; branche: string; titre: string; corps: string; brouillon: boolean }): string[] {
-  return ['gh', 'pr', 'create', '--base', o.base, '--head', o.branche, '--title', o.titre, '--body-file', o.corps, ...(o.brouillon ? ['--draft'] : [])]
+export function argsPrCreate(o: { base: string; branche: string; titre: string; corps: string; brouillon: boolean; repo?: string }): string[] {
+  return ['gh', 'pr', 'create', ...(o.repo ? ['--repo', o.repo] : []), '--base', o.base, '--head', o.branche, '--title', o.titre, '--body-file', o.corps, ...(o.brouillon ? ['--draft'] : [])]
 }
 
 /** L'URL de la PR dans la sortie de `gh pr create` ou `gh pr view` (la dernière URL de PR). */
@@ -187,12 +222,12 @@ export function urlDePr(sortie: string): string | undefined {
  * Les arguments de `glab mr create` : branche source et cible, titre, description en texte (glab ne la lit pas dans un
  * fichier), brouillon ou non, sans question (`--yes`). glab trouve le projet et son hôte dans le remote du dépôt.
  */
-export function argsMrCreate(o: { base: string; branche: string; titre: string; description: string; brouillon: boolean }): string[] {
-  return ['glab', 'mr', 'create', '--source-branch', o.branche, '--target-branch', o.base, '--title', o.titre, '--description', o.description, '--yes', ...(o.brouillon ? ['--draft'] : [])]
+export function argsMrCreate(o: { base: string; branche: string; titre: string; description: string; brouillon: boolean; repo?: string }): string[] {
+  return ['glab', 'mr', 'create', ...(o.repo ? ['--repo', o.repo] : []), '--source-branch', o.branche, '--target-branch', o.base, '--title', o.titre, '--description', o.description, '--yes', ...(o.brouillon ? ['--draft'] : [])]
 }
 
 /** Les arguments de `glab mr list` : les MR ouvertes dont la branche source est `branche`, en JSON. */
-export const argsMrList = (branche: string): string[] => ['glab', 'mr', 'list', '--source-branch', branche, '--output', 'json']
+export const argsMrList = (branche: string, repo?: string): string[] => ['glab', 'mr', 'list', ...(repo ? ['--repo', repo] : []), '--source-branch', branche, '--output', 'json']
 
 /** L'URL d'une MR dans une sortie de glab (la dernière : https://hote/groupe/projet/-/merge_requests/12). */
 export function urlDeMr(sortie: string): string | undefined {
@@ -233,18 +268,40 @@ export function finLivraison(o: { nom: Demande; url: string; brouillon: boolean;
 }
 
 /** La ligne Livraison de /revo-flow doctor. */
-export function doctorLivraison(o: { option: boolean; forge: Forge; gh?: 'connecte' | 'non-connecte' | 'absent'; glab?: 'connecte' | 'non-connecte' | 'absent'; defaut?: string }): string {
+/** L'état d'un CLI de forge sur un hôte : connecté, pas connecté, absent du poste, ou en erreur (réseau, certificat, délai). */
+export type EtatCli = 'connecte' | 'non-connecte' | 'absent' | 'erreur'
+
+/**
+ * L'état d'un CLI d'après son lancement : `absent` seulement s'il n'a pas pu être lancé (introuvable, code 127) ; une erreur
+ * de connexion ou de certificat n'est pas une absence.
+ */
+export function etatCli(r: { ok: boolean; lance: boolean; code?: number; sortie: string }): EtatCli {
+  if (r.ok) return 'connecte'
+  if (!r.lance || r.code === 127 || /command not found|not recognized as|ENOENT|no such file or directory|introuvable/i.test(r.sortie)) return 'absent'
+  if (/not logged|non connect|auth login|no token|401|unauthori[sz]ed/i.test(r.sortie)) return 'non-connecte'
+  return 'erreur'
+}
+
+/** La première ligne utile d'une sortie d'erreur, pour la montrer (certificat, réseau). */
+export const ligneErreur = (sortie: string) => (sortie ?? '').split(/\r?\n/).map(l => l.trim()).find(Boolean)?.slice(0, 160) ?? 'erreur inconnue'
+
+/** Ce qu'il faut dire d'un CLI qui n'est pas connecté : comment l'installer, s'y connecter, ou l'erreur qu'il donne. */
+export function conseilCli(cli: 'gh' | 'glab', etat: EtatCli, hote: string, detail = ''): string {
+  if (etat === 'connecte') return `${cli} connecté`
+  if (etat === 'non-connecte') return `${cli} non connecté : ${cli} auth login --hostname ${hote}`
+  if (etat === 'erreur') return `${cli} en erreur sur ${hote} (${ligneErreur(detail)})`
+  return cli === 'gh' ? 'gh absent : installez GitHub CLI (brew install gh), puis gh auth login' : `glab absent : installez GitLab CLI (brew install glab), puis glab auth login --hostname ${hote}`
+}
+
+/** La ligne Livraison de /revo-flow doctor. */
+export function doctorLivraison(o: { option: boolean; forge: Forge; gh?: EtatCli; glab?: EtatCli; detail?: string; defaut?: string }): string {
   if (!o.option) return 'livraison désactivée (option livraison)'
   const base = o.defaut ? ` vers ${o.defaut}` : ''
-  if (o.forge.forge === 'github') {
-    const gh = o.gh === 'connecte' ? 'gh connecté' : o.gh === 'non-connecte' ? `gh non connecté : gh auth login --hostname ${o.forge.hote}` : 'gh absent : installez GitHub CLI (brew install gh), puis gh auth login'
-    return `GitHub (${o.forge.hote}) · ${gh} · en fin de flow vérifié, PR${base} sur votre accord (brouillon ou prête), jamais de merge`
-  }
-  if (o.forge.forge === 'gitlab') {
-    const h = o.forge.hote
-    const glab = o.glab === 'connecte' ? 'glab connecté' : o.glab === 'non-connecte' ? `glab non connecté : glab auth login --hostname ${h}` : `glab absent : installez GitLab CLI (brew install glab), puis glab auth login --hostname ${h}`
-    return `GitLab (${h}) · ${glab} · en fin de flow vérifié, MR${base} sur votre accord (brouillon ou prête), jamais de merge`
-  }
+  if (o.forge.forge === 'github')
+    return `GitHub (${o.forge.hote}) · ${conseilCli('gh', o.gh ?? 'absent', o.forge.hote, o.detail)} · en fin de flow vérifié, PR${base} sur votre accord (brouillon ou prête), jamais de merge`
+  if (o.forge.forge === 'gitlab')
+    return `GitLab (${o.forge.hote}) · ${conseilCli('glab', o.glab ?? 'absent', o.forge.hote, o.detail)} · en fin de flow vérifié, MR${base} sur votre accord (brouillon ou prête), jamais de merge`
   if (!o.forge.hote) return 'aucun remote origin : pas de livraison'
-  return `pas de remote GitHub reconnu (${o.forge.hote}) : pas de livraison ; si c'est un GitHub Enterprise, gh auth login --hostname ${o.forge.hote}`
+  const h = o.forge.hote
+  return `forge de ${h} non reconnue : pas de livraison ; un GitLab : glab auth login --hostname ${h} ; un GitHub Enterprise : gh auth login --hostname ${h}`
 }
