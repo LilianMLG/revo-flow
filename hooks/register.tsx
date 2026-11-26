@@ -141,6 +141,7 @@ import {
   type PaneActions,
   type ViewData,
 } from './ui/views'
+import { brancheParDefaut, dossiersDuPush, mergeDenial, type MergeContexte } from './merge'
 import { rapportMarkdown } from './rapport'
 import { doctorText, manifestsOf, pluginVersion, versionText } from './doctor'
 import { addBase, baseFor } from './verif/base'
@@ -247,6 +248,7 @@ const opts = {
   agents: true,
   web: 'extension' as 'extension' | 'devtools' | 'off',
   mobile: 'appareil' as 'appareil' | 'mcp' | 'off',
+  gardeMerge: true,
 }
 
 /** L'outil mobile de la preuve mobile (v3.1) : capture, arbre, journal, gestes, réservé au vérificateur. */
@@ -403,6 +405,35 @@ async function projectHeader($: $): Promise<{ project: string; branch: string }>
   if (!repo) return { project: baseName(cwd), branch: '' }
   // La racine d'un worktree est celle du dépôt principal : la branche se lit là où l'on travaille.
   return { project: baseName(repo.root), branch: await gitBranch($, cwd || repo.root) }
+}
+
+/**
+ * La garde anti-merge (v3.2) : le texte du refus d'une commande Bash ou PowerShell qui fusionnerait une PR ou une MR, ou
+ * pousserait sur une branche protégée. Les branches ne sont lues que pour une commande qui pousse, avec git, dans le dossier
+ * où le push tourne (les `cd` et `git -C` qui le précèdent, depuis le dossier de la session). Branche courante illisible :
+ * un push sans branche nommée est refusé.
+ */
+async function mergeCheck($: $, command: string): Promise<string | undefined> {
+  const cible = dossiersDuPush(command)
+  if (!cible) return mergeDenial(command)
+  const ctx: MergeContexte = {}
+  if (cible.connu) {
+    try {
+      const cwd = (await $.fs.stat('.', { resolve: true })).realPath ?? ''
+      if (cwd) {
+        const git = async (args: string[]) => {
+          const r = await $.process.run(['git', ...cible.dossiers.flatMap(d => ['-C', d]), ...args], { cwd, timeoutMs: 5000 })
+          return r.exitCode === 0 ? r.stdout.trim() : ''
+        }
+        const courante = await git(['rev-parse', '--abbrev-ref', 'HEAD'])
+        if (courante && courante !== 'HEAD') ctx.courante = courante
+        ctx.defaut = brancheParDefaut(await git(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']))
+      }
+    } catch {
+      // sans git : main et master restent protégées, et un push sans branche nommée est refusé
+    }
+  }
+  return mergeDenial(command, ctx)
 }
 
 async function registerTools($: $) {
@@ -4285,6 +4316,8 @@ function readOptions(o: PluginOptions) {
   // La preuve mobile (v3.1) : l'outil mobile de revo-flow par défaut ; mcp ajoute le serveur mobile-mcp au vérificateur.
   const mobile = (o as { mobile?: unknown }).mobile
   opts.mobile = mobile === 'mcp' || mobile === 'off' ? mobile : 'appareil'
+  // La garde anti-merge (v3.2) : active par défaut.
+  opts.gardeMerge = (o as { gardeMerge?: unknown }).gardeMerge !== false
 }
 
 /**
@@ -4916,6 +4949,11 @@ export const register: Register = (on, options) => {
     const tool = String(e.tool)
     if (tool === PLAN_TOOL || tool === STEP_TOOL || tool === VERIF_TOOL || tool === MOBILE_TOOL) return next(e)
     const input = e as unknown as Record<string, unknown>
+    // La garde anti-merge (v3.2) : dans un flow ou non, pour l'orchestrateur comme pour un sous-agent.
+    if (opts.gardeMerge && (tool === 'Bash' || tool === 'PowerShell')) {
+      const deny = await mergeCheck($, text(input.command)).catch(() => undefined)
+      if (deny) return { deny }
+    }
     const isVerifierCall = !!e.agentId && verifierAgents.has(e.agentId)
     // La preuve web (v3) : le navigateur du vérificateur ne sert que pendant la preuve web, et seulement sur l'origine du serveur prêt.
     if (isVerifierCall && isWebTool(tool)) {

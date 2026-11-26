@@ -59,7 +59,9 @@ claude plugin update revo-flow@revo-flow
 
 A red flow means the gate still finds new lint, type or test errors, or a function changed by the flow with a CRAP score above 30. It never means the agents' own claims were doubted: "I ran the tests and they pass" does not count, only what revo-flow ran. Errors that were already there before the flow are shown separately and do not block.
 
-Without `/revo-flow`, the mod does nothing.
+Without `/revo-flow`, the mod does nothing, except the merge guard.
+
+**Merge guard (v3.2).** In every session, in a flow or not, revo-flow refuses any Claude command that would merge a PR or MR (`gh pr merge`, `glab mr merge`, the GitHub and GitLab merge APIs), arm auto-merge (`--auto`, `merge_when_pipeline_succeeds`, GitLab push options), or push to the default branch (`main`, `master`, `origin/HEAD`, `--all`, `--mirror`). Fixing, pushing a work branch, opening or updating a PR or MR still pass; merging stays with you. It also covers the commands Claude types while `/ship` or `/steward` watches a PR. It is a second barrier, not the guarantee: protect the branch on the server (approval required, merge restricted to maintainers).
 
 ## `/revo-flow doctor`
 
@@ -103,6 +105,7 @@ Set in `/config`.
 | `cache` | yes | inject the project cache brief and feature excerpts, and offer the `cache` tool |
 | `web` | `extension` | web proof by the verifier: `extension` starts the dev server (after confirmation) and browses with Claude in Chrome, `devtools` also declares the Chrome DevTools MCP as a fallback, `off` disables it |
 | `mobile` | `appareil` | mobile proof by the verifier (v3.1): `appareil` picks the device (plugged-in phone, else an emulator or simulator started with its window), launches the app after confirmation and observes it live with the `mobile` tool, `mcp` also declares the mobile-mcp server, `off` disables it |
+| `gardeMerge` | yes | merge guard (v3.2): refuse any Claude command that merges a PR or MR, arms auto-merge or pushes to the default branch, in a flow or not; `no` turns it off |
 | `agents` | yes | offer your installed agents (project, personal, enabled plugins) to the orchestrator |
 
 ## More

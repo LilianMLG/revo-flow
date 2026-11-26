@@ -54,7 +54,7 @@ claude plugin update revo-flow@revo-flow
 
 Pendant le flow, les durées et « inactif depuis » avancent seuls, un agent sans aucune requête depuis 3 min est signalé une fois (toast et notification), et une ligne d'état sous le prompt résume `revo-flow · titre · 62 % · 3 actifs · 0,41 €`.
 
-Sans `/revo-flow`, le mod ne fait rien : pas même un outil déclaré (`plan`, `step` et `cache` arrivent au premier flow ou `cache build`). Un nouveau `/revo-flow` pendant un flow pas fini demande **Remplacer** ou **Garder le flow en cours**.
+Sans `/revo-flow`, le mod ne fait rien, sauf la **garde anti-merge** (voir plus bas), active dans toute session : pas même un outil déclaré (`plan`, `step` et `cache` arrivent au premier flow ou `cache build`). Un nouveau `/revo-flow` pendant un flow pas fini demande **Remplacer** ou **Garder le flow en cours**.
 
 | Commande | Effet |
 | --- | --- |
@@ -194,6 +194,16 @@ Depuis la v3.1, le même vérificateur peut **voir une app mobile tourner**, sur
 - **Mesure** : le journal du graphe note la preuve mobile de chaque flow (état, captures, verdicts mobile, ko mobile), comme la preuve web.
 - **Limites** : Flutter, Expo et React Native seulement ; pas de geste ni d'arbre des vues sur iOS (capture et journal seulement) ; pas de hot reload ; un iPhone branché n'a de capture qu'avec Flutter ; iOS demande macOS ; le premier build Gradle ou Xcode peut dépasser les 5 minutes (relance l'action `mobile`, l'app est alors déjà construite).
 
+### Garde anti-merge (v3.2)
+
+revo-flow refuse toute commande de Claude qui **fusionnerait** une PR ou une MR, ou **pousserait sur la branche par défaut**. Le merge reste à toi, depuis GitHub ou GitLab. Corriger, pousser sur une branche de travail, ouvrir ou mettre à jour une PR ou une MR, approuver : tout cela passe.
+
+- **Partout** : dans un flow ou non, pour la session comme pour un sous-agent, en Bash comme en PowerShell. Une PR suivie par `/ship` ou `/steward` est donc couverte pour les commandes que Claude tape (Claude Code bloque déjà lui-même le merge pendant un suivi : la garde est une barrière de plus).
+- **Refusé** : `gh pr merge` (avec ou sans `--auto`), `glab mr merge` et `accept`, les options `glab` qui arment l'auto-merge, les API de merge REST et GraphQL de GitHub et GitLab (`…/pulls/<n>/merge`, `…/merges`, écriture de `git/refs/heads/main`, `…/merge_requests/<n>/merge`, train de merge, `mergePullRequest`, `mergeBranch`, `enqueuePullRequest`, `merge_when_pipeline_succeeds=true`…), les options de push GitLab qui fusionnent (`-o merge_request.merge_when_pipeline_succeeds`, `merge_request.auto_merge`), et `git push` vers `main`, `master` ou la branche par défaut d'`origin` (refspec, `HEAD` depuis cette branche, suppression, `--all`, `--mirror`).
+- **Lu, pas exécuté** : la commande est analysée (chaînes `&&` `;` `|`, sous-shells, `$(…)` et backticks même entre guillemets doubles, `sh -c`, `cmd /c`, `eval`, heredoc donné à un shell, `sudo`/`env`/`xargs`/`timeout`, chemins Windows comme `C:\…\gh.exe`) ; un message de commit, un heredoc cité, le `--body` ou le `--title` d'une PR, ou un `grep` qui cite ces commandes passe. Pour un push, revo-flow lit la branche courante et celle d'`origin/HEAD` avec git, là où le push tourne (en suivant les `cd` et `git -C` qui le précèdent) ; s'il ne peut pas la lire (`cd ~/…`, hors d'un dépôt), un push sans branche nommée est refusé : `git push -u origin <branche>` passe.
+- **Une deuxième barrière, pas la garantie** : une commande assez détournée peut passer. La vraie garantie est la **protection de branche côté serveur** : sur GitLab, *Allowed to merge* réservé aux Maintainers et une approbation requise ; sur GitHub, une règle de branche qui demande une approbation.
+- **Option `gardeMerge`** (`/config`, « Garde anti-merge ») : activée par défaut ; `non` coupe la garde.
+
 ### Score CRAP
 
 Depuis la v2.1, la porte juge aussi la **qualité des fonctions que le flow touche**, avec le score CRAP (Savoia et Evans, 2007) : pour chaque fonction, `CRAP = cc² × (1 − cov)³ + cc`, où `cc` est la complexité cyclomatique et `cov` la part de ses lignes couverte par les tests (0 à 1). **Seuil : 30.** Une fonction entièrement couverte vaut sa complexité ; une fonction sans aucun test dépasse 30 dès une complexité de 6.
@@ -227,6 +237,7 @@ Depuis la v2.2, revo-flow découvre les agents déjà installés sur ton Claude 
 | `cache` | oui | brief du cache projet au lancement, extrait de fiche dans le prompt de chaque agent et outil `cache` proposé ; `non` : ni brief, ni extrait, ni outil, la commande `cache` reste et les flows comptent dans la mesure « sans cache » |
 | `web` | `extension` | preuve web du vérificateur (v3.0) : `extension` démarre le serveur de dev du projet après confirmation et navigue avec Claude in Chrome ; `devtools` déclare en plus le MCP Chrome DevTools en repli ; `off` : aucune preuve web |
 | `mobile` | `appareil` | preuve mobile du vérificateur (v3.1) : `appareil` choisit l'appareil (téléphone branché, sinon émulateur ou simulateur démarré avec sa fenêtre), lance l'app après confirmation et l'observe en direct avec l'outil `mobile` ; `mcp` déclare en plus le MCP mobile-mcp ; `off` : aucune preuve mobile |
+| `gardeMerge` | oui | garde anti-merge (v3.2) : refuse toute commande de Claude qui fusionnerait une PR ou une MR, armerait l'auto-merge ou pousserait sur la branche par défaut, dans un flow ou non ; `non` : aucune garde |
 | `agents` | oui | catalogue des agents installés (projet, dossier personnel, plugins activés) proposé à l'orchestrateur ; un sous-agent du plan peut en prendre le type, avec son modèle et son effort ; `non` : rien n'est lu ni proposé, `general-purpose` comme avant |
 
 Sur l'app desktop, `/revo-flow` n'apparaît pas toujours dans le menu `/` : tape la commande en entier, elle fonctionne.
@@ -254,6 +265,7 @@ revo-flow/
 │   ├── doctor.ts          /revo-flow doctor : ce que le mod a détecté et fera sur le projet
 │   ├── rapport.ts         le rapport de flow en markdown
 │   ├── reprise.ts         reprise d'un flow après redémarrage : instantané, flow restauré, question
+│   ├── merge.ts           garde anti-merge : lecture de la commande shell, refus du merge et du push sur la branche par défaut
 │   ├── lib.ts             logique pure du flow : plan, tâches, progression, consignes, coûts
 │   ├── ui/
 │   │   ├── views.tsx      panneau et bande (terminal, desktop, mobile)
