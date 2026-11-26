@@ -2221,6 +2221,43 @@ test('redémarrage : dialogue fermé, l’instantané attend ; celui d’un autr
   expect(w.store.journal).toBeUndefined()
 })
 
+// ── La garde anti-merge (v3.3) ───────────────────────────────────────────
+
+let appelBash = 0
+const bash = async ($: Engine, command: string, extra: Record<string, unknown> = {}) =>
+  (await $.tool.call({ tool: 'Bash', command, tool_use_id: `m-${++appelBash}`, ...extra } as never)).deny as string | undefined
+
+test('garde anti-merge : refusée sans flow en cours, pour la session comme pour un sous-agent, Bash ou PowerShell ; le reste passe', async ($, on) => {
+  const w = world(on)
+  expect(await bash($, 'gh pr merge 12 --squash')).toMatch(/« gh pr merge » est refusé.*réservés à l'utilisateur/)
+  expect(await bash($, 'glab mr merge 7', { agentId: 'a-front' })).toMatch(/glab mr merge/)
+  expect(await bash($, 'git push origin main')).toMatch(/git push vers main/)
+  expect(await (await $.tool.call({ tool: 'PowerShell', command: 'gh pr merge 3', tool_use_id: 'ps' } as never)).deny).toMatch(/gh pr merge/)
+  // Un push doit nommer sa branche ; une branche de travail nommée passe.
+  expect(await bash($, 'git push -u origin HEAD')).toMatch(/branche non nommée/)
+  expect(await bash($, 'git push -u origin feat/promo 2>&1')).toBeUndefined()
+  expect(await bash($, 'gh pr create --fill --draft')).toBeUndefined()
+  expect(await bash($, 'npm test')).toBeUndefined()
+  // La branche par défaut est lue là où le push tourne : cd et git -C passés à git en -C.
+  w.runs.length = 0
+  expect(await bash($, 'cd ../app && git -C sous push origin feat/promo')).toBeUndefined()
+  expect(w.runs.find(r => r.includes('symbolic-ref'))).toEqual(['git', '-C', '../app', '-C', 'sous', 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD'])
+  // cd ~ : dossier illisible, git n'est pas lancé ; main et master restent protégées.
+  w.runs.length = 0
+  expect(await bash($, 'cd ~/app && git push origin main')).toMatch(/git push vers main/)
+  expect(await bash($, 'cd ~/app && git push -u origin feat/promo')).toBeUndefined()
+  expect(w.runs.some(r => r.includes('symbolic-ref'))).toBe(false)
+  // L'outil PowerShell : le backtick continue la ligne.
+  expect(await (await $.tool.call({ tool: 'PowerShell', command: 'gh pr `\n merge 3', tool_use_id: 'ps2' } as never)).deny).toMatch(/gh pr merge/)
+})
+
+test('garde anti-merge désactivée (gardeMerge à non) : rien n’est refusé ni lu', { options: { gardeMerge: false } as never }, async ($, on) => {
+  const w = world(on)
+  expect(await bash($, 'gh pr merge 12 --squash')).toBeUndefined()
+  expect(await bash($, 'git push origin main')).toBeUndefined()
+  expect(w.runs.some(r => r.includes('symbolic-ref'))).toBe(false)
+})
+
 test('reworkTasks et reworkTitle : une tâche de reprise au bout, en cours, sans doublon', () => {
   const faites = [{ title: 'Lire', kind: 'analyse' as const, status: 'completed' as const }, { title: 'Coder', kind: 'codage' as const, status: 'completed' as const }]
   const t = reworkTasks(faites, 'Corriger la porte (typecheck)')

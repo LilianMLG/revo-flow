@@ -10,6 +10,7 @@
 > avoir des utilisateurs, en vue d'une pub sur LinkedIn ? »
 
 > Lot B livré en v3.0 le 2026-10-31 : voir §3. Lot C (preuve mobile) livré en v3.1 le 2026-11-04 : voir §3 bis.
+> Lot D (livraison PR ou MR, garde anti-merge) étudié le 2026-11-26 : voir §3 ter.
 
 ## Verdict
 
@@ -216,6 +217,102 @@ projet (web ou mobile), et **l'utilisateur voit la vérification en direct**, ja
 | Délais | 3 min pour l'émulateur (sonde toutes les 3 s), 5 min pour le build et la pose |
 | Limites connues | Pas de geste ni d'arbre sur iOS ; pas de hot reload (demanderait `--pid-file` et SIGUSR1) ; un iPhone branché n'a de capture qu'avec Flutter ; le premier build peut dépasser 5 min |
 | Tests | `tests/verif/mobile.test.ts` (module pur) et `tests/verif/mobile-flow.test.ts` (flow complet, Windows et macOS : téléphone branché, émulateur démarré puis éteint, échec de build, projet Nuxt, option off, vérificateur en arrière-plan refusé) |
+
+## 3 ter. Lot D : v3.3, « livraison : la PR ou la MR, jamais le merge »
+
+> Étude du 2026-11-26, sur la v3.1.0 (commit f3d4bd7). Aucun fichier de code n'a été modifié.
+> Entrées : la doc de `/ship` et de `/steward` (code.claude.com/docs/en/ship-command, ship-command-troubleshooting,
+> pr-steward), `hooks/register.tsx` (hook `tool.call`, rapport de flow), `hooks/lib.ts` (consigne de l'orchestrateur).
+>
+> Question posée : « peut-on intégrer `/ship` à revo-flow pour qu'il crée la MR et la vérifie en autonomie ? »
+> Contrainte de l'auteur, qui utilise le mod en entreprise : **jamais de merge automatique**. Corriger une PR ou une
+> MR, oui ; la fusionner, jamais. L'auteur est sur GitHub pour ses projets perso, sur GitLab en entreprise.
+
+### Ce que dit la doc de `/ship`
+
+| Point | Fait documenté | Conséquence pour revo-flow |
+|---|---|---|
+| Déclenchement | Seulement une ligne tapée par l'utilisateur ; ni plugin, ni hook, ni `claude -p` | revo-flow ne peut pas enchaîner `/ship` : il prépare la PR ou la MR et dit « tape `/ship` » |
+| Forges | GitHub (`gh`, GitHub Enterprise compris). Sur GitLab, `/ship` **n'ouvre rien** : il relit, puis suit une MR déjà poussée (base passée en argument, v2.1.331+). `glab` non documenté | Sur GitLab, c'est revo-flow qui doit ouvrir la MR, avec `glab` |
+| Merge | Claude Code bloque les commandes `gh`/`git` qui fusionnent, approuvent, activent l'auto-merge ou forcent un push pendant un suivi, mais « ça ne couvre pas tout » (auto-merge déjà armé, règles de branche permissives, hook qui laisse passer) | Une garde revo-flow en plus, et la **protection de branche côté serveur** comme seule vraie garantie |
+| Approbation | Bloquée pendant un suivi ; la revue de `/ship` est `/code-review` en local, pas une approbation | Personne n'approuve à la place d'un humain : ni `/ship`, ni revo-flow |
+| Suivi | Dans la session, 7 jours au plus, machine allumée, branche extraite ; s'arrête sur `/clear`, `/resume`, Échap | À dire dans le message de fin de flow |
+| Hooks | Un hook qui peut *autoriser* des commandes empêche un suivi ; les hooks d'outils ne voient pas les appels `gh`/`git` propres à Claude Code | La garde revo-flow ne fait que refuser ; à vérifier en vrai qu'elle ne bloque pas un suivi |
+
+### Le parcours proposé
+
+1. **Fin de flow vérifié (porte verte)** : revo-flow demande « Ouvrir une MR pour « <titre> » ? »
+   (`Brouillon` / `Prête à relire` / `Pas maintenant`). Un flow terminé non vérifié ne propose rien.
+2. **revo-flow fait les commandes lui-même**, comme pour la porte, pas l'orchestrateur :
+   - branche : sur la branche par défaut, `revo/<slug-du-titre>` est créée ; sur une autre branche, elle est gardée ;
+   - commit des **seuls fichiers du flow** (ceux de la portée de la porte), jamais `git add -A` ; message au style des
+     derniers commits du dépôt (gitmoji compris) ;
+   - push de la branche avec `-u`, **jamais** vers la branche par défaut ;
+   - ouverture : `gh pr create` (GitHub) ou `glab mr create` (GitLab), description = le rapport de flow (plan, verdict
+     de la porte, critères, CRAP, coût). Les captures restent locales (chemins listés, pas d'envoi).
+3. **Message de fin** : lien de la PR ou de la MR, puis « Tape `/ship` pour la revue et le suivi (CI, conflits,
+   commentaires) jusqu'au merge, que tu fais toi-même. Session ouverte, 7 jours au plus. » Sur GitLab, la commande
+   exacte avec la branche de base. Le lien va aussi dans le rapport de flow.
+
+La consigne de l'orchestrateur (`hooks/lib.ts`, « pas de commit, de push ni de MR sans que l'utilisateur le demande »)
+reste : la réponse à la question de l'étape 1 *est* la demande, et c'est revo-flow qui agit, pas le modèle.
+
+### La garde anti-merge
+
+Dans le hook `tool.call` existant (celui qui met le vérificateur en lecture seule), une fonction pure
+`mergeDenial(command, { defaut, courante })` dans `hooks/merge.ts`, pour **tous** les appels Bash et PowerShell, dans un
+flow ou non :
+
+| Refusé | Exemples |
+|---|---|
+| Merge par la CLI | `gh pr merge` (avec ou sans `--auto`), `glab mr merge`, `glab mr update --auto-merge` |
+| Merge par l'API | `gh api` / `glab api` / `curl` vers `…/pulls/<n>/merge`, `…/merge_requests/<n>/merge` |
+| Merge au push (GitLab) | `git push -o merge_request.merge_when_pipeline_succeeds`, `-o merge_request.auto_merge` |
+| Push sur la branche par défaut | `git push … main`, `HEAD:main`, `master`, la branche par défaut lue par `git symbolic-ref refs/remotes/origin/HEAD` dans le dossier du push (`cd`, `git -C`) ; tout `--force` vers elle ; tout push sans branche nommée (`git push`, `HEAD`, `@`) : sa destination dépend du dossier du shell, de push.default et de l'amont (revue de la PR #2) |
+| Modifier main par l'API (revue /ship) | `repos/o/r/merges`, écriture de `git/refs/heads/<protégée>`, `ref=refs/heads/<protégée>`, `mergeBranch`, `enqueuePullRequest`, train de merge GitLab, `contents` (sans `branch` : branche par défaut), commits et fichiers GitLab, `createCommitOnBranch`, `updateRef` |
+
+Message de refus : « revo-flow : le merge et le push sur <branche> sont réservés à l'utilisateur. Fusionne toi-même
+depuis GitHub ou GitLab. » Option `gardeMerge` : oui ou non, activée par défaut (coupée, pour un projet perso).
+La garde est au mieux (une commande détournée peut passer) : le README le dit, et `doctor` rappelle d'activer la
+protection de branche (GitLab : *Allowed to merge* = Maintainers, approbation requise ; GitHub : règle de branche avec
+une approbation). À vérifier : une commande lancée par l'utilisateur avec le préfixe `!` passe-t-elle par `tool.call` ?
+
+### `doctor`
+
+Une ligne `Livraison` : forge (GitHub, GitHub Enterprise, GitLab et son hôte, autre), CLI présente et connectée
+(`gh auth status`, `glab auth status --hostname <hôte>`), branche par défaut, état de la garde. Sans `glab` :
+« `brew install glab` puis `glab auth login --hostname <hôte>` ». Autre forge : la livraison est coupée, `/ship` peut
+encore relire.
+
+### GitLab auto-hébergé (le cas de l'auteur en entreprise)
+
+Le GitLab de l'entreprise est sur un hôte à elle, dont le nom ne contient pas forcément « gitlab ». La détection ne
+peut donc pas se fier à l'URL seule. Ordre retenu :
+
+1. l'hôte du remote `origin` (`git remote get-url origin`, SSH ou HTTPS) ;
+2. `github.com`, ou un hôte connu de `gh auth status` → GitHub ;
+3. un hôte connu de `glab auth status` (ou de `~/.config/glab-cli/config.yml`) → GitLab sur cet hôte ;
+4. sinon, un `.gitlab-ci.yml` à la racine → GitLab probable, à confirmer : `doctor` dit « `glab auth login --hostname
+   <hôte>` » ;
+5. sinon, autre forge : pas de livraison.
+
+Toutes les commandes `glab` reçoivent l'hôte (`GITLAB_HOST=<hôte>`), jamais le gitlab.com par défaut. Points propres
+à un hôte interne, à vérifier au premier essai : certificat d'une autorité interne (`glab` doit la connaître), VPN
+nécessaire (un échec réseau donne un message clair, pas une MR à moitié créée : le push et l'ouverture sont
+séparés, et un push réussi sans MR est dit tel quel), et `/ship` qui lit la MR par git avec ta connexion git (pas
+de `glab`) : lui passer la branche de base.
+
+### Décisions
+
+| Point | Décision |
+|---|---|
+| Option `livraison` | `demander` (défaut) ou `off` |
+| Option `gardeMerge` | Interrupteur oui/non, activé par défaut (demande de l'auteur, plutôt que `jamais`/`libre`) |
+| Qui lance `/ship` | L'utilisateur, toujours (imposé par Claude Code) |
+| Approbation | Jamais par revo-flow ; GitLab interdit souvent l'auto-approbation de l'auteur, et c'est ton compte qui serait l'auteur |
+| Ordre | La garde d'abord (utile tout de suite, `/ship` compris), puis la livraison GitHub, puis GitLab |
+| Tests | `mergeDenial` (module pur, chaque ligne du tableau et des faux positifs : `git merge` local, `gh pr view`) ; détection de forge ; flow complet avec de faux `gh` et `glab` (branche par défaut, branche existante, CLI absente, refus de l'utilisateur) |
+| Effort | Garde ½ jour, livraison GitHub 1 jour, GitLab ½ jour |
 
 ## 4. Écarté ou différé
 
