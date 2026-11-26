@@ -321,7 +321,14 @@ de `glab`) : lui passer la branche de base.
 - **Fichiers** : ceux marqués par les outils du flow et ceux que git voit changés depuis le lancement, filtrés par `git status` (suppressions comprises) ; `git add -A -- <fichiers>` puis `git commit -- <fichiers>` : le reste de l'index n'est pas commité.
 - **Option** booléenne `livraison` (oui par défaut), comme `gardeMerge`, plutôt que `demander`/`off`.
 - **Version 3.4.0** : la 3.2.0 est la revue d'architecture, la 3.3.0 la garde anti-merge.
-- **Reste** : GitLab (`glab mr create`, hôte auto-hébergé, `GITLAB_HOST`).
+
+### Décisions à la livraison GitLab (v3.5)
+
+- **Une table d'opérations par forge** (`OPS` dans register.tsx) : le parcours reste le même (question, branche, commit, push nommé) ; seuls changent la connexion (`glab auth status --hostname`), la branche par défaut (`glab repo view --output json`), la demande ouverte (`glab mr list --source-branch --output json`) et la création (`glab mr create … --yes`).
+- **Hôte auto-hébergé** : reconnu par `glab auth status`, un nom qui contient « gitlab » ou un `.gitlab-ci.yml`. Pas de `GITLAB_HOST` : `glab` tourne dans le dépôt et prend l'hôte de son remote.
+- **Description** : `glab` n'a pas de `--body-file` ; le rapport passe en argument, coupé à 25 000 caractères (une ligne de commande Windows plafonne à 32 767).
+- **/ship** : sur GitLab, il ne fait que relire et suivre une MR déjà poussée ; le message de fin donne la branche de base à lui passer.
+- **Pas d'essai réel** au moment de l'écriture : `glab` n'est pas installé sur le poste de l'auteur ; tout est testé avec un `glab` simulé. Version 3.5.0.
 
 ## 4. Écarté ou différé
 

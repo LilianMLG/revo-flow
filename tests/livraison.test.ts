@@ -8,12 +8,19 @@ import {
   LIVRER_POUSSER,
   LIVRER_PRETE,
   CORPS_MAX,
+  CORPS_MAX_GLAB,
+  LIVRER_POUSSER_MR,
+  argsMrCreate,
+  argsMrList,
   argsPrCreate,
   brancheDeLivraison,
   cheminsChanges,
   cibleDistante,
   corpsDePr,
+  defautDeGlab,
+  demandeDe,
   doctorLivraison,
+  finLivraison,
   fichiersDeLivraison,
   forgeDe,
   hoteDuRemote,
@@ -21,6 +28,8 @@ import {
   ligneRapport,
   messageCommit,
   questionLivraison,
+  urlDansListeMr,
+  urlDeMr,
   urlDePr,
 } from '../hooks/livraison'
 
@@ -165,10 +174,56 @@ describe('question, gh, rapport, doctor', () => {
     expect(ligneRapport('u', 'b', false, true)).toContain('Poussé sur la PR')
     expect(doctorLivraison({ option: true, forge: { forge: 'github', hote: 'github.com' }, gh: 'connecte', defaut: 'main' })).toMatch(/^GitHub \(github\.com\) · gh connecté · .*PR vers main.*jamais de merge$/)
     expect(doctorLivraison({ option: true, forge: { forge: 'github', hote: 'github.com' }, gh: 'absent' })).toContain('brew install gh')
-    expect(doctorLivraison({ option: true, forge: { forge: 'gitlab', hote: 'git.entreprise.local' } })).toContain('prochaine version')
+    expect(doctorLivraison({ option: true, forge: { forge: 'gitlab', hote: 'git.entreprise.local' } })).toContain('glab absent : installez GitLab CLI (brew install glab), puis glab auth login --hostname git.entreprise.local')
+    expect(doctorLivraison({ option: true, forge: { forge: 'gitlab', hote: 'git.entreprise.local' }, glab: 'connecte', defaut: 'main' })).toMatch(/^GitLab \(git\.entreprise\.local\) · glab connecté · .*MR vers main.*jamais de merge$/)
+    expect(doctorLivraison({ option: true, forge: { forge: 'gitlab', hote: 'g.local' }, glab: 'non-connecte' })).toContain('glab non connecté : glab auth login --hostname g.local')
     expect(doctorLivraison({ option: false, forge: { forge: 'autre' } })).toContain('désactivée')
     // revue PR #3, point 10 : sans remote, pas d'hôte inventé ; un hôte inconnu peut être un GitHub Enterprise pas connecté
     expect(doctorLivraison({ option: true, forge: { forge: 'autre' } })).toBe('aucun remote origin : pas de livraison')
     expect(doctorLivraison({ option: true, forge: { forge: 'autre', hote: 'ghe.corp' } })).toContain('gh auth login --hostname ghe.corp')
+  })
+})
+
+describe('GitLab (v3.5)', () => {
+  test('PR sur GitHub, MR sur GitLab', () => {
+    expect(demandeDe({ forge: 'github', hote: 'github.com' })).toBe('PR')
+    expect(demandeDe({ forge: 'gitlab', hote: 'git.entreprise.local' })).toBe('MR')
+  })
+
+  test('glab mr create : source, cible, titre, description en texte, sans question, --draft pour un brouillon', () => {
+    expect(argsMrCreate({ base: 'main', branche: 'revo/x', titre: 'X', description: '# Rapport', brouillon: true })).toEqual([
+      'glab', 'mr', 'create', '--source-branch', 'revo/x', '--target-branch', 'main', '--title', 'X', '--description', '# Rapport', '--yes', '--draft',
+    ])
+    expect(argsMrCreate({ base: 'develop', branche: 'f', titre: 'X', description: 'd', brouillon: false })).not.toContain('--draft')
+    expect(argsMrList('feat/x')).toEqual(['glab', 'mr', 'list', '--source-branch', 'feat/x', '--output', 'json'])
+  })
+
+  test('les URL de MR, la MR ouverte de la liste, la branche par défaut de glab repo view', () => {
+    expect(urlDeMr('Creating merge request for revo/x into main in equipe/boutique\n\n!7 X (revo/x)\n https://git.entreprise.local/equipe/boutique/-/merge_requests/7\n')).toBe('https://git.entreprise.local/equipe/boutique/-/merge_requests/7')
+    expect(urlDeMr('error: 403 Forbidden')).toBeUndefined()
+    expect(urlDansListeMr('[{"iid":7,"web_url":"https://g.local/e/b/-/merge_requests/7"}]')).toBe('https://g.local/e/b/-/merge_requests/7')
+    expect(urlDansListeMr('[]')).toBeUndefined()
+    expect(urlDansListeMr('')).toBeUndefined()
+    expect(urlDansListeMr('pas du json https://g.local/e/b/-/merge_requests/3')).toBe('https://g.local/e/b/-/merge_requests/3')
+    expect(defautDeGlab('{"id":12,"default_branch":"develop","name":"boutique"}')).toBe('develop')
+    expect(defautDeGlab('{"default_branch":""}')).toBeUndefined()
+    expect(defautDeGlab('pas du json')).toBeUndefined()
+  })
+
+  test('la question, la ligne du rapport et le message de fin disent MR ; /ship avec la branche de base', () => {
+    const q = questionLivraison({ nom: 'MR', titre: 'Promo', branche: 'revo/promo', nouvelle: true, base: 'main', fichiers: ['a.ts'], dejaSales: [] })
+    expect(q.question).toContain('ouvrir une MR vers main pour « Promo »')
+    const p = questionLivraison({ nom: 'MR', titre: 'x', branche: 'f', nouvelle: false, base: 'main', fichiers: ['a.ts'], dejaSales: [], prExistante: 'https://g.local/e/b/-/merge_requests/7' })
+    expect(p.options).toEqual([LIVRER_POUSSER_MR, LIVRER_NON])
+    expect(ligneRapport('u', 'b', true, false, 'MR')).toContain('MR ouverte en brouillon : u (branche b)')
+    expect(finLivraison({ nom: 'MR', url: 'u', brouillon: false, existante: false, base: 'develop' })).toBe('MR ouverte : u. Tape /ship pour la revue et le suivi (sur GitLab, donne-lui la branche de base develop) ; le merge reste à toi.')
+    expect(finLivraison({ nom: 'PR', url: 'u', brouillon: true, existante: false, base: 'main' })).toBe('PR ouverte en brouillon : u. Tape /ship pour la revue et le suivi ; le merge reste à toi.')
+  })
+
+  test('la description d’une MR est coupée plus tôt (elle passe en argument de glab)', () => {
+    const r = corpsDePr('x\n'.repeat(20_000), '/h/r.md', CORPS_MAX_GLAB, 'GitLab')
+    expect(r.coupe).toBe(true)
+    expect(r.texte.length).toBeLessThanOrEqual(CORPS_MAX_GLAB + 200)
+    expect(r.texte).toContain('Rapport coupé pour GitLab')
   })
 })
