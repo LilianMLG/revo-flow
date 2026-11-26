@@ -144,22 +144,38 @@ import {
   type ViewData,
 } from './ui/views'
 import {
+  CORPS_MAX,
+  CORPS_MAX_GLAB,
   LIVRER_BROUILLON,
   LIVRER_NON,
+  argsMrCreate,
+  argsMrList,
   argsPrCreate,
   brancheDeLivraison,
   cheminsChanges,
   cibleDistante,
+  conseilCli,
   corpsDePr,
+  defautDeGlab,
   doctorLivraison,
+  etatCli,
   fichiersDeLivraison,
+  finLivraison,
   forgeDe,
   hoteDuRemote,
   hotesGh,
   ligneRapport,
   messageCommit,
+  poidsArgument,
+  projetDuRemote,
   questionLivraison,
+  repoPour,
+  urlDansListeMr,
+  urlDeMr,
   urlDePr,
+  type Demande,
+  type EtatCli,
+  type Forge,
 } from './livraison'
 import { brancheParDefaut, dossiersDuPush, mergeDenial, refusPrudent, type MergeContexte } from './merge'
 import { rapportMarkdown } from './rapport'
@@ -844,48 +860,118 @@ async function finishFlow($: $) {
  * Une commande dans la racine du projet, sans jamais lever : réussie ou non, et sa sortie (stdout, puis stderr s'il y en a).
  * Jamais rognée : l'espace de tête d'une ligne de git status --porcelain fait partie du format.
  */
-async function commande($: $, racine: string, argv: string[], timeoutMs = 60_000): Promise<{ ok: boolean; sortie: string; stdout: string }> {
+type Sortie = { ok: boolean; sortie: string; stdout: string; lance: boolean; code?: number }
+async function commande($: $, racine: string, argv: string[], timeoutMs = 60_000): Promise<Sortie> {
   try {
     const r = await $.process.run(argv, { cwd: racine, timeoutMs })
-    return { ok: r.exitCode === 0, sortie: r.stderr ? `${r.stdout}\n${r.stderr}` : r.stdout, stdout: r.exitCode === 0 ? r.stdout : '' }
+    return { ok: r.exitCode === 0, sortie: r.stderr ? `${r.stdout}\n${r.stderr}` : r.stdout, stdout: r.exitCode === 0 ? r.stdout : '', lance: true, code: r.exitCode ?? undefined }
   } catch (err) {
-    return { ok: false, sortie: err instanceof Error ? err.message : String(err), stdout: '' }
+    // Le programme n'a pas pu être lancé (introuvable) : c'est ce qui distingue « absent » d'une erreur de connexion.
+    return { ok: false, sortie: err instanceof Error ? err.message : String(err), stdout: '', lance: false }
   }
 }
 
-/**
- * La branche par défaut du dépôt : origin/HEAD si git le connaît (posé par git clone), sinon celle que GitHub donne (gh repo
- * view) ; undefined si aucun des deux ne répond : la livraison ne devine pas.
- */
-async function brancheDefautDe($: $, racine: string): Promise<string | undefined> {
-  const local = await commande($, racine, ['git', 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], 10_000)
-  const lu = brancheParDefaut(local.stdout)
-  if (lu) return lu
-  const gh = await commande($, racine, ['gh', 'repo', 'view', '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name'], 30_000)
-  const nom = gh.stdout.trim()
-  return nom && !/\s/.test(nom) ? nom : undefined
+/** Les commandes propres à une forge : connexion, branche par défaut, demande ouverte de la branche, création. */
+type OpsForge = {
+  nom: Demande
+  forge: string
+  cli: 'gh' | 'glab'
+  /** `repo` : le projet d'origin (--repo), pour que gh et glab ne prennent pas `upstream`. */
+  defaut: (repo?: string) => string[]
+  lireDefaut: (stdout: string) => string | undefined
+  ouverte: (cible: string, repo?: string) => string[]
+  lireOuverte: (stdout: string) => string | undefined
+  /** La création : la description vient d'un fichier (gh) ou passe en texte (glab). */
+  creer: (o: { base: string; branche: string; titre: string; fichier: string; texte: string; brouillon: boolean; repo?: string }) => string[]
+  lireUrl: (stdout: string) => string | undefined
+  corpsMax: number
+  /** gh lit la description dans un fichier ; glab la reçoit en argument, mesurée une fois échappée. */
+  corpsFichier: boolean
+}
+
+const nomDeBranche = (stdout: string) => {
+  const n = stdout.trim()
+  return n && !/\s/.test(n) ? n : undefined
+}
+
+const OPS: Record<'github' | 'gitlab', OpsForge> = {
+  github: {
+    nom: 'PR',
+    forge: 'GitHub',
+    cli: 'gh',
+    defaut: repo => ['gh', 'repo', 'view', ...(repo ? [repo] : []), '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name'],
+    lireDefaut: nomDeBranche,
+    ouverte: (cible, repo) => ['gh', 'pr', 'list', ...(repo ? ['--repo', repo] : []), '--head', cible, '--state', 'open', '--json', 'url', '--jq', '.[0].url'],
+    lireOuverte: urlDePr,
+    creer: o => argsPrCreate({ base: o.base, branche: o.branche, titre: o.titre, corps: o.fichier, brouillon: o.brouillon, ...(o.repo ? { repo: o.repo } : {}) }),
+    lireUrl: urlDePr,
+    corpsMax: CORPS_MAX,
+    corpsFichier: true,
+  },
+  // GitLab auto-hébergé compris : --repo (URL web d'origin) fixe le projet et son hôte.
+  gitlab: {
+    nom: 'MR',
+    forge: 'GitLab',
+    cli: 'glab',
+    defaut: repo => ['glab', 'repo', 'view', ...(repo ? [repo] : []), '--output', 'json'],
+    lireDefaut: defautDeGlab,
+    ouverte: (cible, repo) => argsMrList(cible, repo),
+    lireOuverte: urlDansListeMr,
+    creer: o => argsMrCreate({ base: o.base, branche: o.branche, titre: o.titre, description: o.texte, brouillon: o.brouillon, ...(o.repo ? { repo: o.repo } : {}) }),
+    lireUrl: urlDeMr,
+    corpsMax: CORPS_MAX_GLAB,
+    corpsFichier: false,
+  },
 }
 
 /**
- * La livraison d'un flow vérifié sur GitHub : sur l'accord de l'utilisateur, revo-flow crée la branche si besoin (revo/<titre>
- * depuis une branche protégée), commite les seuls fichiers du flow, pousse la branche en la nommant et ouvre la PR avec le
- * rapport en description (ou pousse sur la PR ouverte de la branche). Il ne fusionne jamais. Chaque étape qui échoue arrête la
- * livraison et le dit dans un toast ; rien n'est défait. Sans gh connecté, hors GitHub, sans personne à qui demander : rien.
+ * La forge du dépôt : l'hôte du remote origin (sortie d'un git réussi seulement), reconnu par gh, glab ou son nom (un
+ * .gitlab-ci.yml aussi si `ciGitlab` : doctor seulement, la livraison ne parie pas dessus) ; l'état de gh et de glab sur cet
+ * hôte, leur sortie d'erreur, et le projet d'origin pour --repo. glab n'est pas interrogé pour github.com.
+ */
+async function forgeDuDepot($: $, racine: string, ciGitlab = false): Promise<{ forge: Forge; gh: EtatCli; glab: EtatCli; detail: { gh: string; glab: string }; projet?: { hote: string; chemin: string } }> {
+  const url = (await commande($, racine, ['git', 'remote', 'get-url', 'origin'], 10_000)).stdout
+  const hote = hoteDuRemote(url)
+  if (!hote) return { forge: { forge: 'autre' }, gh: 'absent', glab: 'absent', detail: { gh: '', glab: '' } }
+  const gh = await commande($, racine, ['gh', 'auth', 'status', '--hostname', hote], 15_000)
+  const glab: Sortie = hote === 'github.com' ? { ok: false, sortie: '', stdout: '', lance: false } : await commande($, racine, ['glab', 'auth', 'status', '--hostname', hote], 15_000)
+  const gitlabCi = ciGitlab && (await $.fs.exists(`${normalizePath(racine)}/.gitlab-ci.yml`).catch(() => false))
+  const forge = forgeDe(hote, { ghHotes: hotesGh(gh.sortie), glabHotes: hotesGh(glab.sortie), gitlabCi })
+  const projet = projetDuRemote(url)
+  return { forge, gh: etatCli(gh), glab: etatCli(glab), detail: { gh: gh.sortie, glab: glab.sortie }, ...(projet ? { projet } : {}) }
+}
+
+/**
+ * La branche par défaut du dépôt : origin/HEAD si git le connaît (posé par git clone), sinon celle que la forge donne (gh repo
+ * view, glab repo view) ; undefined si aucun ne répond : la livraison ne devine pas.
+ */
+async function brancheDefautDe($: $, racine: string, ops: OpsForge, repo?: string): Promise<string | undefined> {
+  const local = await commande($, racine, ['git', 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], 10_000)
+  const lu = brancheParDefaut(local.stdout)
+  if (lu) return lu
+  return ops.lireDefaut((await commande($, racine, ops.defaut(repo), 30_000)).stdout)
+}
+
+/**
+ * La livraison d'un flow vérifié sur GitHub (PR, gh) ou GitLab (MR, glab, auto-hébergé compris) : sur l'accord de
+ * l'utilisateur, revo-flow crée la branche si besoin (revo/<titre> depuis une branche protégée), commite les seuls fichiers du
+ * flow, pousse la branche en la nommant et ouvre la PR ou la MR avec le rapport en description (ou pousse sur celle qui est
+ * déjà ouverte). Il ne fusionne jamais. Chaque étape qui échoue arrête la livraison et le dit dans un toast ; rien n'est
+ * défait. Sans gh ou glab connecté, hors GitHub et GitLab, sans personne à qui demander : rien.
  */
 async function livrer($: $, flow: Flow, verif: VerifJournal | undefined, g: Gate | undefined, rapport: string | undefined) {
   if (!opts.livraison || !g || flow.isStopped || verif?.etat !== 'verifie' || !rapport) return
   const racine = g.ref.racine
   const git = (args: string[], timeoutMs?: number) => commande($, racine, ['git', '-c', 'core.quotepath=false', ...args], timeoutMs)
-  const origine = await git(['remote', 'get-url', 'origin'])
-  const hote = hoteDuRemote(origine.stdout)
-  if (!hote) return
-  const auth = await commande($, racine, ['gh', 'auth', 'status', '--hostname', hote], 15_000)
-  const forge = forgeDe(hote, { ghHotes: hotesGh(auth.sortie) })
-  if (forge.forge !== 'github') return
-  if (!auth.ok) {
-    $.ui.toast(`revo-flow : gh absent ou non connecté à ${hote} : pas de PR proposée (gh auth login --hostname ${hote}).`)
+  const depot = await forgeDuDepot($, racine)
+  const forge = depot.forge
+  if (forge.forge === 'autre') return
+  const ops = OPS[forge.forge]
+  if (depot[ops.cli] !== 'connecte') {
+    $.ui.toast(`revo-flow : pas de ${ops.nom} proposée : ${conseilCli(ops.cli, depot[ops.cli], forge.hote, depot.detail[ops.cli])}.`)
     return
   }
+  const repo = depot.projet ? repoPour(ops.cli, depot.projet) : undefined
   const lecture = await git(['status', '--porcelain', '-z', '--untracked-files=all'])
   if (!lecture.ok) return
   const statut = parseStatus(lecture.stdout)
@@ -894,26 +980,30 @@ async function livrer($: $, flow: Flow, verif: VerifJournal | undefined, g: Gate
   if (!fichiers.length) return
   const courante = (await git(['rev-parse', '--abbrev-ref', 'HEAD'])).stdout.trim()
   if (!courante) return
-  const base = await brancheDefautDe($, racine)
+  const base = await brancheDefautDe($, racine, ops, repo)
   if (!base) {
-    $.ui.toast('revo-flow : branche par défaut du dépôt illisible (ni origin/HEAD, ni gh repo view) : pas de PR proposée.')
+    $.ui.toast(`revo-flow : branche par défaut du dépôt illisible (ni origin/HEAD, ni ${ops.cli} repo view) : pas de ${ops.nom} proposée.`)
     return
   }
   const existantes = (await git(['branch', '-a', '--format=%(refname:short)'])).stdout.split(/\r?\n/)
   const { branche, nouvelle } = brancheDeLivraison(courante, base, flow.title, existantes)
-  // Une branche de travail qui suit une autre branche d'origin (wip → origin/feature-login) pousse là, où sa PR est ouverte.
+  // Une branche de travail qui suit une autre branche d'origin (wip → origin/feature-login) pousse là, où sa PR ou sa MR est ouverte.
   const amont = nouvelle ? undefined : (await git(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'])).stdout.trim()
   const cible = cibleDistante(amont, branche)
   const reference = amont ? '@{upstream}' : `origin/${base}`
   const enAvance = Number.parseInt((await git(['rev-list', '--count', `${reference}..HEAD`])).stdout.trim(), 10) || 0
-  const ouverte = nouvelle ? undefined : urlDePr((await commande($, racine, ['gh', 'pr', 'list', '--head', cible, '--state', 'open', '--json', 'url', '--jq', '.[0].url'], 30_000)).stdout)
-  // La description : le rapport, coupé à côté de lui (<titre>.pr.md) s'il dépasse la limite de GitHub. Prête avant tout commit.
+  const ouverte = nouvelle ? undefined : ops.lireOuverte((await commande($, racine, ops.ouverte(cible, repo), 30_000)).stdout)
+  // La description, prête avant tout commit : le rapport, coupé s'il dépasse ce que la forge accepte. gh la lit dans un fichier
+  // (<titre>.pr.md quand elle est coupée) ; glab la reçoit en argument, mesurée une fois échappée pour Windows.
   const lu = await $.fs.read(rapport).catch(() => '')
   const texteRapport = typeof lu === 'string' ? lu : ''
-  const corps = corpsDePr(texteRapport, rapport)
-  const fichierCorps = corps.coupe ? rapport.replace(/\.md$/, '.pr.md') : rapport
-  if (corps.coupe && !(await $.fs.write(fichierCorps, corps.texte).then(() => true, () => false))) return
-  const q = questionLivraison({ titre: flow.title, branche, nouvelle, base, fichiers, dejaSales, horsOutils, enAvance, ...(ouverte ? { prExistante: ouverte } : {}) })
+  const corps = corpsDePr(texteRapport, rapport, ops.corpsMax, ops.forge, ops.corpsFichier ? undefined : poidsArgument)
+  const fichierCorps = corps.coupe && ops.corpsFichier ? rapport.replace(/\.md$/, '.pr.md') : rapport
+  if (corps.coupe && ops.corpsFichier && !(await $.fs.write(fichierCorps, corps.texte).then(() => true, () => false))) {
+    $.ui.toast(`revo-flow : impossible d'écrire ${fichierCorps} (description coupée) : pas de ${ops.nom} proposée.`)
+    return
+  }
+  const q = questionLivraison({ nom: ops.nom, titre: flow.title, branche, nouvelle, base, fichiers, dejaSales, horsOutils, enAvance, ...(ouverte ? { prExistante: ouverte } : {}) })
   const { answer } = await askHow($, q.question, q.options, { headless: LIVRER_NON, dismissed: LIVRER_NON })
   if (answer === LIVRER_NON || !q.options.includes(answer)) return
   const echec = (etape: string, sortie: string) =>
@@ -933,15 +1023,15 @@ async function livrer($: $, flow: Flow, verif: VerifJournal | undefined, g: Gate
   const brouillon = answer === LIVRER_BROUILLON
   let url = ouverte
   if (!url) {
-    const pr = await commande($, racine, argsPrCreate({ base, branche: cible, titre: flow.title, corps: fichierCorps, brouillon }), 60_000)
-    url = urlDePr(pr.stdout)
-    if (!pr.ok || !url) return echec('gh pr create', pr.sortie)
+    const creation = await commande($, racine, ops.creer({ base, branche: cible, titre: flow.title, fichier: fichierCorps, texte: corps.texte, brouillon, ...(repo ? { repo } : {}) }), 60_000)
+    url = ops.lireUrl(creation.stdout) ?? ops.lireUrl(creation.sortie)
+    if (!creation.ok || !url) return echec(`${ops.cli} ${ops.nom === 'MR' ? 'mr' : 'pr'} create`, creation.sortie)
   }
-  if (texteRapport) await $.fs.write(rapport, `${texteRapport.trimEnd()}\n${ligneRapport(url, cible, brouillon, !!ouverte)}`).catch(() => undefined)
+  if (texteRapport) await $.fs.write(rapport, `${texteRapport.trimEnd()}\n${ligneRapport(url, cible, brouillon, !!ouverte, ops.nom)}`).catch(() => undefined)
   await setFlow($, f => (f.id === flow.id ? { ...f, livraison: { url, branche: cible } } : f))
-  const fait = ouverte ? `poussé sur la PR ${url}` : `PR ${brouillon ? 'ouverte en brouillon' : 'ouverte'} : ${url}`
-  $.ui.toast(`revo-flow · « ${flow.title} » : ${fait}. Tape /ship pour la revue et le suivi ; le merge reste à toi.`)
-  await notify($, `« ${flow.title} » : ${fait}`)
+  const fin = finLivraison({ nom: ops.nom, url, brouillon, existante: !!ouverte, base })
+  $.ui.toast(`revo-flow · « ${flow.title} » : ${fin}`)
+  await notify($, `« ${flow.title} » : ${fin.split('. ')[0]}`)
 }
 
 /** Le journal des flows (store du plugin), les plus récents d'abord. */
@@ -4683,20 +4773,18 @@ async function doctorCommand($: $): Promise<string> {
     pieges,
     web: await webDispo($, ref, graph, readMap),
     mobile: await mobileDispo($, ref, graph, readMap, true),
-    livraison: await livraisonDispo($, ref.racine, files.includes('.gitlab-ci.yml')),
+    livraison: await livraisonDispo($, ref.racine),
   })
 }
 
-/** La ligne Livraison de doctor : forge du remote origin, gh présent et connecté, branche par défaut. Lectures seulement. */
-async function livraisonDispo($: $, racine: string, gitlabCi: boolean): Promise<string> {
+/** La ligne Livraison de doctor : forge du remote origin, gh ou glab présent et connecté, branche par défaut. Lectures seulement. */
+async function livraisonDispo($: $, racine: string): Promise<string> {
   if (!opts.livraison) return doctorLivraison({ option: false, forge: { forge: 'autre' } })
-  // Seule la sortie d'une commande réussie compte : sans remote origin, le message d'erreur de git n'est pas un hôte.
-  const hote = hoteDuRemote((await commande($, racine, ['git', 'remote', 'get-url', 'origin'], 10_000)).stdout)
-  const auth = hote ? await commande($, racine, ['gh', 'auth', 'status', '--hostname', hote], 15_000) : { ok: false, sortie: '', stdout: '' }
-  const forge = forgeDe(hote, { ghHotes: hotesGh(auth.sortie), gitlabCi })
-  const defaut = forge.forge === 'github' ? await brancheDefautDe($, racine) : undefined
-  const gh = auth.ok ? 'connecte' : /not logged|non connect|gh auth login/i.test(auth.sortie) ? 'non-connecte' : 'absent'
-  return doctorLivraison({ option: true, forge, gh, ...(defaut ? { defaut } : {}) })
+  const depot = await forgeDuDepot($, racine, true)
+  const forge = depot.forge
+  const ops = forge.forge === 'autre' ? undefined : OPS[forge.forge]
+  const defaut = ops ? await brancheDefautDe($, racine, ops, depot.projet ? repoPour(ops.cli, depot.projet) : undefined) : undefined
+  return doctorLivraison({ option: true, forge, gh: depot.gh, glab: depot.glab, ...(ops ? { detail: depot.detail[ops.cli] } : {}), ...(defaut ? { defaut } : {}) })
 }
 
 // ── Les hooks ────────────────────────────────────────────────────────────

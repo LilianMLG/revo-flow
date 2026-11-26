@@ -8,19 +8,33 @@ import {
   LIVRER_POUSSER,
   LIVRER_PRETE,
   CORPS_MAX,
+  CORPS_MAX_GLAB,
+  LIVRER_POUSSER_MR,
+  argsMrCreate,
+  argsMrList,
   argsPrCreate,
   brancheDeLivraison,
   cheminsChanges,
   cibleDistante,
+  conseilCli,
   corpsDePr,
+  defautDeGlab,
+  demandeDe,
   doctorLivraison,
+  etatCli,
+  finLivraison,
   fichiersDeLivraison,
   forgeDe,
   hoteDuRemote,
   hotesGh,
   ligneRapport,
   messageCommit,
+  poidsArgument,
+  projetDuRemote,
   questionLivraison,
+  repoPour,
+  urlDansListeMr,
+  urlDeMr,
   urlDePr,
 } from '../hooks/livraison'
 
@@ -165,10 +179,95 @@ describe('question, gh, rapport, doctor', () => {
     expect(ligneRapport('u', 'b', false, true)).toContain('Poussé sur la PR')
     expect(doctorLivraison({ option: true, forge: { forge: 'github', hote: 'github.com' }, gh: 'connecte', defaut: 'main' })).toMatch(/^GitHub \(github\.com\) · gh connecté · .*PR vers main.*jamais de merge$/)
     expect(doctorLivraison({ option: true, forge: { forge: 'github', hote: 'github.com' }, gh: 'absent' })).toContain('brew install gh')
-    expect(doctorLivraison({ option: true, forge: { forge: 'gitlab', hote: 'git.entreprise.local' } })).toContain('prochaine version')
+    expect(doctorLivraison({ option: true, forge: { forge: 'gitlab', hote: 'git.entreprise.local' } })).toContain('glab absent : installez GitLab CLI (brew install glab), puis glab auth login --hostname git.entreprise.local')
+    expect(doctorLivraison({ option: true, forge: { forge: 'gitlab', hote: 'git.entreprise.local' }, glab: 'connecte', defaut: 'main' })).toMatch(/^GitLab \(git\.entreprise\.local\) · glab connecté · .*MR vers main.*jamais de merge$/)
+    expect(doctorLivraison({ option: true, forge: { forge: 'gitlab', hote: 'g.local' }, glab: 'non-connecte' })).toContain('glab non connecté : glab auth login --hostname g.local')
     expect(doctorLivraison({ option: false, forge: { forge: 'autre' } })).toContain('désactivée')
     // revue PR #3, point 10 : sans remote, pas d'hôte inventé ; un hôte inconnu peut être un GitHub Enterprise pas connecté
     expect(doctorLivraison({ option: true, forge: { forge: 'autre' } })).toBe('aucun remote origin : pas de livraison')
     expect(doctorLivraison({ option: true, forge: { forge: 'autre', hote: 'ghe.corp' } })).toContain('gh auth login --hostname ghe.corp')
+    // revue PR #4, point 6 : un hôte non reconnu peut aussi être un GitLab pas encore connecté
+    expect(doctorLivraison({ option: true, forge: { forge: 'autre', hote: 'git.entreprise.local' } })).toContain('un GitLab : glab auth login --hostname git.entreprise.local')
+  })
+})
+
+describe('GitLab (v3.5)', () => {
+  test('PR sur GitHub, MR sur GitLab', () => {
+    expect(demandeDe({ forge: 'github', hote: 'github.com' })).toBe('PR')
+    expect(demandeDe({ forge: 'gitlab', hote: 'git.entreprise.local' })).toBe('MR')
+  })
+
+  test('glab mr create : source, cible, titre, description en texte, sans question, --draft pour un brouillon', () => {
+    expect(argsMrCreate({ base: 'main', branche: 'revo/x', titre: 'X', description: '# Rapport', brouillon: true })).toEqual([
+      'glab', 'mr', 'create', '--source-branch', 'revo/x', '--target-branch', 'main', '--title', 'X', '--description', '# Rapport', '--yes', '--draft',
+    ])
+    expect(argsMrCreate({ base: 'develop', branche: 'f', titre: 'X', description: 'd', brouillon: false })).not.toContain('--draft')
+    expect(argsMrList('feat/x')).toEqual(['glab', 'mr', 'list', '--source-branch', 'feat/x', '--output', 'json'])
+  })
+
+  test('les URL de MR, la MR ouverte de la liste, la branche par défaut de glab repo view', () => {
+    expect(urlDeMr('Creating merge request for revo/x into main in equipe/boutique\n\n!7 X (revo/x)\n https://git.entreprise.local/equipe/boutique/-/merge_requests/7\n')).toBe('https://git.entreprise.local/equipe/boutique/-/merge_requests/7')
+    expect(urlDeMr('error: 403 Forbidden')).toBeUndefined()
+    expect(urlDansListeMr('[{"iid":7,"web_url":"https://g.local/e/b/-/merge_requests/7"}]')).toBe('https://g.local/e/b/-/merge_requests/7')
+    expect(urlDansListeMr('[]')).toBeUndefined()
+    expect(urlDansListeMr('')).toBeUndefined()
+    expect(urlDansListeMr('pas du json https://g.local/e/b/-/merge_requests/3')).toBe('https://g.local/e/b/-/merge_requests/3')
+    expect(defautDeGlab('{"id":12,"default_branch":"develop","name":"boutique"}')).toBe('develop')
+    expect(defautDeGlab('{"default_branch":""}')).toBeUndefined()
+    expect(defautDeGlab('pas du json')).toBeUndefined()
+  })
+
+  test('la question, la ligne du rapport et le message de fin disent MR ; /ship avec la branche de base', () => {
+    const q = questionLivraison({ nom: 'MR', titre: 'Promo', branche: 'revo/promo', nouvelle: true, base: 'main', fichiers: ['a.ts'], dejaSales: [] })
+    expect(q.question).toContain('ouvrir une MR vers main pour « Promo »')
+    const p = questionLivraison({ nom: 'MR', titre: 'x', branche: 'f', nouvelle: false, base: 'main', fichiers: ['a.ts'], dejaSales: [], prExistante: 'https://g.local/e/b/-/merge_requests/7' })
+    expect(p.options).toEqual([LIVRER_POUSSER_MR, LIVRER_NON])
+    expect(ligneRapport('u', 'b', true, false, 'MR')).toContain('MR ouverte en brouillon : u (branche b)')
+    expect(finLivraison({ nom: 'MR', url: 'u', brouillon: false, existante: false, base: 'develop' })).toBe('MR ouverte : u. Tape /ship pour la revue et le suivi (sur GitLab, donne-lui la branche de base develop) ; le merge reste à toi.')
+    expect(finLivraison({ nom: 'PR', url: 'u', brouillon: true, existante: false, base: 'main' })).toBe('PR ouverte en brouillon : u. Tape /ship pour la revue et le suivi ; le merge reste à toi.')
+  })
+
+  test('la description d’une MR est coupée plus tôt (elle passe en argument de glab)', () => {
+    const r = corpsDePr('x\n'.repeat(20_000), '/h/r.md', CORPS_MAX_GLAB, 'GitLab')
+    expect(r.coupe).toBe(true)
+    expect(r.texte.length).toBeLessThanOrEqual(CORPS_MAX_GLAB + 200)
+    expect(r.texte).toContain('Rapport coupé pour GitLab')
+  })
+})
+
+describe('revue de la PR #4', () => {
+  test('point 1 : une description de MR est mesurée une fois échappée (guillemets et antislashs comptent double)', () => {
+    expect(poidsArgument('a"b\\c')).toBe(7)
+    // 6 caractères bruts, 9 une fois échappés : sous la limite en longueur, au-dessus en poids.
+    const rapport = `${'"x\\y" '.repeat(1700)}\n`.repeat(2)
+    expect(rapport.length).toBeLessThan(CORPS_MAX_GLAB)
+    expect(poidsArgument(rapport)).toBeGreaterThan(CORPS_MAX_GLAB)
+    const r = corpsDePr(rapport, '/h/r.md', CORPS_MAX_GLAB, 'GitLab', poidsArgument)
+    expect(r.coupe).toBe(true)
+    expect(poidsArgument(r.texte)).toBeLessThanOrEqual(CORPS_MAX_GLAB)
+    // sans guillemets ni antislash, rien ne change
+    expect(corpsDePr('court', '/h/r.md', CORPS_MAX_GLAB, 'GitLab', poidsArgument)).toEqual({ texte: 'court', coupe: false })
+  })
+
+  test('point 2 : le projet d’origin pour --repo, https, ssh, scp, sous-groupes ; gh sans schéma, glab en URL', () => {
+    expect(projetDuRemote('git@git.entreprise.local:equipe/web/boutique.git')).toEqual({ hote: 'git.entreprise.local', chemin: 'equipe/web/boutique' })
+    expect(projetDuRemote('ssh://git@git.entreprise.local:2222/equipe/boutique.git')).toEqual({ hote: 'git.entreprise.local', chemin: 'equipe/boutique' })
+    expect(projetDuRemote('https://github.com/moi/app.git')).toEqual({ hote: 'github.com', chemin: 'moi/app' })
+    expect(projetDuRemote('https://github.com/moi')).toBeUndefined()
+    expect(projetDuRemote('/srv/depot.git')).toBeUndefined()
+    expect(repoPour('gh', { hote: 'github.com', chemin: 'moi/app' })).toBe('github.com/moi/app')
+    expect(repoPour('glab', { hote: 'g.local', chemin: 'e/b' })).toBe('https://g.local/e/b')
+    expect(argsMrList('f', 'https://g.local/e/b')).toEqual(['glab', 'mr', 'list', '--repo', 'https://g.local/e/b', '--source-branch', 'f', '--output', 'json'])
+    expect(argsPrCreate({ base: 'main', branche: 'b', titre: 't', corps: 'r.md', brouillon: false, repo: 'github.com/o/r' }).slice(3, 5)).toEqual(['--repo', 'github.com/o/r'])
+  })
+
+  test('point 4 : absent seulement s’il n’a pas pu être lancé ; une erreur de certificat ou de réseau est une erreur', () => {
+    expect(etatCli({ ok: true, lance: true, code: 0, sortie: '' })).toBe('connecte')
+    expect(etatCli({ ok: false, lance: false, sortie: 'spawn glab ENOENT' })).toBe('absent')
+    expect(etatCli({ ok: false, lance: true, code: 127, sortie: '' })).toBe('absent')
+    expect(etatCli({ ok: false, lance: true, code: 1, sortie: 'x git.corp: no token found' })).toBe('non-connecte')
+    expect(etatCli({ ok: false, lance: true, code: 1, sortie: 'x509: certificate signed by unknown authority' })).toBe('erreur')
+    expect(conseilCli('glab', 'erreur', 'git.corp', 'x509: certificate signed by unknown authority\nautre')).toBe('glab en erreur sur git.corp (x509: certificate signed by unknown authority)')
+    expect(doctorLivraison({ option: true, forge: { forge: 'gitlab', hote: 'git.corp' }, glab: 'erreur', detail: 'dial tcp: i/o timeout' })).toContain('glab en erreur sur git.corp (dial tcp: i/o timeout)')
   })
 })

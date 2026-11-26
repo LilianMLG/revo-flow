@@ -2402,6 +2402,7 @@ test('livraison : flow vérifié sur main → question ; « Brouillon » → rev
   expect(cmds.find(c => c.includes('push'))!.slice(-3)).toEqual(['-u', 'origin', `${branche}:${branche}`])
   const pr = cmds.find(c => c[0] === 'gh')!
   expect(pr).toContain('--draft')
+  expect(pr[pr.indexOf('--repo') + 1]).toBe('github.com/moi/boutique')
   expect(pr[pr.indexOf('--base') + 1]).toBe('main')
   expect(pr[pr.indexOf('--body-file') + 1]).toMatch(/\/rapports\/.+\.md$/)
   // Dans cet ordre : branche, ajout, commit, push, PR.
@@ -2459,4 +2460,85 @@ test('livraison : branche par défaut illisible (ni origin/HEAD, ni gh) → pas 
   await finirVerifie($, w, etat, 'Brouillon')
   expect(questionsLivraison(w)).toEqual([])
   expect(cmds).toEqual([])
+})
+
+/** Un dépôt sur un GitLab hébergé par l'entreprise (nom sans « gitlab »), glab connecté, gh non : la MR. */
+function depotGitlab(w: ReturnType<typeof world>, etat: { fini: boolean; glab: 'connecte' | 'non-connecte' | 'absent'; gitlabCi?: boolean }) {
+  const cmds: string[][] = []
+  if (etat.gitlabCi) w.disk[diskKey(`${ROOT}/.gitlab-ci.yml`)] = 'stages: [test]'
+  w.runAvant.repond = a => {
+    const res = (stdout: string, exitCode = 0, stderr = '') => ({ value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false } })
+    const j = a.join(' ')
+    if (/remote get-url origin/.test(j)) return res('git@git.entreprise.local:equipe/boutique.git\n')
+    if (a[0] === 'gh' && a[1] === 'auth') return res('', 1, 'You are not logged into any GitHub hosts. To log in, run: gh auth login\n')
+    if (a[0] === 'glab' && a[1] === 'auth')
+      return etat.glab === 'connecte'
+        ? res('', 0, 'git.entreprise.local\n  ✓ Logged in to git.entreprise.local as moi\n')
+        : etat.glab === 'non-connecte'
+          ? res('', 1, 'git.entreprise.local\n  x git.entreprise.local: no token found. Run glab auth login --hostname git.entreprise.local\n')
+          : res('', 127, 'command not found: glab')
+    if (/symbolic-ref --short refs\/remotes\/origin\/HEAD/.test(j)) return res('origin/main\n')
+    if (etat.fini && /status --porcelain -z/.test(j)) return res(' M components/Basket.vue\0')
+    if (etat.fini && /rev-parse --abbrev-ref HEAD/.test(j)) return res('main\n')
+    if (/branch -a --format/.test(j)) return res('main\norigin/main\n')
+    if (/log --format=%s -10/.test(j)) return res('feat: panier\nfix: total\n')
+    if (/switch -c|add -A|commit -m|push -u/.test(j) || (a[0] === 'glab' && a[1] === 'mr' && a[2] === 'create')) {
+      cmds.push(a)
+      return a[0] === 'glab' ? res('Creating merge request\nhttps://git.entreprise.local/equipe/boutique/-/merge_requests/7\n') : res('')
+    }
+    return undefined
+  }
+  return cmds
+}
+
+test('livraison GitLab auto-hébergé : glab connu de l’hôte → MR ; « Prête à relire » → branche, commit, push nommé, glab mr create avec le rapport en description', { options: { architecture: false } }, async ($, on) => {
+  const w = world(on)
+  const etat = { fini: false, glab: 'connecte' as const }
+  const cmds = depotGitlab(w, etat)
+  await finirVerifie($, w, etat, 'Prête à relire')
+  expect(questionsLivraison(w)).toHaveLength(1)
+  expect(questionsLivraison(w)[0]).toContain('ouvrir une MR vers main')
+  const branche = cmds.find(c => c.includes('switch'))!.at(-1)!
+  expect(cmds.find(c => c.includes('commit'))![cmds.find(c => c.includes('commit'))!.indexOf('-m') + 1]).toMatch(/^feat: /)
+  expect(cmds.find(c => c.includes('push'))!.slice(-3)).toEqual(['-u', 'origin', `${branche}:${branche}`])
+  const mr = cmds.find(c => c[0] === 'glab')!
+  // --repo fixe le projet d'origin (glab préférerait upstream) ; revue PR #4, point 2.
+  expect(mr.slice(0, 9)).toEqual(['glab', 'mr', 'create', '--repo', 'https://git.entreprise.local/equipe/boutique', '--source-branch', branche, '--target-branch', 'main'])
+  expect(mr[mr.indexOf('--description') + 1]).toContain('# ')
+  expect(mr).toContain('--yes')
+  expect(mr).not.toContain('--draft')
+  expect((w.states.flow as Flow).livraison).toEqual({ url: 'https://git.entreprise.local/equipe/boutique/-/merge_requests/7', branche })
+  const rapport = Object.entries(w.disk).find(([k]) => k.includes('/rapports/'))?.[1] ?? ''
+  expect(rapport).toContain('MR ouverte : https://git.entreprise.local/equipe/boutique/-/merge_requests/7')
+  expect(w.toasts.some(t => /branche de base main/.test(t))).toBe(true)
+})
+
+test('livraison GitLab : glab absent et un .gitlab-ci.yml → la livraison ne parie pas sur le fichier : ni question, ni commande, ni toast (revue PR #4, point 3)', { options: { architecture: false } }, async ($, on) => {
+  const w = world(on)
+  const etat = { fini: false, glab: 'absent' as const, gitlabCi: true }
+  const cmds = depotGitlab(w, etat)
+  await finirVerifie($, w, etat, 'Brouillon')
+  expect(questionsLivraison(w)).toEqual([])
+  expect(cmds).toEqual([])
+  expect(w.toasts.some(t => /livraison|glab|pas de MR/.test(t))).toBe(false)
+})
+
+test('livraison GitLab : glab connu de l’hôte mais pas connecté → un toast dit comment s’y connecter, ni question ni commande', { options: { architecture: false } }, async ($, on) => {
+  const w = world(on)
+  const etat = { fini: false, glab: 'non-connecte' as const }
+  const cmds = depotGitlab(w, etat)
+  await finirVerifie($, w, etat, 'Brouillon')
+  expect(questionsLivraison(w)).toEqual([])
+  expect(cmds).toEqual([])
+  expect(w.toasts.some(t => /pas de MR proposée : glab non connecté : glab auth login --hostname git\.entreprise\.local/.test(t))).toBe(true)
+})
+
+test('livraison : hôte inconnu de gh et de glab, sans .gitlab-ci.yml → rien, sans toast', { options: { architecture: false } }, async ($, on) => {
+  const w = world(on)
+  const etat = { fini: false, glab: 'absent' as const }
+  const cmds = depotGitlab(w, etat)
+  await finirVerifie($, w, etat, 'Brouillon')
+  expect(questionsLivraison(w)).toEqual([])
+  expect(cmds).toEqual([])
+  expect(w.toasts.some(t => /livraison|glab|gh /.test(t))).toBe(false)
 })
