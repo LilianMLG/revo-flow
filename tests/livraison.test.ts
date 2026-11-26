@@ -7,8 +7,12 @@ import {
   LIVRER_NON,
   LIVRER_POUSSER,
   LIVRER_PRETE,
+  CORPS_MAX,
   argsPrCreate,
   brancheDeLivraison,
+  cheminsChanges,
+  cibleDistante,
+  corpsDePr,
   doctorLivraison,
   fichiersDeLivraison,
   forgeDe,
@@ -81,10 +85,43 @@ describe('fichiers', () => {
     const r = fichiersDeLivraison(['components/Basket.vue', 'lib/vieux.ts', 'lib/inchange.ts', 'store/cart.ts'], statut, new Set(['notes.md', 'store/cart.ts']))
     expect(r.fichiers).toEqual(['components/Basket.vue', 'lib/promo.ts', 'lib/vieux.ts', 'store/cart.ts'])
     expect(r.dejaSales).toEqual(['store/cart.ts'])
+    // lib/promo.ts : propre au lancement, changé sans passer par les outils du flow ; la question le dit.
+    expect(r.horsOutils).toEqual(['lib/promo.ts'])
+  })
+
+  test('une suppression faite avant le flow n’est pas un fichier du flow (revue PR #3, point 1)', () => {
+    const statut = [st(' ', 'M', 'a.ts'), st(' ', 'D', 'vieux.ts')]
+    const depart = cheminsChanges([st(' ', 'D', 'vieux.ts')])
+    expect(fichiersDeLivraison(['a.ts'], statut, depart)).toEqual({ fichiers: ['a.ts'], dejaSales: [], horsOutils: [] })
+  })
+
+  test('un renommage du flow emporte sa source (revue PR #3, point 2)', () => {
+    const statut = [{ x: 'R', y: ' ', p: 'src/b.ts', from: 'src/a.ts' }]
+    expect(fichiersDeLivraison([], statut, new Set()).fichiers).toEqual(['src/a.ts', 'src/b.ts'])
+    expect(cheminsChanges(statut)).toEqual(new Set(['src/b.ts', 'src/a.ts']))
+    // une copie ne retire pas sa source
+    expect(fichiersDeLivraison([], [{ x: 'C', y: ' ', p: 'c.ts', from: 'a.ts' }], new Set()).fichiers).toEqual(['c.ts'])
   })
 
   test('rien de changé : rien à livrer', () => {
-    expect(fichiersDeLivraison(['a.ts'], [], new Set())).toEqual({ fichiers: [], dejaSales: [] })
+    expect(fichiersDeLivraison(['a.ts'], [], new Set())).toEqual({ fichiers: [], dejaSales: [], horsOutils: [] })
+  })
+
+  test('cibleDistante : la branche suivie sur origin, sinon la même (revue PR #3, point 7)', () => {
+    expect(cibleDistante('origin/feature-login', 'wip')).toBe('feature-login')
+    expect(cibleDistante('origin/feat/x', 'feat/x')).toBe('feat/x')
+    expect(cibleDistante('upstream/main', 'wip')).toBe('wip')
+    expect(cibleDistante('', 'wip')).toBe('wip')
+    expect(cibleDistante(undefined, 'wip')).toBe('wip')
+  })
+
+  test('corpsDePr : le rapport tel quel, coupé au-delà de la limite de GitHub avec le chemin du complet (revue PR #3, point 9)', () => {
+    expect(corpsDePr('# Rapport\n', '/h/r.md')).toEqual({ texte: '# Rapport\n', coupe: false })
+    const long = `${'ligne de rapport\n'.repeat(5000)}`
+    const r = corpsDePr(long, '/h/r.md')
+    expect(r.coupe).toBe(true)
+    expect(r.texte.length).toBeLessThanOrEqual(CORPS_MAX + 200)
+    expect(r.texte).toContain('le rapport complet est sur le poste de l’auteur : /h/r.md'.replace('’', "'"))
   })
 })
 
@@ -96,6 +133,11 @@ describe('question, gh, rapport, doctor', () => {
     expect(q.question).toContain('nouvelle branche revo/code-promo')
     expect(q.question).toContain('PR vers main pour « Code promo »')
     expect(q.question).toContain('ne fusionne jamais')
+  })
+
+  test('la question dit les fichiers changés hors des outils du flow et les commits pas encore poussés (revue PR #3, points 7 et 8)', () => {
+    const q = questionLivraison({ titre: 'x', branche: 'wip', nouvelle: false, base: 'main', fichiers: ['a.ts', 'README.md'], dejaSales: [], horsOutils: ['README.md'], enAvance: 2 })
+    expect(q.question).toContain('2 fichiers du flow (dont 1 fichier changé hors des outils du flow : README.md), avec 2 commits déjà sur la branche et pas encore poussés,')
   })
 
   test('PR déjà ouverte sur la branche : pousser dessus ou pas maintenant', () => {
@@ -125,5 +167,8 @@ describe('question, gh, rapport, doctor', () => {
     expect(doctorLivraison({ option: true, forge: { forge: 'github', hote: 'github.com' }, gh: 'absent' })).toContain('brew install gh')
     expect(doctorLivraison({ option: true, forge: { forge: 'gitlab', hote: 'git.entreprise.local' } })).toContain('prochaine version')
     expect(doctorLivraison({ option: false, forge: { forge: 'autre' } })).toContain('désactivée')
+    // revue PR #3, point 10 : sans remote, pas d'hôte inventé ; un hôte inconnu peut être un GitHub Enterprise pas connecté
+    expect(doctorLivraison({ option: true, forge: { forge: 'autre' } })).toBe('aucun remote origin : pas de livraison')
+    expect(doctorLivraison({ option: true, forge: { forge: 'autre', hote: 'ghe.corp' } })).toContain('gh auth login --hostname ghe.corp')
   })
 })

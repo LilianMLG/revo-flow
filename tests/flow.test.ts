@@ -2346,16 +2346,17 @@ test('revue d’architecture désactivée (option architecture) : la porte verte
 // ── La livraison (v3.4) ──────────────────────────────────────────────────
 
 /** Un dépôt GitHub sur main, gh connecté : les commandes de la livraison, enregistrées, et le statut git après le flow. */
-function depotGithub(w: ReturnType<typeof world>, etat: { fini: boolean; prOuverte?: string; ghAbsent?: boolean }) {
+function depotGithub(w: ReturnType<typeof world>, etat: { fini: boolean; prOuverte?: string; ghAbsent?: boolean; sansOriginHead?: boolean; defautGh?: string; courante?: string }) {
   const cmds: string[][] = []
   w.runAvant.repond = a => {
     const res = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     const j = a.join(' ')
     if (/remote get-url origin/.test(j)) return res('git@github.com:moi/boutique.git\n')
     if (a[0] === 'gh' && a[1] === 'auth') return etat.ghAbsent ? res('', 127) : res('github.com\n  ✓ Logged in to github.com account moi\n')
-    if (/symbolic-ref --short refs\/remotes\/origin\/HEAD/.test(j)) return res('origin/main\n')
+    if (/symbolic-ref --short refs\/remotes\/origin\/HEAD/.test(j)) return etat.sansOriginHead ? res('', 128) : res('origin/main\n')
+    if (a[0] === 'gh' && a[1] === 'repo' && a[2] === 'view') return etat.defautGh ? res(`${etat.defautGh}\n`) : res('', 1)
     if (etat.fini && /status --porcelain -z/.test(j)) return res(' M components/Basket.vue\0?? lib/promo.ts\0')
-    if (etat.fini && /rev-parse --abbrev-ref HEAD/.test(j)) return res('main\n')
+    if (etat.fini && /rev-parse --abbrev-ref HEAD/.test(j)) return res(`${etat.courante ?? 'main'}\n`)
     if (/branch -a --format/.test(j)) return res('main\norigin/main\n')
     if (/log --format=%s -10/.test(j)) return res('✨ feat: v3.2, garde\n🐛 fix: x\n')
     if (a[0] === 'gh' && a[1] === 'pr' && a[2] === 'list') return res(etat.prOuverte ? `${etat.prOuverte}\n` : '\n')
@@ -2433,6 +2434,27 @@ test('livraison : gh non connecté → pas de question ni de commande', { option
 test('livraison : option coupée → pas de question', { options: { architecture: false, livraison: false } as never }, async ($, on) => {
   const w = world(on)
   const etat = { fini: false }
+  const cmds = depotGithub(w, etat)
+  await finirVerifie($, w, etat, 'Brouillon')
+  expect(questionsLivraison(w)).toEqual([])
+  expect(cmds).toEqual([])
+})
+
+test('livraison : sans origin/HEAD, la branche par défaut vient de gh repo view ; illisible, rien n’est proposé (revue PR #3, point 3)', { options: { architecture: false } }, async ($, on) => {
+  const w = world(on)
+  const etat = { fini: false, sansOriginHead: true, defautGh: 'develop', courante: 'develop' }
+  const cmds = depotGithub(w, etat)
+  await finirVerifie($, w, etat, 'Prête à relire')
+  // develop est la branche par défaut sur GitHub : une nouvelle branche revo/…, et la PR vise develop.
+  expect(cmds.find(c => c.includes('switch'))!.at(-1)).toMatch(/^revo\//)
+  const pr = cmds.find(c => c[0] === 'gh')!
+  expect(pr[pr.indexOf('--base') + 1]).toBe('develop')
+  expect(pr).not.toContain('--draft')
+})
+
+test('livraison : branche par défaut illisible (ni origin/HEAD, ni gh) → pas de question ni de commande', { options: { architecture: false } }, async ($, on) => {
+  const w = world(on)
+  const etat = { fini: false, sansOriginHead: true, courante: 'develop' }
   const cmds = depotGithub(w, etat)
   await finirVerifie($, w, etat, 'Brouillon')
   expect(questionsLivraison(w)).toEqual([])

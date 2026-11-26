@@ -77,16 +77,46 @@ export function messageCommit(titre: string, resume: string | undefined, sujets:
   return corps ? `${sujet}\n\n${corps}` : sujet
 }
 
+/** Les chemins d'une entrée de git status : le chemin, et la source d'un renommage (sans elle, le commit en garderait une copie). */
+const cheminsDe = (e: StatusEntry) => (e.from !== undefined && (e.x === 'R' || e.y === 'R') ? [e.p, e.from] : [e.p])
+
+/** Tous les chemins que git status voit changés (suppressions et sources de renommage comprises) : l'état au lancement du flow. */
+export const cheminsChanges = (statut: StatusEntry[]): Set<string> => new Set(statut.flatMap(cheminsDe))
+
 /**
- * Les fichiers à commiter : ceux du flow (modifiés par ses outils, ou vus par git status et propres au lancement) que git
- * voit encore changés, suppressions comprises. `dejaSales` : ceux qui avaient déjà des modifications avant le flow
- * (ils partent avec, la question le dit).
+ * Les fichiers à commiter : ceux du flow (modifiés par ses outils, ou changés depuis le lancement selon git status) que git
+ * voit encore changés, suppressions et sources de renommage comprises. `depart` : tout ce que git status voyait au lancement.
+ * La question les détaille : `dejaSales` avaient déjà des modifications avant le flow ; `horsOutils`, propres au lancement,
+ * ont changé sans passer par les outils du flow (commande d'un agent, éditeur de l'utilisateur, fichier généré).
  */
-export function fichiersDeLivraison(marques: string[], statut: StatusEntry[], saleAuDepart: Set<string>): { fichiers: string[]; dejaSales: string[] } {
-  const change = new Set(statut.map(e => e.p))
-  const nouveaux = statut.map(e => e.p).filter(p => !saleAuDepart.has(p))
-  const fichiers = [...new Set([...marques, ...nouveaux])].filter(p => change.has(p)).sort()
-  return { fichiers, dejaSales: fichiers.filter(p => saleAuDepart.has(p)) }
+export function fichiersDeLivraison(marques: string[], statut: StatusEntry[], depart: Set<string>): { fichiers: string[]; dejaSales: string[]; horsOutils: string[] } {
+  const change = cheminsChanges(statut)
+  const marque = new Set(marques)
+  const retenus = new Set<string>()
+  for (const e of statut) {
+    const chemins = cheminsDe(e)
+    if (chemins.some(p => marque.has(p) || !depart.has(p))) chemins.forEach(p => retenus.add(p))
+  }
+  const fichiers = [...retenus].filter(p => change.has(p)).sort()
+  const dejaSales = fichiers.filter(p => depart.has(p))
+  return { fichiers, dejaSales, horsOutils: fichiers.filter(p => !marque.has(p) && !depart.has(p)) }
+}
+
+/** La branche distante où pousser : celle que suit la branche courante sur origin (`origin/feature-x` → `feature-x`), sinon la même. */
+export function cibleDistante(amont: string | undefined, branche: string): string {
+  const a = (amont ?? '').trim()
+  return a.startsWith('origin/') && a.length > 'origin/'.length && !/\s/.test(a) ? a.slice('origin/'.length) : branche
+}
+
+/** La taille maximale d'une description de PR sur GitHub est 65 536 caractères : au-delà, le rapport est coupé. */
+export const CORPS_MAX = 60_000
+
+/** La description de la PR : le rapport, coupé au-delà de CORPS_MAX avec le chemin du rapport complet. */
+export function corpsDePr(rapport: string, chemin: string): { texte: string; coupe: boolean } {
+  if (rapport.length <= CORPS_MAX) return { texte: rapport, coupe: false }
+  const debut = rapport.slice(0, CORPS_MAX)
+  const fin = debut.lastIndexOf('\n')
+  return { texte: `${debut.slice(0, fin > 0 ? fin : CORPS_MAX)}\n\n…\n\n_Rapport coupé pour GitHub ; le rapport complet est sur le poste de l'auteur : ${chemin}_\n`, coupe: true }
 }
 
 export const LIVRER_BROUILLON = 'Brouillon'
@@ -97,10 +127,26 @@ export const LIVRER_NON = 'Pas maintenant'
 const plural = (n: number, mot: string) => `${n} ${mot}${n > 1 ? 's' : ''}`
 
 /** La question de fin de flow : ouvrir la PR (brouillon ou prête), ou pousser sur celle qui existe déjà. */
-export function questionLivraison(o: { titre: string; branche: string; nouvelle: boolean; base: string; fichiers: string[]; dejaSales: string[]; prExistante?: string }): { question: string; options: string[] } {
+export function questionLivraison(o: {
+  titre: string
+  branche: string
+  nouvelle: boolean
+  base: string
+  fichiers: string[]
+  dejaSales: string[]
+  horsOutils?: string[]
+  /** Les commits déjà sur la branche et pas encore poussés : ils partent avec. */
+  enAvance?: number
+  prExistante?: string
+}): { question: string; options: string[] } {
   const ou = o.nouvelle ? `sur une nouvelle branche ${o.branche}` : `sur ${o.branche}`
-  const sales = o.dejaSales.length ? ` (dont ${plural(o.dejaSales.length, 'fichier')} déjà modifié${o.dejaSales.length > 1 ? 's' : ''} avant le flow : ${o.dejaSales.slice(0, 3).join(', ')}${o.dejaSales.length > 3 ? '…' : ''})` : ''
-  const quoi = `${plural(o.fichiers.length, 'fichier')} du flow${sales}`
+  const liste = (xs: string[]) => `${xs.slice(0, 3).join(', ')}${xs.length > 3 ? '…' : ''}`
+  const details = [
+    ...(o.dejaSales.length ? [`${plural(o.dejaSales.length, 'fichier')} déjà modifié${o.dejaSales.length > 1 ? 's' : ''} avant le flow : ${liste(o.dejaSales)}`] : []),
+    ...(o.horsOutils?.length ? [`${plural(o.horsOutils.length, 'fichier')} changé${o.horsOutils.length > 1 ? 's' : ''} hors des outils du flow : ${liste(o.horsOutils)}`] : []),
+  ]
+  const avance = o.enAvance ? `, avec ${plural(o.enAvance, 'commit')} déjà sur la branche et pas encore poussé${o.enAvance > 1 ? 's' : ''},` : ''
+  const quoi = `${plural(o.fichiers.length, 'fichier')} du flow${details.length ? ` (dont ${details.join(' ; ')})` : ''}${avance}`
   if (o.prExistante)
     return {
       question: `Flow vérifié. Commiter ${quoi} ${ou} et pousser sur la PR ${o.prExistante} ? revo-flow ne fusionne jamais.`,
@@ -136,5 +182,6 @@ export function doctorLivraison(o: { option: boolean; forge: Forge; gh?: 'connec
     return `GitHub (${o.forge.hote}) · ${gh} · en fin de flow vérifié, PR${base} sur votre accord (brouillon ou prête), jamais de merge`
   }
   if (o.forge.forge === 'gitlab') return `GitLab (${o.forge.hote}) · la MR en fin de flow arrive dans une prochaine version ; /ship peut déjà relire une MR poussée`
-  return `pas de remote GitHub (${o.forge.hote ?? 'aucun remote origin'}) : pas de livraison`
+  if (!o.forge.hote) return 'aucun remote origin : pas de livraison'
+  return `pas de remote GitHub reconnu (${o.forge.hote}) : pas de livraison ; si c'est un GitHub Enterprise, gh auth login --hostname ${o.forge.hote}`
 }
