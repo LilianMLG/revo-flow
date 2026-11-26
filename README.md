@@ -63,7 +63,7 @@ A red flow means the gate still finds new lint, type or test errors, or a functi
 
 Without `/revo-flow`, the mod does nothing, except the merge guard.
 
-**Merge guard (v3.2).** In every session, in a flow or not, revo-flow refuses any Claude command that would merge a PR or MR (`gh pr merge`, `glab mr merge`, the GitHub and GitLab merge APIs), arm auto-merge (`--auto`, `merge_when_pipeline_succeeds`, GitLab push options), or push to the default branch (`main`, `master`, `origin/HEAD`, `--all`, `--mirror`). Fixing, pushing a work branch, opening or updating a PR or MR still pass; merging stays with you. It also covers the commands Claude types while `/ship` or `/steward` watches a PR. It is a second barrier, not the guarantee: protect the branch on the server (approval required, merge restricted to maintainers).
+**Merge guard (v3.2).** In every session, in a flow or not, revo-flow refuses any Claude command that would merge a PR or MR (`gh pr merge`, `glab mr merge`, the GitHub and GitLab merge APIs), arm auto-merge (`--auto`, `merge_when_pipeline_succeeds`, GitLab push options), or push to the default branch (`main`, `master`, `origin/HEAD`, `--all`, `--branches`, `--mirror`, direct writes through the API). A push must name its branch: `git push` or `git push origin HEAD` is refused, `git push -u origin <branch>` passes. Fixing, pushing a work branch, opening or updating a PR or MR still pass; merging stays with you. It also covers the commands Claude types while `/ship` or `/steward` watches a PR. It is a second barrier, not the guarantee: protect the branch on the server (approval required, merge restricted to maintainers).
 
 ## `/revo-flow doctor`
 

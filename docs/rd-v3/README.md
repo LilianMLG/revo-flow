@@ -268,8 +268,8 @@ flow ou non :
 | Merge par la CLI | `gh pr merge` (avec ou sans `--auto`), `glab mr merge`, `glab mr update --auto-merge` |
 | Merge par l'API | `gh api` / `glab api` / `curl` vers `…/pulls/<n>/merge`, `…/merge_requests/<n>/merge` |
 | Merge au push (GitLab) | `git push -o merge_request.merge_when_pipeline_succeeds`, `-o merge_request.auto_merge` |
-| Push sur la branche par défaut | `git push … main`, `HEAD:main`, `master`, la branche par défaut lue par `git symbolic-ref refs/remotes/origin/HEAD` dans le dossier du push (`cd`, `git -C`) ; tout `--force` vers elle ; un push sans branche nommée quand la branche courante est illisible |
-| Modifier main par l'API (revue /ship) | `repos/o/r/merges`, écriture de `git/refs/heads/<protégée>`, `ref=refs/heads/<protégée>`, `mergeBranch`, `enqueuePullRequest`, train de merge GitLab |
+| Push sur la branche par défaut | `git push … main`, `HEAD:main`, `master`, la branche par défaut lue par `git symbolic-ref refs/remotes/origin/HEAD` dans le dossier du push (`cd`, `git -C`) ; tout `--force` vers elle ; tout push sans branche nommée (`git push`, `HEAD`, `@`) : sa destination dépend du dossier du shell, de push.default et de l'amont (revue de la PR #2) |
+| Modifier main par l'API (revue /ship) | `repos/o/r/merges`, écriture de `git/refs/heads/<protégée>`, `ref=refs/heads/<protégée>`, `mergeBranch`, `enqueuePullRequest`, train de merge GitLab, `contents` (sans `branch` : branche par défaut), commits et fichiers GitLab, `createCommitOnBranch`, `updateRef` |
 
 Message de refus : « revo-flow : le merge et le push sur <branche> sont réservés à l'utilisateur. Fusionne toi-même
 depuis GitHub ou GitLab. » Option `gardeMerge` : oui ou non, activée par défaut (coupée, pour un projet perso).

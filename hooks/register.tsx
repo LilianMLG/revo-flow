@@ -143,7 +143,7 @@ import {
   type PaneActions,
   type ViewData,
 } from './ui/views'
-import { brancheParDefaut, dossiersDuPush, mergeDenial, type MergeContexte } from './merge'
+import { brancheParDefaut, dossiersDuPush, mergeDenial, refusPrudent, type MergeContexte } from './merge'
 import { rapportMarkdown } from './rapport'
 import { doctorText, manifestsOf, pluginVersion, versionText } from './doctor'
 import { addBase, baseFor } from './verif/base'
@@ -426,28 +426,22 @@ async function projectHeader($: $): Promise<{ project: string; branch: string }>
 
 /**
  * La garde anti-merge (v3.2) : le texte du refus d'une commande Bash ou PowerShell qui fusionnerait une PR ou une MR, ou
- * pousserait sur une branche protégée. Les branches ne sont lues que pour une commande qui pousse, avec git, dans le dossier
- * où le push tourne (les `cd` et `git -C` qui le précèdent, depuis le dossier de la session). Branche courante illisible :
- * un push sans branche nommée est refusé.
+ * pousserait sur une branche protégée ou sans branche nommée. Pour une commande qui pousse, la branche par défaut est lue
+ * avec git dans le dossier du push (les `cd` et `git -C` qui le précèdent, depuis le dossier de la session) ; main et master
+ * sont protégées de toute façon.
  */
-async function mergeCheck($: $, command: string): Promise<string | undefined> {
-  const cible = dossiersDuPush(command)
-  if (!cible) return mergeDenial(command)
-  const ctx: MergeContexte = {}
-  if (cible.connu) {
+async function mergeCheck($: $, command: string, shell: 'bash' | 'powershell'): Promise<string | undefined> {
+  const cible = dossiersDuPush(command, shell)
+  const ctx: MergeContexte = { shell }
+  if (cible?.connu) {
     try {
       const cwd = (await $.fs.stat('.', { resolve: true })).realPath ?? ''
       if (cwd) {
-        const git = async (args: string[]) => {
-          const r = await $.process.run(['git', ...cible.dossiers.flatMap(d => ['-C', d]), ...args], { cwd, timeoutMs: 5000 })
-          return r.exitCode === 0 ? r.stdout.trim() : ''
-        }
-        const courante = await git(['rev-parse', '--abbrev-ref', 'HEAD'])
-        if (courante && courante !== 'HEAD') ctx.courante = courante
-        ctx.defaut = brancheParDefaut(await git(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']))
+        const r = await $.process.run(['git', ...cible.dossiers.flatMap(d => ['-C', d]), 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], { cwd, timeoutMs: 5000 })
+        if (r.exitCode === 0) ctx.defaut = brancheParDefaut(r.stdout)
       }
     } catch {
-      // sans git : main et master restent protégées, et un push sans branche nommée est refusé
+      // sans git : main et master restent protégées
     }
   }
   return mergeDenial(command, ctx)
@@ -5150,7 +5144,8 @@ export const register: Register = (on, options) => {
     const input = e as unknown as Record<string, unknown>
     // La garde anti-merge (v3.2) : dans un flow ou non, pour l'orchestrateur comme pour un sous-agent.
     if (opts.gardeMerge && (tool === 'Bash' || tool === 'PowerShell')) {
-      const deny = await mergeCheck($, text(input.command)).catch(() => undefined)
+      // Un contrôle en échec refuse par prudence une commande qui parle de merge ou de push.
+      const deny = await mergeCheck($, text(input.command), tool === 'PowerShell' ? 'powershell' : 'bash').catch(() => refusPrudent(input.command))
       if (deny) return { deny }
     }
     const isVerifierCall = !!e.agentId && verifierAgents.has(e.agentId)

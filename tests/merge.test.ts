@@ -4,9 +4,12 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import { brancheParDefaut, dossiersDuPush, mergeDenial, segments } from '../hooks/merge'
 
-const FEATURE = { defaut: 'main', courante: 'feat/garde' }
-const refuse = (c: string, ctx = FEATURE) => expect(mergeDenial(c, ctx)).toBeDefined()
-const passe = (c: string, ctx = FEATURE) => expect(mergeDenial(c, ctx)).toBeUndefined()
+import type { MergeContexte } from '../hooks/merge'
+
+const DEPOT: MergeContexte = { defaut: 'main' }
+const PS: MergeContexte = { defaut: 'main', shell: 'powershell' }
+const refuse = (c: string, ctx = DEPOT) => expect(mergeDenial(c, ctx)).toBeDefined()
+const passe = (c: string, ctx = DEPOT) => expect(mergeDenial(c, ctx)).toBeUndefined()
 
 describe('mergeDenial : merge par la CLI', () => {
   test('gh pr merge, avec ou sans --auto, numéro ou options', () => {
@@ -68,7 +71,7 @@ describe('mergeDenial : merge par l’API', () => {
     refuse('gh api repos/o/r/merges -f base=main -f head=feat/x')
     refuse('gh api -X PATCH repos/o/r/git/refs/heads/main -f sha=abc')
     refuse('gh api repos/o/r/git/refs -f ref=refs/heads/main -f sha=abc')
-    refuse('gh api repos/o/r/git/refs/heads/develop -X DELETE', { defaut: 'develop', courante: 'feat/x' })
+    refuse('gh api repos/o/r/git/refs/heads/develop -X DELETE', { defaut: 'develop' })
     refuse(`gh api graphql -f query='mutation { enqueuePullRequest(input: {pullRequestId: "X"}) { clientMutationId } }'`)
     refuse(`gh api graphql -f query='mutation { mergeBranch(input: {repositoryId: "X", base: "main", head: "f"}) { clientMutationId } }'`)
     refuse('glab api -X POST projects/12/merge_trains/merge_requests/17')
@@ -77,6 +80,21 @@ describe('mergeDenial : merge par l’API', () => {
     passe('gh api repos/o/r/git/refs/heads/main --jq .object.sha')
     passe('glab api projects/12/merge_trains/merge_requests/17')
     passe('gh api -X PATCH repos/o/r/git/refs/heads/feat/x -f sha=abc')
+  })
+
+  test('les écritures directes sur une branche protégée : fichiers, commits, refs GraphQL (revue PR, point 6)', () => {
+    refuse('gh api -X PUT repos/o/r/contents/README.md -f branch=main -f message=x -f content=eA==')
+    // sans branch, GitHub écrit sur la branche par défaut
+    refuse('gh api -X PUT repos/o/r/contents/README.md -f message=x -f content=eA==')
+    refuse('gh api -X DELETE repos/o/r/contents/a.md -f branch=main -f message=x -f sha=abc')
+    refuse(`gh api graphql -f query='mutation { createCommitOnBranch(input: {branch: {repositoryNameWithOwner: "o/r", branchName: "main"}}) { commit { oid } } }'`)
+    refuse(`gh api graphql -f query='mutation { updateRef(input: {refId: "X", oid: "abc"}) { clientMutationId } }' -f name=refs/heads/main`)
+    refuse(`curl -X POST https://git.entreprise.local/api/v4/projects/12/repository/commits -H 'Content-Type: application/json' -d '{"branch":"main","commit_message":"x","actions":[]}'`)
+    refuse('glab api -X PUT projects/12/repository/files/README.md -f branch=develop -f content=x', { defaut: 'develop' })
+    passe('gh api -X PUT repos/o/r/contents/README.md -f branch=feat/x -f message=x -f content=eA==')
+    passe('gh api repos/o/r/contents/README.md')
+    passe('glab api -X POST projects/12/repository/commits -f branch=feat/x -f commit_message=x')
+    passe(`gh api graphql -f query='mutation { createCommitOnBranch(input: {branch: {repositoryNameWithOwner: "o/main-app", branchName: "feat/x"}}) { commit { oid } } }'`)
   })
 
   test('le texte libre de gh et glab ne déclenche rien ; gh api …/merge sans méthode reste refusé (revue, point 8)', () => {
@@ -106,22 +124,22 @@ describe('mergeDenial : push', () => {
     refuse('git push --force-with-lease origin feat/x:main')
     refuse('git push origin :main')
     refuse('git push origin --delete main')
-    refuse('git push origin develop', { defaut: 'develop', courante: 'feat/garde' })
+    refuse('git push origin develop', { defaut: 'develop' })
     refuse('git -C ../autre push origin main')
     refuse("git push origin 'refs/heads/*:refs/heads/*'")
   })
 
-  test('sans refspec : refusé seulement depuis une branche protégée', () => {
-    refuse('git push', { defaut: 'main', courante: 'main' })
-    refuse('git push origin', { defaut: 'main', courante: 'main' })
-    refuse('git push origin HEAD', { defaut: 'main', courante: 'main' })
-    passe('git push')
-    passe('git push -u origin HEAD')
-    passe('git push origin')
-    passe('git push --tags', { defaut: 'main', courante: 'main' })
-    // branche courante illisible (git n'a pas répondu, cd ~) : un push sans branche nommée est refusé, une branche nommée passe
-    refuse('git push', {})
-    refuse('git push origin HEAD', {})
+  test('un push doit nommer sa branche : sans refspec, HEAD ou @, il dépend du dossier du shell et de l’amont (revue PR, points 3 à 5)', () => {
+    expect(mergeDenial('git push')).toContain('« git push sans branche nommée »')
+    refuse('git push origin')
+    refuse('git push -u origin HEAD')
+    refuse('git push origin @')
+    refuse('git push --follow-tags origin')
+    refuse('git -C repo-feat push origin feat/x && git -C repo-main push')
+    passe('git push --tags')
+    passe('git push origin --tags')
+    passe('git push -u origin feat/garde')
+    passe('git push origin HEAD:feat/garde')
     passe('git push -u origin feat/garde', {})
   })
 
@@ -132,9 +150,22 @@ describe('mergeDenial : push', () => {
     passe('git push --signed origin feat/garde')
   })
 
-  test('--all et --mirror poussent aussi main', () => {
+  test('--all, --branches et --mirror poussent aussi main (revue PR, point 2)', () => {
     refuse('git push --all origin')
+    refuse('git push --branches origin')
     refuse('git push --mirror')
+  })
+
+  test('les redirections ne sont pas des refspecs ; un commentaire n’est pas un argument (revue PR, points 1 et 10)', () => {
+    refuse('git push origin 2>&1')
+    refuse('git push origin >/dev/null 2>&1')
+    refuse('git push origin &> out.txt')
+    refuse('git push origin main 2>&1 | tail -5')
+    passe('git push -u origin feat/garde 2>&1')
+    passe('git push -u origin feat/garde > out.txt 2>&1')
+    passe('git push -u origin feat/garde  # pas main')
+    refuse('git push origin main # vers feat')
+    expect(segments('a 2>&1 b > f c # d e\nf')).toEqual([['a', 'b', 'c'], ['f']])
   })
 
   test('les options de push GitLab qui fusionnent, sous leurs trois écritures', () => {
@@ -179,6 +210,28 @@ describe('mergeDenial : lecture du shell', () => {
     refuse(`Invoke-Expression "glab mr merge 3"`)
     refuse('cmd /c gh pr merge 3')
     refuse('cmd.exe /K "git push origin main"')
+    refuse('powershell -EncodedCommand ZwBoACAAcAByACAAbQBlAHIAZwBlAA==')
+  })
+
+  test('outil PowerShell : le backtick échappe et continue la ligne, l’antislash est ordinaire (revue PR, point 8)', () => {
+    refuse('gh pr `\n merge 12', PS)
+    refuse('gh pr `\r\n merge 12', PS)
+    refuse('g`h pr merge 12', PS)
+    refuse('& "C:\\Program Files\\GitHub CLI\\gh.exe" pr merge 3', PS)
+    refuse('git push origin "ma`in"', PS)
+    passe('git push -u origin feat/garde 2>&1', PS)
+    passe('git commit -m "pas de gh pr merge ici"', PS)
+    expect(segments('a `\n b; c', 'powershell')).toEqual([['a', 'b'], ['c']])
+  })
+
+  test('un shell qui lit son entrée : here-string et tube (revue PR, point 7)', () => {
+    refuse('bash <<< "gh pr merge 12 --squash"')
+    refuse(`sh <<< 'git push origin main'`)
+    refuse(`echo 'gh pr merge 12' | sh`)
+    refuse(`printf 'git push origin main\n' | bash -s`)
+    passe(`grep x <<< "gh pr merge 12"`)
+    passe('cat scripts/test.sh | wc -l')
+    passe(`echo "gh pr merge" && bash scripts/test.sh`)
   })
 
   test('une substitution entre guillemets doubles est exécutée, entre guillemets simples non (revue, point 1)', () => {
@@ -216,7 +269,7 @@ describe('mergeDenial : lecture du shell', () => {
     const r = mergeDenial('git push origin develop', { defaut: 'develop' })!
     expect(r).toContain('git push vers develop')
     expect(r).toContain("réservés à l'utilisateur")
-    const m = mergeDenial('git push origin master', { defaut: 'develop', courante: 'feat/x' })!
+    const m = mergeDenial('git push origin master', { defaut: 'develop' })!
     expect(m).toContain('« git push vers master »')
     expect(m).toContain('(main, master, develop)')
     expect(mergeDenial('gh pr merge 3')!).toContain('« gh pr merge »')
@@ -242,7 +295,7 @@ describe('utilitaires', () => {
     expect(dossiersDuPush('cd ../app && git push')).toEqual({ dossiers: ['../app'], connu: true })
     expect(dossiersDuPush('cd a && cd b && git -C c push origin')).toEqual({ dossiers: ['a', 'b', 'c'], connu: true })
     expect(dossiersDuPush('(cd "../mon app" && git push)')).toEqual({ dossiers: ['../mon app'], connu: true })
-    expect(dossiersDuPush('Set-Location -Path C:\\app; git push')).toEqual({ dossiers: ['C:\\app'], connu: true })
+    expect(dossiersDuPush('Set-Location -Path C:\\app; git push', 'powershell')).toEqual({ dossiers: ['C:\\app'], connu: true })
     expect(dossiersDuPush('cd ~/app && git push')).toEqual({ dossiers: [], connu: false })
     expect(dossiersDuPush('cd - && git push')).toEqual({ dossiers: [], connu: false })
     expect(dossiersDuPush('pushd x && popd && git push')).toEqual({ dossiers: ['x'], connu: false })

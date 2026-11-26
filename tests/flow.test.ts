@@ -2233,20 +2233,22 @@ test('garde anti-merge : refusée sans flow en cours, pour la session comme pour
   expect(await bash($, 'glab mr merge 7', { agentId: 'a-front' })).toMatch(/glab mr merge/)
   expect(await bash($, 'git push origin main')).toMatch(/git push vers main/)
   expect(await (await $.tool.call({ tool: 'PowerShell', command: 'gh pr merge 3', tool_use_id: 'ps' } as never)).deny).toMatch(/gh pr merge/)
-  // La branche courante (feat/promo) est lue par git pour un push sans refspec : elle passe.
-  expect(await bash($, 'git push -u origin HEAD')).toBeUndefined()
-  expect(w.runs.some(r => r.includes('--abbrev-ref'))).toBe(true)
+  // Un push doit nommer sa branche ; une branche de travail nommée passe.
+  expect(await bash($, 'git push -u origin HEAD')).toMatch(/branche non nommée/)
+  expect(await bash($, 'git push -u origin feat/promo 2>&1')).toBeUndefined()
   expect(await bash($, 'gh pr create --fill --draft')).toBeUndefined()
   expect(await bash($, 'npm test')).toBeUndefined()
-  // Les branches sont lues là où le push tourne : cd et git -C passés à git en -C (revue, point 6).
+  // La branche par défaut est lue là où le push tourne : cd et git -C passés à git en -C.
   w.runs.length = 0
-  expect(await bash($, 'cd ../app && git -C sous push')).toBeUndefined()
-  expect(w.runs.find(r => r.includes('--abbrev-ref'))).toEqual(['git', '-C', '../app', '-C', 'sous', 'rev-parse', '--abbrev-ref', 'HEAD'])
-  // cd ~ : branches illisibles, git n'est pas lancé, un push sans branche nommée est refusé, une branche nommée passe.
+  expect(await bash($, 'cd ../app && git -C sous push origin feat/promo')).toBeUndefined()
+  expect(w.runs.find(r => r.includes('symbolic-ref'))).toEqual(['git', '-C', '../app', '-C', 'sous', 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD'])
+  // cd ~ : dossier illisible, git n'est pas lancé ; main et master restent protégées.
   w.runs.length = 0
-  expect(await bash($, 'cd ~/app && git push')).toMatch(/sans branche nommée/)
+  expect(await bash($, 'cd ~/app && git push origin main')).toMatch(/git push vers main/)
   expect(await bash($, 'cd ~/app && git push -u origin feat/promo')).toBeUndefined()
-  expect(w.runs.some(r => r.includes('--abbrev-ref'))).toBe(false)
+  expect(w.runs.some(r => r.includes('symbolic-ref'))).toBe(false)
+  // L'outil PowerShell : le backtick continue la ligne.
+  expect(await (await $.tool.call({ tool: 'PowerShell', command: 'gh pr `\n merge 3', tool_use_id: 'ps2' } as never)).deny).toMatch(/gh pr merge/)
 })
 
 test('garde anti-merge désactivée (gardeMerge à non) : rien n’est refusé ni lu', { options: { gardeMerge: false } as never }, async ($, on) => {
