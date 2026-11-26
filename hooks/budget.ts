@@ -1,7 +1,7 @@
 // Le budget par flow (docs/rd-v4 §2.2) : une estimation à la validation du plan, un plafond, trois états pendant le flow.
 // Pur : des chiffres et des textes, aucun accès disque ni processus. Les coûts sont en dollars, l'affichage en euros (lib.ts).
 import type { Effort, Flow, FlowBudget, Lead, ModelKey } from '../types'
-import { EUR_PER_USD, euros, type JournalEntry, type PlanInput } from './lib'
+import { EUR_PER_USD, PRICES, euros, priceKey, type JournalEntry, type PlanInput } from './lib'
 
 /** Il faut au moins autant d'agents dans le journal pour estimer sur l'historique (sinon la valeur par défaut). */
 export const HISTORIQUE_MIN = 3
@@ -55,18 +55,35 @@ function agentHistorique(journal: readonly JournalEntry[], model: ModelKey, effo
   return { usd: s.sum / s.n, ids: pool.map(a => a.id) }
 }
 
-/** Le coût moyen de l'orchestrateur sur les flows du journal, ou la valeur par défaut. */
-function leadMoyen(tous: readonly JournalEntry[]): number {
-  const journal = finis(tous)
-  if (!journal.length) return DEFAUT_LEAD_USD
+/**
+ * L'estimation par défaut de l'orchestrateur pour ce modèle : DEFAUT_LEAD_USD vaut pour un orchestrateur au tarif d'Opus, mis à l'échelle
+ * du prix d'entrée du modèle de la session (Fable : × 2) ; modèle inconnu ou absent : DEFAUT_LEAD_USD.
+ */
+export function leadDefaut(leadModel: string | undefined): number {
+  const key = leadModel ? priceKey(leadModel) : undefined
+  return key ? (DEFAUT_LEAD_USD * PRICES[key].input) / PRICES.opus.input : DEFAUT_LEAD_USD
+}
+
+/**
+ * Le coût moyen de l'orchestrateur sur les flows du journal, ou la valeur par défaut. Un orchestrateur ne coûte jamais 0 : une entrée à 0
+ * vient d'un modèle sans tarif à l'époque (Fable avant la v3.6.1) et ne compte pas. Avec le modèle de la session, seuls les flows menés
+ * par la même famille de modèle comptent : la moyenne d'orchestrateurs Opus ne dit rien d'un orchestrateur Fable, deux fois plus cher.
+ */
+function leadMoyen(tous: readonly JournalEntry[], leadModel?: string): number {
+  const famille = leadModel ? priceKey(leadModel) : undefined
+  const journal = finis(tous).filter(e => e.lead.costUsd > 0 && (!famille || priceKey(e.lead.modelId) === famille))
+  if (!journal.length) return leadDefaut(leadModel)
   const s = moyenne(journal.map(e => e.lead.costUsd))
   return s.sum / s.n
 }
 
-/** L'estimation d'un flow : la somme des agents du plan (moyenne du journal, sinon défaut) et de l'orchestrateur. */
-export function estimate(plan: PlanInput, journal: readonly JournalEntry[]): BudgetEstimate {
+/**
+ * L'estimation d'un flow : la somme des agents du plan (moyenne du journal, sinon défaut) et de l'orchestrateur. `leadModel` : le modèle
+ * de la session, pour estimer l'orchestrateur sur sa propre famille de modèle.
+ */
+export function estimate(plan: PlanInput, journal: readonly JournalEntry[], leadModel?: string): BudgetEstimate {
   const used = new Set<string>()
-  let usd = leadMoyen(journal)
+  let usd = leadMoyen(journal, leadModel)
   for (const a of plan.agents) {
     const h = agentHistorique(journal, a.model, a.effort)
     if (h) h.ids.forEach(id => used.add(id))

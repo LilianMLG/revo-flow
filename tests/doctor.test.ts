@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { doctorText, manifestsOf, pluginVersion, versionText, type DoctorInput } from '../hooks/doctor'
+import { CODE_MODE_ENV, doctorText, isCodeMode, manifestsOf, pluginVersion, versionText, type DoctorInput } from '../hooks/doctor'
 import { detectCommands } from '../hooks/verif/detect'
 import { computeStats } from '../hooks/cache/graph'
 import type { AgentDef } from '../types/agents'
@@ -215,6 +215,53 @@ describe('doctorText : pièges', () => {
     const t = doctorText(complet({ commandes: f.commandes, pieges: f.pieges }))
     expect(find(t, 'Pièges')).toContain('@vitest/coverage-v8')
     expect(find(t, 'CRAP')).toMatch(/aucun score/)
+  })
+})
+
+describe('doctorText : Code Mode', () => {
+  const web = (option: string) => ({ option, login: false, serveur: { argv: ['npm', 'run', 'dev'], port: 3000, origine: 'script dev' } }) as never
+  const flutter = { option: 'appareil', app: { framework: 'flutter', origine: 'pubspec.yaml', plateformes: ['android'] } } as never
+  const codeMode = (over: Partial<DoctorInput>) => {
+    const all = lines(doctorText(complet({ codeMode: true, ...over })))
+    const i = all.findIndex(l => l.startsWith('Code Mode'))
+    return all.slice(i, i + 3)
+  }
+
+  test('isCodeMode : « 1 », « true », « yes » ou « on » ; absent, « 0 » ou autre chose : non (revue de la PR #6)', () => {
+    expect(CODE_MODE_ENV).toBe('CLAUDE_CODE_EXPERIMENTAL_CODE_MODE')
+    expect(['1', 'true', ' TRUE ', 'yes', 'on'].map(isCodeMode)).toEqual([true, true, true, true, true])
+    expect([undefined, '', '0', 'false', 'oui', 'off'].map(isCodeMode)).toEqual([false, false, false, false, false, false])
+  })
+
+  test('absent de l’entrée : pas de rubrique ; inactif : une ligne qui dit « absent ou à 0 »', () => {
+    expect(doctorText(complet())).not.toMatch(/^Code Mode/m)
+    expect(find(doctorText(complet({ codeMode: false })), 'Code Mode')).toBe('Code Mode    inactif (CLAUDE_CODE_EXPERIMENTAL_CODE_MODE absent ou à 0)')
+  })
+
+  test('actif : seule la garde anti-merge est dite essayée ; le gel des tests et le vérificateur sont dits non essayés (revue de la PR #6)', () => {
+    const [tete] = codeMode({})
+    expect(tete).toBe('Code Mode    actif (expérimental) : la garde anti-merge voit les appels faits depuis un script (essayé) ; gel des tests et lecture seule du vérificateur non essayés dans ce mode')
+  })
+
+  test('actif : le rappel de la preuve web seulement pour un projet qui en a une (serveur de dev, option active, pas d’app mobile)', () => {
+    const reprise = /reprise : claude --resume et --continue exigent la même variable \(CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1\)/
+    // Sans serveur de dev : pas de rappel, la reprise suit directement.
+    expect(codeMode({})[1]).toMatch(reprise)
+    // Serveur de dev et option extension : le rappel, et le repli à activer.
+    const avec = codeMode({ web: web('extension') })
+    expect(avec[1]).toMatch(/preuve web : l’extension Claude in Chrome n’est pas disponible en Code Mode .* option web « devtools » pour le repli/)
+    expect(avec[2]).toMatch(reprise)
+    expect(codeMode({ web: web('devtools') })[1]).toMatch(/le repli Chrome DevTools MCP reste/)
+    // Preuve web coupée, ou app mobile : le conseil ne vaut pas.
+    expect(codeMode({ web: web('off') })[1]).toMatch(reprise)
+    expect(codeMode({ web: web('extension'), mobile: flutter })[1]).toMatch(reprise)
+  })
+
+  test('sans projet git : Code Mode se dit quand même, il tient à la session (revue de la PR #6)', () => {
+    const t = doctorText({ ...complet({ codeMode: true }), nom: undefined })
+    expect(t).toMatch(/Aucun projet git reconnu/)
+    expect(t).toMatch(/^Code Mode    actif \(expérimental\)/m)
+    expect(t).not.toMatch(/preuve web/)
   })
 })
 

@@ -51,7 +51,15 @@ export type DoctorInput = {
   mobile?: MobileDispo
   /** La livraison (v3.4) : la ligne déjà écrite (doctorLivraison) ; absent = rubrique non affichée. */
   livraison?: string
+  /** Code Mode de Claude Code (expérimental) actif dans cette session ; absent = rubrique non affichée. */
+  codeMode?: boolean
 }
+
+/** La variable d'environnement qui active Code Mode dans Claude Code (v2.1.323 et suivantes). */
+export const CODE_MODE_ENV = 'CLAUDE_CODE_EXPERIMENTAL_CODE_MODE'
+
+/** La valeur de la variable active-t-elle Code Mode ? « 1 », « true », « yes » ou « on », les valeurs vraies des variables de Claude Code. */
+export const isCodeMode = (valeur: string | undefined) => /^(1|true|yes|on)$/i.test((valeur ?? '').trim())
 
 const LIBELLE: Record<VerifOutil, string> = { generation: 'Génération', format: 'Format', lint: 'Lint', typage: 'Typage', tests: 'Tests', qualite: 'CRAP' }
 
@@ -209,6 +217,29 @@ function mobileLines(m: MobileDispo): string[] {
 }
 
 /**
+ * La rubrique Code Mode : en Code Mode le modèle n'a qu'un outil, REPL, et tous ses appels (shell, fichiers, MCP) partent d'un script.
+ * Essayé sur Claude Code 2.1.332 : les appels du script passent par les hooks du mod sous le nom habituel de l'outil (la garde anti-merge
+ * refuse un push sur main par tools.Bash, Bash et $`…`), un outil retiré à un agent n'existe pas dans son script, et un flow complet tourne.
+ */
+function codeModeLines(input: Pick<DoctorInput, 'codeMode' | 'web' | 'mobile'>): string[] {
+  if (input.codeMode === undefined) return []
+  if (!input.codeMode) return [ligne('Code Mode', `inactif (${CODE_MODE_ENV} absent ou à 0)`)]
+  return [
+    // Seul ce qui a été essayé est affirmé : la garde anti-merge. Le gel des tests et le vérificateur passent par le même hook, sans essai.
+    ligne('Code Mode', 'actif (expérimental) : la garde anti-merge voit les appels faits depuis un script (essayé) ; gel des tests et lecture seule du vérificateur non essayés dans ce mode'),
+    ...webProofNote(input),
+    suite(`reprise : claude --resume et --continue exigent la même variable (${CODE_MODE_ENV}=1)`),
+  ]
+}
+
+/** Le rappel sur la preuve web en Code Mode : seulement pour un projet qui en a une (serveur de dev détecté, option active, pas d'app mobile). */
+function webProofNote({ web, mobile }: Pick<DoctorInput, 'web' | 'mobile'>): string[] {
+  if (!web?.serveur || web.option === 'off' || mobile?.app) return []
+  const repli = web.option === 'devtools' ? 'le repli Chrome DevTools MCP reste' : 'option web « devtools » pour le repli Chrome DevTools MCP'
+  return [suite(`preuve web : l’extension Claude in Chrome n’est pas disponible en Code Mode (documentation de Claude Code) ; ${repli}`)]
+}
+
+/**
  * Le texte de /revo-flow doctor. Sans projet : le dit, et dit que la porte ne fera rien. Avec un projet : stack, porte, une ligne par
  * commande, CRAP, base de référence, cache, agents, pièges.
  */
@@ -220,6 +251,8 @@ export function doctorText(input: DoctorInput): string {
       '',
       'La porte de vérification ne fera rien : sans projet, revo-flow n\'a ni commande à détecter, ni base de référence, ni cache ; un flow se terminera « non vérifié ».',
       'Ouvrez Claude Code dans un dépôt git, puis relancez /revo-flow doctor.',
+      // Code Mode tient à la session, pas au projet : il se dit ici aussi (sans projet, ni preuve web ni mobile à rappeler).
+      ...codeModeLines({ codeMode: input.codeMode }),
     ].join('\n')
   }
   const lignes = [`revo-flow doctor · ${input.nom}`]
@@ -235,6 +268,7 @@ export function doctorText(input: DoctorInput): string {
   if (input.mobile?.app || (input.mobile && !input.web)) lignes.push(...mobileLines(input.mobile))
   else if (input.web) lignes.push(...webLines(input.web))
   if (input.livraison) lignes.push(ligne('Livraison', input.livraison))
+  lignes.push(...codeModeLines(input))
   if (input.pieges.length === 0) lignes.push(ligne('Pièges', 'aucun'))
   else input.pieges.forEach((p, i) => lignes.push(i === 0 ? ligne('Pièges', p) : suite(p)))
   return lignes.join('\n')

@@ -25,7 +25,7 @@ export const KINDS: readonly TaskKind[] = ['analyse', 'codage', 'test', 'review'
 
 /** « claude-sonnet-5-5 » → « Sonnet 5.5 » ; un identifiant inconnu est rendu tel quel. */
 export function modelLabel(id: string): string {
-  const m = /(haiku|sonnet|opus|fable)[-_ ]?(\d+)?[-_.](\d+)/i.exec(id)
+  const m = /(haiku|sonnet|opus|fable|mythos)[-_ ]?(\d+)?[-_.](\d+)/i.exec(id)
   if (!m) return id.replace(/^claude-/, '')
   const name = m[1]!.charAt(0).toUpperCase() + m[1]!.slice(1).toLowerCase()
   return m[2] ? `${name} ${m[2]}.${m[3]}` : name
@@ -844,17 +844,38 @@ export function usagePercents(
   }
 }
 
-/** Dollars par million de tokens : entrée, sortie, lecture de cache, écriture de cache. Tarifs de l'API au 2026-10-06. */
+/**
+ * Dollars par million de tokens : entrée, sortie, lecture de cache, écriture de cache (1,25 × l'entrée). Tarifs de l'API au 2026-11-03.
+ * fable : Claude Fable 5.2 et Mythos 5.2 (8 $ / 40 $) ; les Fable 5 et 5.1, plus chers (10 $ / 50 $), sont comptés à ce tarif-ci. Sa
+ * lecture de cache est bien à 0,20 $, comme celle d'Opus 5.5 : c'est le prix publié, pas une copie de la ligne du dessus.
+ * sonnet : Sonnet 5.5, dont la lecture de cache est passée à 0,10 $ ; sonnetAncien : les Sonnet d'avant, restés à 0,20 $.
+ */
 export const PRICES = {
   haiku: { input: 0.1, output: 0.5, read: 0.01, write: 0.125 },
-  sonnet: { input: 2, output: 10, read: 0.2, write: 2.5 },
+  sonnet: { input: 2, output: 10, read: 0.1, write: 2.5 },
+  sonnetAncien: { input: 2, output: 10, read: 0.2, write: 2.5 },
   opus: { input: 4, output: 20, read: 0.2, write: 5 },
+  fable: { input: 8, output: 40, read: 0.2, write: 10 },
 } as const
+
+export type PriceKey = keyof typeof PRICES
+
+/**
+ * La ligne de tarif d'un modèle, ou rien pour un modèle inconnu. Plus large que modelKey (les modèles qu'un plan peut donner à un agent) :
+ * l'orchestrateur tourne sur le modèle de la session, Fable ou Mythos compris, et sans tarif son coût comptait pour 0.
+ */
+export function priceKey(id: string): PriceKey | undefined {
+  const l = id.toLowerCase()
+  if (/fable|mythos/.test(l)) return 'fable'
+  const key = modelKey(l)
+  // Un Sonnet qui n'est pas le 5.5 garde l'ancienne lecture de cache.
+  return key === 'sonnet' && !/sonnet[-_ ]?5[-_.]5/.test(l) ? 'sonnetAncien' : key
+}
 
 export const EUR_PER_USD = 0.92
 
 export function costUsd(model: string, u: Usage): number {
-  const key = modelKey(model)
+  const key = priceKey(model)
   if (!key) return 0
   const p = PRICES[key]
   const prompt = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0)
@@ -947,6 +968,8 @@ const VERBS: Record<string, string> = {
   WebSearch: 'Recherche',
   Skill: 'Skill',
   TodoWrite: 'Planifie',
+  // Code Mode : le seul outil du modèle, un script qui enchaîne les appels (chacun passe ensuite sous son propre nom).
+  REPL: 'Exécute un script',
 }
 
 /** Une phrase courte pour l'action en cours : « Lit components/Basket.vue ». */
