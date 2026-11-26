@@ -5,9 +5,9 @@
 import type { ProjetVerif, VerifBase, VerifCommande, VerifErreur, VerifEtatCommande, VerifResultat } from '../../types/verif'
 import { baseFor, classify } from './base'
 import { CRAP_SEUIL, analysable, coverageFiles, coverageFormatOf, coverageOf, crapErreurs, crapOf, crapText, langOf, mergeCoverage, type Couverture, type CrapFonction, type Lang } from './crap'
-import { parseOutput, signatureKey } from './parse'
+import { INTROUVABLE, parseOutput, signatureKey, type ParseCtx } from './parse'
 import { dureeText } from './report'
-import { FICHIERS, SORTIES, isDart, norm, plan, toolOf, withShell, type Lancement } from './scope'
+import { FICHIERS, SORTIES, isDart, norm, parFichierOf, plan, toolOf, withShell, type Lancement } from './scope'
 
 /**
  * Ce que la vérification demande au moteur. racine : chemin absolu du projet ; sorties : dossier absolu ~/.claude/revo-flow/verif/<flow>.
@@ -37,8 +37,6 @@ const MAX_SORTIE = 4 * 1024 * 1024 - 64 * 1024
 const MAX_PREEXISTANTES = 200
 /** Tests instables retenus dans projet.verif. */
 const MAX_INSTABLES = 100
-/** Codes de sortie d'une commande introuvable (sh, cmd.exe). */
-const INTROUVABLE = new Set([127, 9009])
 /** Ordre d'exécution : la génération avant le typage, les tests, puis la qualité (score CRAP, qui lit la couverture des tests). */
 const ORDRE = ['generation', 'format', 'lint', 'typage', 'tests', 'qualite']
 /** Le sous-dossier des sorties où les tests liés écrivent leur couverture (coverageArgs). */
@@ -53,6 +51,22 @@ export function durationOf(verif: ProjetVerif | undefined, id: string): number |
 export function timeoutOf(dureeMs: number | undefined): number {
   if (!dureeMs) return RUN_MAX_MS
   return Math.min(RUN_MAX_MS, Math.max(RUN_MIN_MS, Math.round(dureeMs * 3)))
+}
+
+/**
+ * Le délai d'un lancement de la commande : timeoutOf(durée apprise de la commande) ; pour un paquet de tests liés dont la durée par
+ * fichier est apprise, le plus long des deux délais (celui de la commande, celui du paquet : durée par fichier × fichiers du paquet).
+ */
+export function timeoutFor(cmd: VerifCommande, l: Pick<Lancement, 'fichiers'>): number {
+  const d = parFichierOf(cmd)
+  const commande = timeoutOf(cmd.dureeMs)
+  return d && l.fichiers.length ? Math.max(commande, timeoutOf(d * l.fichiers.length)) : commande
+}
+
+/** Une moyenne glissante (70 % l'ancienne, 30 % la mesure) ; relevée d'un coup à la mesure si `monte` (un délai a été dépassé). */
+export function glisse(avant: number | undefined, mesure: number, monte = false): number {
+  if (!avant || (monte && mesure > avant)) return Math.round(mesure)
+  return Math.round(avant * 0.7 + mesure * 0.3)
 }
 
 const sepOf = (io: Pick<VerifIo, 'os'>) => (io.os === 'windows' ? '\\' : '/')
@@ -74,7 +88,11 @@ export function projectArgv(cmd: VerifCommande): string[] | undefined {
   return cmd.argv.map(x => (x === FICHIERS ? '.' : x))
 }
 
-type Exec = { l: Lancement; exitCode: number; stdout: string; stderr: string; dureeMs: number; echec?: string }
+/** Un lancement fait : echec = pourquoi il est illisible (délai, lancement impossible) ; delai = il a dépassé son délai. */
+type Exec = { l: Lancement; exitCode: number; stdout: string; stderr: string; dureeMs: number; echec?: string; delai?: boolean }
+
+/** La panne d'un délai dépassé. */
+const delaiDepasse = (timeoutMs: number) => ({ echec: `délai dépassé (${dureeText(timeoutMs)})`, delai: true })
 
 /** Le jeton '{sorties}' (seul ou suivi d'un chemin à « / ») dans un argument : remplacé par le dossier des sorties, au séparateur de l'hôte. */
 const SORTIES_RE = new RegExp(`${SORTIES.replace(/[{}]/g, '\\$&')}((?:/[^\\s,;=]*)?)`, 'g')
@@ -84,20 +102,55 @@ export function fillSorties(io: Pick<VerifIo, 'os' | 'sorties'>, argv: string[])
   return argv.map(t => (t.includes(SORTIES) ? t.replace(SORTIES_RE, (_, rest: string) => joinPath(io, io.sorties, rest.replace(/^\//, ''))) : t))
 }
 
-/** Un lancement : jamais d'exception, une erreur de run devient `echec`. */
+/**
+ * Un lancement : jamais d'exception, une erreur de run devient `echec`. Un délai se voit à l'exception (« timed out ») ou, si run rend
+ * la main sans lever, à un code non nul (ou absent) arrivé au bout du délai.
+ */
 async function exec(io: VerifIo, lancement: Lancement, timeoutMs: number): Promise<Exec> {
   const l = lancement.argv.some(t => t.includes(SORTIES)) ? { ...lancement, argv: fillSorties(io, lancement.argv) } : lancement
   const t0 = await io.now()
   try {
     const r = await io.run(withShell(l.argv, io.os), { cwd: joinPath(io, io.racine, l.cwd), timeoutMs })
-    const exitCode = typeof r.exitCode === 'number' ? r.exitCode : -1
-    return { l, exitCode, stdout: r.stdout ?? '', stderr: r.stderr ?? '', dureeMs: (await io.now()) - t0, ...(typeof r.exitCode === 'number' ? {} : { echec: 'arrêtée sans code de sortie' }) }
+    const dureeMs = (await io.now()) - t0
+    const code = typeof r.exitCode === 'number'
+    const e: Exec = { l, exitCode: code ? r.exitCode : -1, stdout: r.stdout ?? '', stderr: r.stderr ?? '', dureeMs }
+    if (e.exitCode !== 0 && dureeMs >= timeoutMs) return { ...e, ...delaiDepasse(timeoutMs) }
+    return code ? e : { ...e, echec: 'arrêtée sans code de sortie' }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     const dureeMs = (await io.now()) - t0
     const delai = /time ?out|timed out|délai/i.test(msg) || dureeMs >= timeoutMs
-    return { l, exitCode: -1, stdout: '', stderr: msg, dureeMs, echec: delai ? `délai dépassé (${dureeText(timeoutMs)})` : `lancement impossible : ${msg.slice(0, 160)}` }
+    return { l, exitCode: -1, stdout: '', stderr: msg, dureeMs, ...(delai ? delaiDepasse(timeoutMs) : { echec: `lancement impossible : ${msg.slice(0, 160)}` }) }
   }
+}
+
+/** Une tentative : le dossier de couverture vidé avant (cov donné), relu après sauf délai dépassé (rapport partiel ou absent). */
+async function tenter(io: VerifIo, l: Lancement, timeoutMs: number, cov: Cov | undefined): Promise<Exec> {
+  if (cov) await clearCoverage(io)
+  const e = await exec(io, l, timeoutMs)
+  if (cov && !e.delai) await readCoverage(io, l.cwd, cov)
+  return e
+}
+
+/**
+ * Un lancement, relancé une fois au délai maximal (RUN_MAX_MS) s'il dépasse un délai appris plus court : la dernière tentative fait foi.
+ * Rend les tentatives dans l'ordre (une ou deux). cov : la couverture à mesurer (tests liés qui écrivent dans {sorties}).
+ */
+async function lancer(io: VerifIo, l: Lancement, timeoutMs: number, cov?: Cov): Promise<Exec[]> {
+  const premiere = await tenter(io, l, timeoutMs, cov)
+  if (!premiere.delai || timeoutMs >= RUN_MAX_MS) return [premiere]
+  return [premiere, await tenter(io, l, RUN_MAX_MS, cov)]
+}
+
+/** Les titres des tentatives d'un lancement dans la sortie complète : « lancement dans packages/core », puis la relance au délai maximal. */
+function titres(titre: string, l: Lancement, essais: Exec[]): { titre: string; e: Exec }[] {
+  const ou = l.cwd ? ` dans ${l.cwd}` : ''
+  return essais.map((e, i) => ({ titre: i ? `${titre}${ou}, relancé au délai maximal (${dureeText(RUN_MAX_MS)})` : `${titre}${ou}`, e }))
+}
+
+/** Les erreurs lues d'une tentative ; une tentative en panne (délai, lancement impossible) est lue comme sans code de sortie. */
+function lire(cmd: VerifCommande, e: Exec, ctx: ParseCtx) {
+  return parseOutput(cmd.format, e.echec ? { ...e, exitCode: -1 } : e, ctx)
 }
 
 /** Le texte complet des lancements, pour le .txt (borné à 4 MiB). */
@@ -129,7 +182,32 @@ function illisible(e: Exec, lues: number): string | undefined {
 }
 
 type Portee = { changed: string[]; files: string[]; testsOf?: (p: string) => string[]; annotes?: string[] }
-type Etape = { etat: VerifEtatCommande; erreurs: VerifErreur[]; instables: string[]; lancee: boolean }
+/**
+ * Ce que la porte apprend d'une commande : dureeMs = durée sans les tentatives en délai dépassé (absente si la commande est en panne) ;
+ * parFichierMs = durée par fichier des tests liés ; monte = un délai a été dépassé (la moyenne glissante est relevée d'un coup).
+ */
+type Appris = { dureeMs?: number; parFichierMs?: number; monte: boolean }
+type Etape = { etat: VerifEtatCommande; erreurs: VerifErreur[]; instables: string[]; lancee: boolean; appris?: Appris }
+
+/**
+ * La durée par fichier mesurée d'une commande de tests liés qui reçoit ses fichiers : tentatives finales lisibles, ou arrivées au bout
+ * du délai maximal (borne basse, pour que le prochain découpage soit plus fin). undefined pour les autres commandes.
+ */
+function parFichierMesure(cmd: VerifCommande, finales: Exec[]): number | undefined {
+  if (cmd.portee !== 'lies' || !cmd.argv.includes(FICHIERS)) return undefined
+  const lues = finales.filter(e => e.l.fichiers.length && (!e.echec || e.delai))
+  const n = lues.reduce((s, e) => s + e.l.fichiers.length, 0)
+  return n ? Math.round(lues.reduce((s, e) => s + e.dureeMs, 0) / n) : undefined
+}
+
+/** La commande après la porte : durée et durée par fichier apprises (glisse). */
+function apprendre(c: VerifCommande, a: Appris | undefined): VerifCommande {
+  if (!a) return c
+  const out = { ...c }
+  if (a.dureeMs !== undefined) out.dureeMs = glisse(c.dureeMs, a.dureeMs, a.monte)
+  if (a.parFichierMs !== undefined) out.dureeParFichierMs = glisse(c.dureeParFichierMs, a.parFichierMs, a.monte)
+  return out
+}
 /**
  * La couverture de la porte, accumulée sur les lancements de tests : langs = langues dont les tests ont tourné avec la couverture,
  * lus = rapports de couverture lus.
@@ -196,19 +274,20 @@ async function runCommand(
   onProgress?.({ ...vide, etat: 'en_cours', fichiers })
   const notes: string[] = []
   if ((cmd.dureeMs ?? 0) > SPAWN_SEUIL_MS) notes.push(`durée apprise ${dureeText(cmd.dureeMs!)} : au-delà de 5 min, à passer par spawn (run plafonné à 10 min)`)
-  const timeoutMs = timeoutOf(cmd.dureeMs)
 
   const execs: { titre: string; e: Exec }[] = []
+  const finales: Exec[] = []
   let lues: Omit<VerifErreur, 'statut'>[] = []
   const pannes: string[] = []
   const couverture = mesure(cmd)
   if (couverture) cov.langs.add(isDart(cmd) ? 'dart' : 'ts')
   for (const l of lancements) {
-    if (couverture) await clearCoverage(io)
-    const e = await exec(io, l, timeoutMs)
-    if (couverture) await readCoverage(io, l.cwd, cov)
-    execs.push({ titre: `lancement${l.cwd ? ` dans ${l.cwd}` : ''}`, e })
-    const errs = parseOutput(cmd.format, e, { outil: cmd.id, cwd: l.cwd, racine: io.racine, argv: l.argv })
+    // Un paquet qui dépasse son délai appris est relancé une fois au délai maximal : la dernière tentative fait foi.
+    const essais = await lancer(io, l, timeoutFor(cmd, l), couverture ? cov : undefined)
+    execs.push(...titres('lancement', l, essais))
+    const e = essais.at(-1)!
+    finales.push(e)
+    const errs = lire(cmd, e, { outil: cmd.id, cwd: l.cwd, racine: io.racine, argv: l.argv })
     const panne = illisible(e, errs.length)
     if (panne) pannes.push(panne)
     lues.push(...errs)
@@ -226,13 +305,14 @@ async function runCommand(
     const encore = new Set<string>()
     const relues = new Set<string>()
     for (const l of relance) {
-      if (couverture) await clearCoverage(io)
-      const e = await exec(io, l, timeoutMs)
-      if (couverture) await readCoverage(io, l.cwd, cov)
-      execs.push({ titre: `relance des tests rouges${l.cwd ? ` dans ${l.cwd}` : ''}`, e })
-      const errs = parseOutput(cmd.format, e, { outil: cmd.id, cwd: l.cwd, racine: io.racine, argv: l.argv })
-      if (illisible(e, errs.length)) continue
-      for (const f of l.fichiers) relues.add(f)
+      const essais = await lancer(io, l, timeoutFor(cmd, l), couverture ? cov : undefined)
+      execs.push(...titres('relance des tests rouges', l, essais))
+      const e = essais.at(-1)!
+      const errs = lire(cmd, e, { outil: cmd.id, cwd: l.cwd, racine: io.racine, argv: l.argv })
+      // Une relance qui plante (code non nul sans test lu : seule l'erreur « sortie ») n'a rien rejugé : les rouges restent rouges, jamais instables.
+      if (illisible(e, errs.length) || (errs.length > 0 && errs.every(x => x.code === 'sortie'))) continue
+      // Une commande sur tout le projet (claude plugin test) ne sait pas viser un fichier : elle a relancé tous les tests rouges.
+      for (const f of l.fichiers.length ? l.fichiers : aRelancer) relues.add(f)
       for (const x of errs) encore.add(signatureKey(x))
     }
     erreurs = erreurs.map((e): VerifErreur => {
@@ -269,7 +349,12 @@ async function runCommand(
   }
   if (notes.length) etat.note = notes.join(' ; ')
   onProgress?.(etat)
-  return { etat, erreurs, instables: nouveauxInstables, lancee: true }
+  const appris: Appris = {
+    ...(etat.etat === 'erreur' ? {} : { dureeMs: execs.filter(x => !x.e.delai).reduce((n, x) => n + x.e.dureeMs, 0) }),
+    parFichierMs: parFichierMesure(cmd, finales),
+    monte: execs.some(x => x.e.delai),
+  }
+  return { etat, erreurs, instables: nouveauxInstables, lancee: true, appris }
 }
 
 /**
@@ -349,30 +434,27 @@ export async function runGate(
   const etats: VerifEtatCommande[] = []
   const erreurs: VerifErreur[] = []
   const appris: string[] = []
-  const durees = new Map<string, number>()
+  const durees = new Map<string, Appris>()
   const cov: Cov = { couv: new Map(), langs: new Set(), lus: 0 }
   for (const cmd of ordre) {
     const r = cmd.format === 'crap' ? await runCrap(io, cmd, portee, input.commit, cov, input.onProgress) : await runCommand(io, cmd, portee, base, verif.instables, filtre, cov, input.onProgress)
     etats.push(r.etat)
     erreurs.push(...r.erreurs)
     appris.push(...r.instables)
-    if (r.lancee && r.etat.etat !== 'erreur') durees.set(cmd.id, r.etat.dureeMs)
+    if (r.appris) durees.set(cmd.id, r.appris)
   }
   const nouvelles = erreurs.filter(e => e.statut === 'nouvelle' || e.statut === 'nouvelle?')
   const etat: VerifResultat['etat'] = nouvelles.length ? 'rouge' : etats.some(c => c.etat === 'erreur') ? 'erreur' : 'vert'
   const gardees = [...nouvelles, ...erreurs.filter(e => e.statut === 'instable'), ...erreurs.filter(e => e.statut === 'preexistante').slice(0, MAX_PREEXISTANTES)]
   const resultat: VerifResultat = { etat, le: new Date(t0).toISOString(), dureeMs: (await io.now()) - t0, commandes: etats, erreurs: gardees }
-  const commandes = verif.commandes.map(c => {
-    const d = durees.get(c.id)
-    if (d === undefined) return c
-    return { ...c, dureeMs: c.dureeMs ? Math.round(c.dureeMs * 0.7 + d * 0.3) : d }
-  })
+  const commandes = verif.commandes.map(c => apprendre(c, durees.get(c.id)))
   const instables = [...new Set([...verif.instables, ...appris])].slice(-MAX_INSTABLES)
   return { resultat, verif: { ...verif, commandes, instables } }
 }
 
 /**
- * La base de référence au commit de départ : lint, typage et format sur tout le projet (projectArgv), à la racine.
+ * La base de référence au commit de départ : lint, typage et format sur tout le projet (projectArgv), à la racine. Les tests n'y entrent
+ * pas (claude plugin test compris : 50 s de plus en fond pour rien, un test rouge au départ est rare) : leurs erreurs sont « nouvelle ? ».
  * Une commande illisible n'entre pas dans base.commandes : ses erreurs à la porte seront « nouvelle ? ».
  */
 export async function runBase(io: VerifIo, verif: ProjetVerif, commit: string, onProgress?: (c: VerifEtatCommande) => void): Promise<VerifBase> {
@@ -385,13 +467,14 @@ export async function runBase(io: VerifIo, verif: ProjetVerif, commit: string, o
     if (!argv) continue
     const l: Lancement = { id: cmd.id, cwd: '', argv, fichiers: [] }
     onProgress?.({ id: cmd.id, outil: cmd.outil, etat: 'en_cours', dureeMs: 0, nouvelles: 0, preexistantes: 0, instables: 0, fichiers: 0 })
-    const e = await exec(io, l, timeoutOf(cmd.dureeMs))
-    const errs = parseOutput(cmd.format, e, { outil: cmd.id, cwd: '', racine: io.racine, argv })
+    const essais = await lancer(io, l, timeoutOf(cmd.dureeMs))
+    const e = essais.at(-1)!
+    const errs = lire(cmd, e, { outil: cmd.id, cwd: '', racine: io.racine, argv })
     const panne = illisible(e, errs.length)
     const chemin = joinPath(io, io.sorties, `base-${cmd.id}.txt`)
     let sortie: string | undefined
     try {
-      await io.write(chemin, sortieText(cmd, [{ titre: `base de référence au commit ${commit}`, e }]))
+      await io.write(chemin, sortieText(cmd, titres(`base de référence au commit ${commit}`, l, essais)))
       sortie = chemin
     } catch {
       sortie = undefined

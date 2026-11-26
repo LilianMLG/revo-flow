@@ -1809,6 +1809,10 @@ for (const os of OSES) {
     // Le dégel passe par l'utilisateur.
     w.ctl.answer = 'Garder gelé'
     expect(JSON.stringify(await $.tool.call({ tool: 'mcp__revo-flow__verif', action: 'degeler', fichiers: ['tests/promo.test.ts'], motif: 'le test attend un arrondi faux' } as never))).toMatch(/garde ces tests gelés/)
+    // Le vérificateur passe après les autres (v3.6) : refusé tant que « Front panier » travaille, prêt quand il a fini.
+    expect((await spawn($, 'Vérificateur')).deny).toMatch(/« Vérificateur » passe après « Front panier », qui n'a pas fini/)
+    await endTurn($, w, front, 'completed')
+    expect(w.sent.map(x => x.text).join('\n')).toMatch(/revo-flow : « Front panier » a fini : lance maintenant « Vérificateur »/)
     // Le vérificateur : sa tâche (critères, diff), son Bash filtré, ses verdicts au panneau.
     const verifier = (await spawn($, 'Vérificateur')).agentId!
     expect(w.prompts.at(-1)).toMatch(/# Vérification du flow[\s\S]*- C2 : Le total du panier/)
@@ -1834,11 +1838,11 @@ test('test gelé modifié par Bash : la porte reste rouge sans l’accord de l�
   await $.tool.call({ tool: 'Write', file_path: `${ROOT}\\tests\\promo.test.ts`, agentId: tester, tool_use_id: 'w1' } as never)
   await endTurn($, w, tester, 'completed')
   const front = (await spawn($, 'Front panier')).agentId!
-  const verifier = (await spawn($, 'Vérificateur')).agentId!
   // Un Bash réécrit le test gelé : son hash change.
   w.hashes['tests/promo.test.ts'] = 'f'.repeat(40)
   w.ctl.answer = 'Refuser'
   await endTurn($, w, front, 'completed')
+  const verifier = (await spawn($, 'Vérificateur')).agentId!
   await endTurn($, w, verifier, 'completed')
   const r = await stop($)
   expect(w.asked.join('\n')).toMatch(/Le test gelé tests\/promo\.test\.ts \(écrit par « testeur »\) a été modifié hors des outils/)
@@ -2541,4 +2545,333 @@ test('livraison : hôte inconnu de gh et de glab, sans .gitlab-ci.yml → rien, 
   expect(questionsLivraison(w)).toEqual([])
   expect(cmds).toEqual([])
   expect(w.toasts.some(t => /livraison|glab|gh /.test(t))).toBe(false)
+})
+
+// ── v3.6 : plan ordonné (C6), budget (C7), critères ko et porte en panne (C8) ──
+
+const PLAN_ORDRE = {
+  titre: 'Code promo panier',
+  resume: 'L’API, puis le front.',
+  agents: [
+    { nom: 'API promo', modele: 'opus', effort: 'high', fichiers: ['api/**'], taches: ['Ajouter la mutation'] },
+    { nom: 'Front panier', modele: 'sonnet', effort: 'medium', apres: ['API promo'], fichiers: ['components/**'], taches: ['Ajouter le champ'] },
+  ],
+}
+
+const rapportOf = (w: ReturnType<typeof world>) => Object.entries(w.disk).find(([k]) => k.includes('/rapports/'))?.[1] ?? ''
+
+test('C6 · apres : un agent lancé avant la fin d’un agent de son « apres » est refusé avec le nom de l’agent attendu ; prêt quand il a fini (un seul message) ; fichiers hors périmètre signalés une fois et au rapport', async ($, on) => {
+  const w = world(on)
+  await launch($, w)
+  await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN_ORDRE } as never)
+  expect(w.asked[0]!).toMatch(/Front panier — Sonnet 5\.5, effort medium, 1 tâche, après « API promo »/)
+  // Lancé trop tôt : refusé, avec le nom de l'agent attendu ; il reste à lancer.
+  const tot = await spawn($, 'Front panier')
+  expect(tot.deny).toBe("revo-flow : « Front panier » passe après « API promo », qui n'a pas fini. Lance-le quand « API promo » aura rendu son rapport.")
+  expect(agentIn(w, 'front-panier').status).toBe('waiting')
+  const api = (await spawn($, 'API promo')).agentId!
+  // Hors de ses fichiers : un toast, une fois par fichier ; dans ses fichiers, rien.
+  await $.tool.call({ tool: 'Edit', file_path: `${ROOT}\\api\\promo.ts`, agentId: api, tool_use_id: 'e1' } as never)
+  await $.tool.call({ tool: 'Edit', file_path: `${ROOT}\\lib\\money.ts`, agentId: api, tool_use_id: 'e2' } as never)
+  await $.tool.call({ tool: 'Edit', file_path: `${ROOT}\\lib\\money.ts`, agentId: api, tool_use_id: 'e3' } as never)
+  expect(w.toasts.filter(t => /« API promo » modifie lib\/money\.ts, hors des fichiers que le plan lui donne/.test(t))).toHaveLength(1)
+  expect(w.toasts.some(t => /api\/promo\.ts, hors/.test(t))).toBe(false)
+  expect(agentIn(w, 'api-promo').horsPlan).toEqual(['lib/money.ts'])
+  // L'instantané de reprise garde « apres » et « fichiers », le flow restauré aussi ; le rappel après compaction les dit.
+  const snap = readSnapshot(w.store[snapshots(w)[0]!])!
+  expect(snap.flow.agents.find(a => a.key === 'front-panier')).toMatchObject({ after: ['api-promo'], files: ['components/**'] })
+  expect(resumedFlow(snap.flow).agents.find(a => a.key === 'front-panier')).toMatchObject({ after: ['api-promo'], files: ['components/**'] })
+  expect(flowRecap(w.states.flow as Flow)).toMatch(/« Front panier » \(Sonnet 5\.5, effort medium\) \[waiting\] après « API promo » · fichiers : components\/\*\*/)
+  // « API promo » a fini : l'orchestrateur est prévenu, une seule fois, de lancer « Front panier ».
+  await endTurn($, w, api, 'completed')
+  expect(w.sent.filter(x => /revo-flow : « API promo » a fini : lance maintenant « Front panier » avec l’outil Agent/.test(x.text))).toHaveLength(1)
+  const front = await spawn($, 'Front panier')
+  expect(front.deny).toBeUndefined()
+  expect(w.prompts.at(-1)).toMatch(/Ton périmètre : components\/\*\*/)
+  expect(w.prompts.at(-1)).not.toMatch(/Attention \(revo-flow\)/)
+  await endTurn($, w, front.agentId!, 'completed')
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' } as never)
+  await w.clock.settle()
+  expect(rapportOf(w)).toContain('## Périmètre')
+  expect(rapportOf(w)).toContain('Hors plan, touché quand même : lib/money.ts (agent API promo)')
+})
+
+test('C6 · apres : une dépendance en échec ne refuse pas le lancement ; l’agent est averti dans sa consigne, l’utilisateur par un toast', async ($, on) => {
+  const w = world(on)
+  await launch($, w)
+  await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN_ORDRE } as never)
+  const api = (await spawn($, 'API promo')).agentId!
+  await endTurn($, w, api, 'killed')
+  expect(w.sent.some(x => /lance maintenant « Front panier »/.test(x.text))).toBe(false)
+  const front = await spawn($, 'Front panier')
+  expect(front.deny).toBeUndefined()
+  expect(w.prompts.at(-1)).toMatch(/Attention \(revo-flow\) : « API promo », que tu devais attendre, a échoué ou reste bloqué : son travail peut manquer/)
+  expect(w.toasts.some(t => /« Front panier » part alors qu’un agent qu’il devait attendre a échoué/.test(t))).toBe(true)
+})
+
+/** Le modèle simulé : chaque requête rend l'usage STEP_USAGE (100 ↑, 50 ↓, 1 000 lus du cache, 20 écrits). */
+const stepUsage = (on: On) =>
+  on('turn.step', async function* (_$, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: STEP_USAGE } as never
+  })
+
+/** Une requête de l'orchestrateur sur Opus : 0,0017 $ comptés au flow. */
+const leadStep = async ($: Engine, w: ReturnType<typeof world>) => {
+  for await (const _ of $.turn.step({ turnId: 'lead-1', index: 0, model: 'claude-opus-5-5', messageCount: 1 } as never)) void _
+  await w.clock.settle()
+}
+
+const budgetQuestions = (w: ReturnType<typeof world>) => w.asked.filter(q => q.includes('Le flow a dépensé'))
+
+test('C7 · budget : la validation du plan affiche l’estimation et le plafond ; 80 % un toast ; 100 % la question Arrêter, +50 % ou Laisser finir ; Arrêter fait ce que fait Tout arrêter, journalisé « arrêté (budget) »', { options: { budget: '0,0018' } as never }, async ($, on) => {
+  const w = world(on)
+  stepUsage(on)
+  await launch($, w)
+  await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN } as never)
+  // Journal vide : les valeurs par défaut (Sonnet medium 0,80 $ + Opus high 2,50 $ + orchestrateur 1 $) ; plafond de l'option, en euros.
+  expect(w.asked[0]!).toMatch(/Estimation ≈ 3,96 € \(estimation par défaut\) · plafond 0,01 €\\nLancer ce plan \?/)
+  expect(rapportOf(w)).toBe('')
+  expect(Object.entries(w.disk).find(([k]) => k.includes('/plans/'))?.[1]).toMatch(/\*\*Budget\*\* : Estimation ≈ 3,96 € \(estimation par défaut\) · plafond 0,01 €/)
+  expect((w.states.flow as Flow).budget).toMatchObject({ base: 'defaut', flows: 0 })
+  const front = (await spawn($, 'Front panier')).agentId!
+  const api = (await spawn($, 'API promo')).agentId!
+  await $.turn.start({ turnId: 'lead-1' } as never)
+  // 1re requête : 86 % du plafond → un toast, une seule fois ; la bande montre la dépense contre le plafond.
+  await leadStep($, w)
+  expect(w.toasts.filter(t => /revo-flow : Budget à 86 % : 0,01 € sur 0,01 €\./.test(t))).toHaveLength(1)
+  expect(budgetQuestions(w)).toEqual([])
+  expect((await drawn($, 'terminal', 'AbovePrompt')).text).toMatch(/budget 0,01 € \/ 0,01 €/)
+  // 2e requête : 174 % → la question et ses trois réponses ; « +50 % » relève le plafond, le flow continue.
+  w.ctl.answer = '+50 %'
+  await leadStep($, w)
+  expect(budgetQuestions(w)).toHaveLength(1)
+  expect(budgetQuestions(w)[0]).toMatch(/Le flow a dépensé 0,01 € pour un plafond de 0,01 €\. Que faire \?/)
+  expect(budgetQuestions(w)[0]).toMatch(/Arrêter.*\+50 %.*Laisser finir/)
+  expect(Math.abs((w.states.flow as Flow).budget!.plafond! - (0.0018 / 0.92) * 1.5) < 1e-12).toBe(true)
+  expect(w.stopped).toEqual([])
+  // 3e requête : au-delà du nouveau plafond → la question, une fois pour lui ; « Arrêter » arrête tout, sans redemander.
+  w.ctl.answer = 'Arrêter'
+  await leadStep($, w)
+  expect(budgetQuestions(w)).toHaveLength(2)
+  expect(w.asked.some(q => /Arrêter 2 agents/.test(q))).toBe(false)
+  expect(w.stopped.sort()).toEqual([api, front].sort())
+  expect(w.aborted).toEqual(['lead-1'])
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 'lead-1', reason: 'aborted' } as never)
+  await w.clock.settle()
+  expect(w.notified.join('\n')).toMatch(/« Code promo panier » arrêté \(budget\)/)
+  expect((w.store.journal as JournalEntry[])[0]).toMatchObject({ isStopped: true, motif: 'budget', budget: { atteint: true } })
+  expect(await run($, 'historique')).toMatch(/Code promo panier \(ui-vel\) · .* · arrêté \(budget\)/)
+  // Le rapport est écrit quand même, avec le budget.
+  expect(rapportOf(w)).toMatch(/\*\*Fin\*\* : arrêté/)
+  expect(rapportOf(w)).toMatch(/\*\*Budget\*\* : estimé 3,96 € · plafond 0,01 € · réel 0,01 € · plafond atteint/)
+})
+
+test('C7 · budget : dialogue fermé, le flow continue sans plafond (jamais arrêté sur Échap), sans seconde question', { options: { budget: '0,0001' } as never }, async ($, on) => {
+  const w = world(on)
+  stepUsage(on)
+  await launch($, w)
+  await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN } as never)
+  await spawn($, 'Front panier')
+  w.ctl.answer = DISMISS
+  await leadStep($, w)
+  expect(budgetQuestions(w)).toHaveLength(1)
+  const flow = w.states.flow as Flow
+  expect(flow.isStopped).toBeUndefined()
+  expect(flow.budget!.plafond).toBeUndefined()
+  expect(flow.budget!.atteint).toBe(true)
+  await leadStep($, w)
+  expect(budgetQuestions(w)).toHaveLength(1)
+  expect(w.stopped).toEqual([])
+})
+
+test('C7 · budget sans personne à qui demander (claude -p) : arrêté sur le plafond, clos et journalisé sans fin de tour de l’orchestrateur', { options: { budget: '0,0001' } as never }, async ($, on) => {
+  const w = world(on)
+  stepUsage(on)
+  await launch($, w)
+  await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN } as never)
+  const front = (await spawn($, 'Front panier')).agentId!
+  w.surfaces.length = 0
+  w.ctl.answer = DISMISS
+  await leadStep($, w)
+  expect(budgetQuestions(w)).toHaveLength(1)
+  expect(w.stopped).toEqual([front])
+  expect((w.states.flow as Flow).phase).toBe('done')
+  expect(w.notified.join('\n')).toMatch(/« Code promo panier » arrêté \(budget\)/)
+  expect((w.store.journal as JournalEntry[])[0]).toMatchObject({ isStopped: true, motif: 'budget', budget: { atteint: true } })
+})
+
+test('budget off : ni estimation au plan, ni plafond, ni question ; la bande ne parle pas de budget', { options: { budget: 'off' } as never }, async ($, on) => {
+  const w = world(on)
+  stepUsage(on)
+  await launch($, w)
+  await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN } as never)
+  expect(w.asked[0]!).not.toMatch(/Estimation/)
+  expect((w.states.flow as Flow).budget).toBeUndefined()
+  await spawn($, 'Front panier')
+  for (let i = 0; i < 3; i++) await leadStep($, w)
+  expect(budgetQuestions(w)).toEqual([])
+  expect((await drawn($, 'terminal', 'AbovePrompt')).text).not.toMatch(/budget/)
+})
+
+const PLAN_C8 = {
+  ...PLAN,
+  criteres: ['Un code promo expiré affiche une erreur sous le champ', 'Le total du panier est arrondi au centime'],
+  agents: [...PLAN.agents, { nom: 'Vérificateur', type: 'revo-flow:verifier', modele: 'sonnet', effort: 'medium', taches: [{ titre: 'Juger les critères', type: 'review' }] }],
+}
+
+test('C8 · critère ko : la porte verte ne conclut pas, l’orchestrateur reçoit le critère ko et sa preuve ; après correction, un nouveau verdict ; exception acceptée → « vérifié ✓ · critères 1/2 · 1 ko »', async ($, on) => {
+  const w = world(on)
+  seedVerif(w, WINDOWS)
+  w.ctl.answer = 'Utiliser'
+  await launch($, w)
+  w.ctl.answer = 'Lancer'
+  await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN_C8 } as never)
+  const front = (await spawn($, 'Front panier')).agentId!
+  const api = (await spawn($, 'API promo')).agentId!
+  await $.tool.call({ tool: 'Edit', file_path: FILE, agentId: front, tool_use_id: 'u1' } as never)
+  w.verifRun.tsc = GREEN
+  await endTurn($, w, front, 'completed')
+  await endTurn($, w, api, 'completed')
+  const juge = (await spawn($, 'Vérificateur')).agentId!
+  w.status[juge] = 'completed'
+  const verdicts = '```json\n[{"id":"C1","verdict":"ok","preuve":"npx vitest run tests/promo.test.ts → ✓ C1"},{"id":"C2","verdict":"ko","preuve":"expected 10.005 to be 10.01"}]\n```'
+  await $.turn.complete({ answer: verdicts, durationMs: 1, isAborted: false, turnId: 'v', reason: 'answer', agentId: juge } as never)
+  await w.clock.settle()
+  // 1. Porte verte, un critère ko : la conclusion est refusée, avec le critère et sa preuve.
+  let r = await stop($)
+  expect(r.block).toMatch(/Critères d'acceptation \(revo-flow\) : 1 critère ko sur 2\./)
+  expect(r.block).toMatch(/- C2 Le total du panier est arrondi au centime : expected 10\.005 to be 10\.01/)
+  expect(r.block).toMatch(/relance le vérificateur \(subagent_type « revo-flow:verifier »\) pour un nouveau verdict/)
+  expect((await drawn($, 'terminal', 'AbovePrompt')).text).toMatch(/vérif ✓ \d+\/\d+ · critères 1\/2 · 1 ko/)
+  // 2. L'orchestrateur corrige : le « ko » d'avant la correction ne vaut plus, un nouveau verdict est exigé.
+  await $.tool.call({ tool: 'Edit', file_path: FILE, tool_use_id: 'u2' } as never)
+  r = await stop($, { stop_hook_active: true })
+  expect(r.block).toMatch(/le code a changé depuis le « ko » de C2 ; un nouveau verdict est obligatoire/)
+  // 3. Exception : l'utilisateur accepte de terminer malgré le critère ko ; la conclusion passe.
+  w.ctl.answer = 'Terminer malgré'
+  expect(JSON.stringify(await $.tool.call({ tool: 'mcp__revo-flow__verif', action: 'exception', motif: 'arrondi traité dans un autre ticket' } as never))).toMatch(/accepte de terminer malgré les critères ko/)
+  expect(w.asked.at(-1)!).toMatch(/1 critère ko : C2 \(expected 10\.005 to be 10\.01\)\. L’orchestrateur demande une exception : « arrondi traité dans un autre ticket »/)
+  expect((await stop($, { stop_hook_active: true })).block).toBeUndefined()
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' } as never)
+  await w.clock.settle()
+  expect(w.notified.join('\n')).toMatch(/terminé · vérifié ✓ · critères 1\/2 · 1 ko/)
+  expect(await run($, 'historique')).toMatch(/· vérif ✓ · critères 1\/2 · 1 ko/)
+  expect(rapportOf(w)).toMatch(/Non vérifié : .*C2 ko/)
+})
+
+test('revue de la PR #5 · critère ko sans personne : une exception redemandée à chaque block ne repousse pas le plafond ; les verdicts sont gardés pour un rechargement du mod', async ($, on) => {
+  const w = world(on)
+  seedVerif(w, WINDOWS)
+  w.ctl.answer = 'Utiliser'
+  await launch($, w)
+  w.ctl.answer = 'Lancer'
+  await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN_C8 } as never)
+  const front = (await spawn($, 'Front panier')).agentId!
+  const api = (await spawn($, 'API promo')).agentId!
+  await $.tool.call({ tool: 'Edit', file_path: FILE, agentId: front, tool_use_id: 'u1' } as never)
+  w.verifRun.tsc = GREEN
+  await endTurn($, w, front, 'completed')
+  await endTurn($, w, api, 'completed')
+  const juge = (await spawn($, 'Vérificateur')).agentId!
+  w.status[juge] = 'completed'
+  const verdicts = '```json\n[{"id":"C1","verdict":"ok","preuve":"vu"},{"id":"C2","verdict":"ko","preuve":"expected 10.005 to be 10.01"}]\n```'
+  await $.turn.complete({ answer: verdicts, durationMs: 1, isAborted: false, turnId: 'v', reason: 'answer', agentId: juge } as never)
+  await w.clock.settle()
+  // Plus personne à qui demander (claude -p) : chaque block est suivi d'une demande d'exception, qui rend « une tentative de plus ».
+  w.surfaces.length = 0
+  w.ctl.answer = DISMISS
+  const exception = async () => JSON.stringify(await $.tool.call({ tool: 'mcp__revo-flow__verif', action: 'exception', motif: 'pas le temps' } as never))
+  expect((await stop($)).block).toMatch(/1 critère ko sur 2/)
+  // Les verdicts et le compte des blocks sont dans l'atom gardé : un critère ko bloque encore après un rechargement du mod.
+  expect(w.states.verifFlow).toMatchObject({ criteresBlocks: 1, verdicts: [{ id: 'C1', verdict: 'ok' }, { id: 'C2', verdict: 'ko' }] })
+  expect(await exception()).toMatch(/critères ko soient corrigés/)
+  expect((await stop($, { stop_hook_active: true })).block).toMatch(/1 critère ko sur 2/)
+  expect(await exception()).toMatch(/critères ko soient corrigés/)
+  expect((await stop($, { stop_hook_active: true })).block).toMatch(/1 critère ko sur 2/)
+  expect(await exception()).toMatch(/critères ko soient corrigés/)
+  // 4e fin de tour : le plafond (3) n'a pas bougé, la question du plafond se termine sans personne, le tour finit.
+  expect((await stop($, { stop_hook_active: true })).block).toBeUndefined()
+})
+
+test('C8 · sans critère ko, la porte verte conclut ; un critère non vérifiable ne bloque pas mais s’affiche', async ($, on) => {
+  const w = world(on)
+  seedVerif(w, WINDOWS)
+  w.ctl.answer = 'Utiliser'
+  await launch($, w)
+  w.ctl.answer = 'Lancer'
+  await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN_C8 } as never)
+  const front = (await spawn($, 'Front panier')).agentId!
+  const api = (await spawn($, 'API promo')).agentId!
+  w.verifRun.tsc = GREEN
+  await endTurn($, w, front, 'completed')
+  await endTurn($, w, api, 'completed')
+  const juge = (await spawn($, 'Vérificateur')).agentId!
+  w.status[juge] = 'completed'
+  const verdicts = '```json\n[{"id":"C1","verdict":"ok","preuve":"vitest ✓"},{"id":"C2","verdict":"non-verifiable","preuve":"banc de caisse absent"}]\n```'
+  await $.turn.complete({ answer: verdicts, durationMs: 1, isAborted: false, turnId: 'v', reason: 'answer', agentId: juge } as never)
+  await w.clock.settle()
+  expect((await stop($)).block).toBeUndefined()
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' } as never)
+  await w.clock.settle()
+  expect(w.notified.join('\n')).toMatch(/terminé · vérifié ✓ · critères 1\/2 ·/)
+  expect(w.notified.join('\n')).not.toMatch(/ko/)
+})
+
+const pannes = (w: ReturnType<typeof world>) => w.asked.filter(q => q.includes("La porte n'a pas pu juger"))
+
+test('C8 · porte en panne : la question (Relancer la porte, Terminer non vérifié, Voir le détail) au lieu de finir en silence ; deux relances au plus ; « non vérifié (porte en panne : …) » partout', async ($, on) => {
+  const w = world(on)
+  seedVerif(w, WINDOWS)
+  const { front, api } = await launchVerif($, w)
+  await $.tool.call({ tool: 'Edit', file_path: FILE, agentId: front, tool_use_id: 'u1' } as never)
+  // typecheck ne rend jamais la main : délai dépassé à chaque lancement, aucune erreur nouvelle à corriger.
+  w.runAvant.repond = a => (a.includes('tsc') ? { deny: 'process timed out' } : undefined)
+  await endTurn($, w, front, 'completed')
+  await endTurn($, w, api, 'completed')
+  w.ctl.answer = undefined
+  const fin = stop($)
+  await w.clock.settle()
+  expect(pannes(w)).toHaveLength(1)
+  expect(pannes(w)[0]).toMatch(/La porte n'a pas pu juger : typecheck : délai dépassé \(10 min 00\)\. Relancer la porte, ou terminer non vérifié \?/)
+  expect(pannes(w)[0]).toMatch(/Relancer la porte.*Terminer non vérifié.*Voir le détail/)
+  expect((w.states.verif as { enAttente?: string }).enAttente).toBe('Porte en panne')
+  // Voir le détail : la sortie complète s'ouvre, la question revient.
+  w.ctl.pending!('Voir le détail')
+  await w.clock.settle()
+  expect(w.runs.some(x => x[0] === 'cmd' && x.includes('start'))).toBe(true)
+  expect(pannes(w)).toHaveLength(2)
+  // Relancer : la porte repart ; deux relances au plus, la question suivante ne le propose plus.
+  for (const n of [3, 4]) {
+    w.ctl.pending!('Relancer la porte')
+    await w.clock.settle()
+    expect(pannes(w)).toHaveLength(n)
+  }
+  expect(pannes(w)[3]).toMatch(/Elle a déjà été relancée deux fois : terminer non vérifié \?/)
+  expect(pannes(w)[3]).not.toMatch(/Relancer la porte/)
+  w.ctl.pending!('Terminer non vérifié')
+  expect((await fin).block).toBeUndefined()
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' } as never)
+  await w.clock.settle()
+  expect(w.notified.join('\n')).toMatch(/terminé · non vérifié \(porte en panne : typecheck délai dépassé\) · accepté/)
+  expect(await run($, 'historique')).toMatch(/· vérif ✗ panne/)
+  expect(rapportOf(w)).toMatch(/\*\*Verdict\*\* : non vérifié \(porte en panne : typecheck : délai dépassé \(10 min 00\)\) · accepté par l'utilisateur/)
+})
+
+test('C8 · porte en panne sans personne à qui demander (claude -p) : terminé non vérifié, sans « accepté »', async ($, on) => {
+  const w = world(on)
+  seedVerif(w, WINDOWS)
+  const { front, api } = await launchVerif($, w)
+  await $.tool.call({ tool: 'Edit', file_path: FILE, agentId: front, tool_use_id: 'u1' } as never)
+  w.runAvant.repond = a => (a.includes('tsc') ? { deny: 'process timed out' } : undefined)
+  await endTurn($, w, front, 'completed')
+  await endTurn($, w, api, 'completed')
+  w.surfaces.length = 0
+  w.ctl.answer = DISMISS
+  expect((await stop($)).block).toBeUndefined()
+  expect(pannes(w)).toHaveLength(1)
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' } as never)
+  await w.clock.settle()
+  expect(w.notified.join('\n')).toMatch(/terminé · non vérifié \(porte en panne : typecheck délai dépassé\) ·/)
+  expect(w.notified.join('\n')).not.toMatch(/accepté/)
+  expect((w.store.journal as JournalEntry[])[0]!.verif).toMatchObject({ etat: 'non-verifie', pannes: ['typecheck : délai dépassé (10 min 00)'] })
 })

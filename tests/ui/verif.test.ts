@@ -2,6 +2,10 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import { barSvg, verifNoteSvg, verifRowSvg } from '../../hooks/ui/art'
 import {
+  bandNote,
+  budgetView,
+  criteresSuffix,
+  mobileLine,
   verifCommandRow,
   verifCommandText,
   verifCriteriaText,
@@ -12,7 +16,7 @@ import {
   verifTone,
   webLine,
 } from '../../hooks/ui/views'
-import type { VerifEtatCommande, VerifView, WebView } from '../../types/verif'
+import type { MobileView, VerifEtatCommande, VerifView, WebView } from '../../types/verif'
 
 const cmd = (o: Partial<VerifEtatCommande> & { id: string }): VerifEtatCommande => ({
   outil: 'lint',
@@ -193,5 +197,65 @@ describe('webLine : la preuve web', () => {
     const n = verifNotes(view({ criteres: { total: 1, ok: 1, verdicts: [] }, web: web(), enAttente: 'Continuer ?' }))
     expect(n.map(x => x.text.split(' ')[0])).toEqual(['Critères', 'preuve', 'en'])
     expect(verifNotes(view({ web: web({ etat: 'non-demande' }) }))).toEqual([])
+  })
+})
+
+describe('v3.6 : critères, panne, budget et preuve restée sans réponse dans la bande et le panneau', () => {
+  const crit = (verdicts: { id: string; verdict: 'ok' | 'ko' | 'non-verifiable' }[], total = 8) => ({
+    total,
+    ok: verdicts.filter(v => v.verdict === 'ok').length,
+    verdicts: verdicts.map(v => ({ ...v, preuve: 'x' })),
+  })
+
+  test('verifLine : « vérif ✓ 3/3 · critères 6/8 », « · 1 ko » s’il y en a, orange ; sans critères, inchangée', () => {
+    const run = [cmd({ id: 'eslint' }), cmd({ id: 'typecheck' }), cmd({ id: 'vitest' })]
+    const ok6 = Array.from({ length: 6 }, (_, i) => ({ id: `C${i + 1}`, verdict: 'ok' as const }))
+    const v = view({ etat: 'vert', commandes: run, criteres: crit([...ok6, { id: 'C7', verdict: 'non-verifiable' }]) })
+    expect(verifLine(v)).toBe('vérif ✓ 3/3 · critères 6/8')
+    expect(verifTone(v)).toBe('ok')
+    const ko = view({ etat: 'vert', commandes: run, criteres: crit([...ok6, { id: 'C7', verdict: 'ko' }]) })
+    expect(verifLine(ko)).toBe('vérif ✓ 3/3 · critères 6/8 · 1 ko')
+    expect(verifTone(ko)).toBe('warn')
+    expect(criteresSuffix(view({ etat: 'vert', commandes: run }))).toBe('')
+    expect(verifLine(view({ etat: 'vert', commandes: run }))).toBe('vérif ✓ 3/3')
+  })
+
+  test('verifLine : la porte en panne nomme la commande ; sans commande en panne, « erreur » (revo-flow a planté)', () => {
+    expect(verifLine(view({ etat: 'erreur', commandes: [cmd({ id: 'eslint' }), cmd({ id: 'flutter-test', etat: 'erreur', note: 'délai dépassé (10 min 00)' })] }))).toBe('vérif ⚠ panne flutter-test')
+    expect(verifLine(view({ etat: 'erreur' }))).toBe('vérif ⚠ erreur')
+  })
+
+  const flowAvec = (plafond: number | undefined, depense: number) =>
+    ({
+      flow: { title: 'T', agents: [{ costUsd: depense / 2 }], budget: { estime: 1, base: 'defaut', flows: 0, ...(plafond === undefined ? {} : { plafond }) } },
+      lead: { costUsd: depense / 2 },
+    }) as never
+
+  test('budgetView : dépense / plafond, la part, orange à 80 %, rouge à 100 % ; rien sans plafond', () => {
+    expect(budgetView(flowAvec(1, 0.5))).toEqual({ text: '0,46 € / 0,92 €', percent: 50, tone: 'dim' })
+    expect(budgetView(flowAvec(1, 0.85))!.tone).toBe('warn')
+    expect(budgetView(flowAvec(1, 1.2))!.tone).toBe('ko')
+    expect(budgetView(flowAvec(undefined, 0.5))).toBeUndefined()
+    expect(budgetView({ flow: null, lead: { costUsd: 0 } } as never)).toBeUndefined()
+  })
+
+  test('bandNote : la vérification puis le budget ; la couleur du budget l’emporte dès l’alerte', () => {
+    const vert = view({ etat: 'vert', commandes: [cmd({ id: 'eslint' })] })
+    const d = (plafond: number | undefined, depense: number, verif: VerifView | null) => ({ ...(flowAvec(plafond, depense) as object), verif }) as never
+    expect(bandNote(d(1, 0.5, vert))).toEqual({ text: 'vérif ✓ 1/1 · budget 0,46 € / 0,92 €', tone: 'ok' })
+    expect(bandNote(d(1, 0.9, vert))).toEqual({ text: 'vérif ✓ 1/1 · budget 0,83 € / 0,92 €', tone: 'warn' })
+    expect(bandNote(d(1, 0.5, null))).toEqual({ text: 'budget 0,46 € / 0,92 €', tone: 'dim' })
+    expect(bandNote(d(undefined, 0.5, vert))).toEqual({ text: 'vérif ✓ 1/1', tone: 'ok' })
+    expect(bandNote(d(undefined, 0.5, null))).toBeUndefined()
+  })
+
+  test('preuve web et mobile : « ferme » (question restée sans réponse) se distingue du refus ; le premier build peut être long', () => {
+    expect(webLine(view({ web: { etat: 'ferme', captures: [] } }))).toEqual({ mark: '–', tone: 'dim', text: 'preuve web : serveur non démarré (question restée sans réponse)' })
+    const m = (o: Partial<MobileView>): MobileView => ({ etat: 'refuse', captures: [], ...o })
+    expect(mobileLine(view({ mobile: m({}) }))!.text).toBe('preuve mobile : app non lancée (votre choix)')
+    expect(mobileLine(view({ mobile: m({ etat: 'ferme' }) }))!.text).toBe('preuve mobile : app non lancée (question restée sans réponse)')
+    expect(mobileLine(view({ mobile: m({ etat: 'installation', commande: 'flutter run -d x', appareil: 'Pixel 8' }) }))!.text).toBe(
+      'preuve mobile : « flutter run -d x » sur Pixel 8 (le premier build peut être long, 15 min au plus)',
+    )
   })
 })

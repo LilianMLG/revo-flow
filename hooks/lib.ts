@@ -1,6 +1,8 @@
 /** La logique pure du flow : plan, appariement des agents, tâches et progression, consignes, tokens et coûts, journal. */
 import type { Critere, Effort, Flow, FlowAgent, FlowTask, ModelKey, Phase, TaskKind, TaskStatus, Tally, VerifJournal } from '../types'
+import type { BudgetJournal } from './budget'
 import { parseCriteres } from './verif/garde'
+import { globMatch, norm } from './verif/scope'
 
 export const PLUGIN = 'revo-flow'
 export const PLAN_TOOL = `mcp__${PLUGIN}__plan`
@@ -56,6 +58,61 @@ export const slug = (s: string) =>
 
 const str = (v: unknown) => (typeof v === 'string' ? v.trim() : '')
 
+type PlanAgent = PlanInput['agents'][number]
+
+/** Les agents tels que les fonctions d'ordre les lisent : le plan (PlanAgent) comme le flow (FlowAgent). */
+type Ordered = Pick<FlowAgent, 'key' | 'name' | 'after' | 'subagentType'>
+
+/** Au plus autant de fichiers (ou motifs) déclarés par agent. */
+const MAX_FILES = 20
+
+/** Une liste de textes (ou un seul texte) : sans les vides ni les doublons. */
+function readList(raw: unknown): string[] {
+  const list = Array.isArray(raw) ? (raw as unknown[]) : typeof raw === 'string' ? [raw] : []
+  return [...new Set(list.map(str).filter(Boolean))]
+}
+
+/** Les fichiers déclarés (« fichiers ») : chemins relatifs à la racine, « dossier/ » vaut « dossier/** ». */
+const readFiles = (raw: unknown) => [...new Set(readList(raw).map(f => norm(f)).map(f => (f.endsWith('/') ? `${f}**` : f)))]
+
+/** Les tâches d'un agent : titre et type lus, les titres vides écartés. */
+function readTasks(raw: unknown): FlowTask[] {
+  return (Array.isArray(raw) ? (raw as unknown[]) : [])
+    .map(t => (typeof t === 'string' ? { titre: t } : typeof t === 'object' && t !== null ? (t as Record<string, unknown>) : {}))
+    .map(t => ({ title: str(t.titre).slice(0, 70), kind: kindOf(str(t.type)), status: 'pending' as const }))
+    .filter(t => t.title.length > 0)
+}
+
+/** Lit un agent de l'appel plan : sa fiche et les noms de « apres » (résolus ensuite), ou ce qui ne va pas. */
+function readAgent(x: unknown, i: number, used: Set<string>): { agent: PlanAgent; apres: string[] } | { error: string } {
+  const a = typeof x === 'object' && x !== null ? (x as Record<string, unknown>) : {}
+  const name = str(a.nom).slice(0, 40) || `Agent ${i + 1}`
+  let key = slug(name) || `agent-${i + 1}`
+  if (used.has(key)) key = `${key}-${i + 1}`
+  used.add(key)
+  const model = str(a.modele).toLowerCase()
+  if (!(model in MODELS)) return { error: `Agent « ${name} » : modele doit être haiku, sonnet ou opus.` }
+  const effort = str(a.effort).toLowerCase()
+  if (!EFFORTS.includes(effort as Effort)) return { error: `Agent « ${name} » : effort doit être low, medium, high ou xhigh.` }
+  const tasks = readTasks(a.taches)
+  if (tasks.length === 0) return { error: `Agent « ${name} » : donne-lui au moins une tâche (taches).` }
+  if (tasks.length > 12) return { error: `Agent « ${name} » : ${tasks.length} tâches, 12 au plus.` }
+  const files = readFiles(a.fichiers)
+  if (files.length > MAX_FILES) return { error: `Agent « ${name} » : ${files.length} fichiers, ${MAX_FILES} au plus (regroupe-les avec des motifs : hooks/verif/**).` }
+  const agent: PlanAgent = {
+    key,
+    name,
+    role: str(a.role).slice(0, 160),
+    subagentType: typeOf(str(a.type)),
+    model: model as ModelKey,
+    effort: effort as Effort,
+    why: str(a.pourquoi).slice(0, 160),
+    tasks,
+    ...(files.length ? { files } : {}),
+  }
+  return { agent, apres: readList(a.apres) }
+}
+
 /** Lit l'appel à l'outil plan. Renvoie le plan, ou ce qui ne va pas, à renvoyer tel quel à l'orchestrateur. */
 export function parsePlan(input: Record<string, unknown>): { plan: PlanInput } | { error: string } {
   const title = str(input.titre).slice(0, 70)
@@ -64,34 +121,16 @@ export function parsePlan(input: Record<string, unknown>): { plan: PlanInput } |
   if (raw.length === 0) return { error: '« agents » vide : prévois au moins un sous-agent.' }
   if (raw.length > 6) return { error: `${raw.length} agents : 6 au plus. Regroupe des tâches.` }
   const agents: PlanInput['agents'] = []
+  const apres: string[][] = []
   const used = new Set<string>()
   for (const [i, x] of raw.entries()) {
-    const a = typeof x === 'object' && x !== null ? (x as Record<string, unknown>) : {}
-    const name = str(a.nom).slice(0, 40) || `Agent ${i + 1}`
-    let key = slug(name) || `agent-${i + 1}`
-    if (used.has(key)) key = `${key}-${i + 1}`
-    used.add(key)
-    const model = str(a.modele).toLowerCase()
-    if (!(model in MODELS)) return { error: `Agent « ${name} » : modele doit être haiku, sonnet ou opus.` }
-    const effort = str(a.effort).toLowerCase()
-    if (!EFFORTS.includes(effort as Effort)) return { error: `Agent « ${name} » : effort doit être low, medium, high ou xhigh.` }
-    const tasks: FlowTask[] = (Array.isArray(a.taches) ? (a.taches as unknown[]) : [])
-      .map(t => (typeof t === 'string' ? { titre: t } : typeof t === 'object' && t !== null ? (t as Record<string, unknown>) : {}))
-      .map(t => ({ title: str(t.titre).slice(0, 70), kind: kindOf(str(t.type)), status: 'pending' as const }))
-      .filter(t => t.title.length > 0)
-    if (tasks.length === 0) return { error: `Agent « ${name} » : donne-lui au moins une tâche (taches).` }
-    if (tasks.length > 12) return { error: `Agent « ${name} » : ${tasks.length} tâches, 12 au plus.` }
-    agents.push({
-      key,
-      name,
-      role: str(a.role).slice(0, 160),
-      subagentType: typeOf(str(a.type)),
-      model: model as ModelKey,
-      effort: effort as Effort,
-      why: str(a.pourquoi).slice(0, 160),
-      tasks,
-    })
+    const r = readAgent(x, i, used)
+    if ('error' in r) return r
+    agents.push(r.agent)
+    apres.push(r.apres)
   }
+  const order = resolveOrder(agents, apres)
+  if (order) return { error: order }
   // Les critères d'acceptation : facultatifs ; donnés, ils doivent être valides (1 à 8, vérifiables), sinon le plan est refusé.
   const rawCriteres = input.criteres
   const hasCriteres = rawCriteres !== undefined && rawCriteres !== null && !(Array.isArray(rawCriteres) && rawCriteres.length === 0)
@@ -102,6 +141,207 @@ export function parsePlan(input: Record<string, unknown>): { plan: PlanInput } |
     criteres = c.criteres
   }
   return { plan: { title, summary: str(input.resume).slice(0, 400), agents, ...(criteres?.length ? { criteres } : {}) } }
+}
+
+// ── L'ordre des agents : dépendances, vagues, fichiers déclarés ──────────
+
+/** Les clés des agents qui doivent finir avant celui-ci : ses « apres », et pour le vérificateur tous les autres (implicite). */
+export function agentDeps(agents: readonly Ordered[], a: Ordered): string[] {
+  const implicit = isVerifier(a) ? agents.filter(b => b.key !== a.key && !isVerifier(b)).map(b => b.key) : []
+  return [...new Set([...(a.after ?? []), ...implicit])]
+}
+
+/** « « a » », « « a » et « b » », « « a », « b » et « c » ». */
+export function joinNames(names: readonly string[]): string {
+  const q = names.map(n => `« ${n} »`)
+  return q.length < 2 ? q.join('') : `${q.slice(0, -1).join(', ')} et ${q.at(-1)}`
+}
+
+/** Les noms des agents cités dans « apres » par `a` (la clé si l'agent n'est plus dans la liste). */
+const afterNames = (agents: readonly Ordered[], a: Ordered) => (a.after ?? []).map(k => agents.find(b => b.key === k)?.name ?? k)
+
+/** Résout les « apres » (noms ou clés) en clés dans `agents`, puis refuse un cycle ou un fichier déclaré par deux agents non ordonnés. */
+function resolveOrder(agents: PlanAgent[], apres: string[][]): string | undefined {
+  for (const [i, a] of agents.entries()) {
+    const keys: string[] = []
+    for (const ref of apres[i] ?? []) {
+      const dep = findAgent(agents, ref)
+      if (!dep) return `Agent « ${a.name} » : apres cite « ${ref} », qui n'est pas dans le plan. Noms possibles : ${joinNames(agents.filter(b => b !== a).map(b => b.name))}.`
+      if (dep.key === a.key) return `Agent « ${a.name} » : apres le cite lui-même.`
+      keys.push(dep.key)
+    }
+    if (keys.length) a.after = [...new Set(keys)]
+  }
+  const cycle = findCycle(agents)
+  if (cycle) return `apres en cycle : ${cycle.map(k => `« ${agents.find(b => b.key === k)!.name} »`).join(' → ')}. Chaque agent passe après le suivant : retire une dépendance.`
+  return sharedFile(agents)
+}
+
+/** Un cycle de dépendances, de la clé de départ à elle-même (a → b → a), ou rien. */
+function findCycle(agents: readonly Ordered[]): string[] | undefined {
+  const state = new Map<string, 'open' | 'closed'>()
+  const path: string[] = []
+  const visit = (a: Ordered): string[] | undefined => {
+    if (state.get(a.key) === 'closed') return undefined
+    if (state.get(a.key) === 'open') return [...path.slice(path.indexOf(a.key)), a.key]
+    state.set(a.key, 'open')
+    path.push(a.key)
+    for (const d of agentDeps(agents, a)) {
+      const found = visit(agents.find(b => b.key === d)!)
+      if (found) return found
+    }
+    path.pop()
+    state.set(a.key, 'closed')
+    return undefined
+  }
+  for (const a of agents) {
+    const found = visit(a)
+    if (found) return found
+  }
+  return undefined
+}
+
+/** Toutes les clés dont `a` dépend, de proche en proche (sans lui-même). */
+function ancestors(agents: readonly Ordered[], a: Ordered): Set<string> {
+  const out = new Set<string>()
+  const todo = agentDeps(agents, a)
+  for (let k = todo.shift(); k !== undefined; k = todo.shift()) {
+    if (out.has(k)) continue
+    out.add(k)
+    const dep = agents.find(b => b.key === k)
+    if (dep) todo.push(...agentDeps(agents, dep))
+  }
+  return out
+}
+
+const isGlob = (p: string) => /[*?{]/.test(p)
+
+/** Le dossier d'un motif, avant son premier joker : « hooks/verif/** » → « hooks/verif/ ». */
+const globDir = (p: string) => p.slice(0, p.search(/[*?{]/)).replace(/[^/]*$/, '')
+
+/** Le motif descend-il dans les sous-dossiers de son dossier (« ** », ou un « / » après le premier joker) ? « hooks/*.ts » non. */
+const isDeep = (p: string) => /\*\*|\//.test(p.slice(globDir(p).length))
+
+/** Deux motifs : un motif à plat n'attrape que son propre dossier, que l'autre doit pouvoir atteindre ; deux profonds, préfixe l'un de l'autre. */
+function globsOverlap(a: string, b: string): boolean {
+  // Un motif sans « / » (« *.md ») porte sur le nom du fichier, dans n'importe quel dossier (globMatch) : il peut recouvrir tout autre motif.
+  if (!a.includes('/') || !b.includes('/')) return true
+  const [da, db] = [globDir(a), globDir(b)]
+  if (!isDeep(a) && !isDeep(b)) return da === db
+  if (!isDeep(a)) return da.startsWith(db)
+  if (!isDeep(b)) return db.startsWith(da)
+  return da.startsWith(db) || db.startsWith(da)
+}
+
+/**
+ * Deux déclarations se recouvrent-elles ? Chemins identiques ; un chemin littéral que le motif de l'autre attrape ;
+ * deux motifs : par leurs dossiers (prudent : peut refuser à tort, jamais laisser passer), « hooks/*.ts » n'atteignant pas « hooks/verif/ ».
+ */
+export function pathsOverlap(a: string, b: string): boolean {
+  if (a === b) return true
+  if (!isGlob(a)) return isGlob(b) && globMatch(b, a)
+  if (!isGlob(b)) return globMatch(a, b)
+  return globsOverlap(a, b)
+}
+
+/** Le premier fichier déclaré par deux agents qui ne sont pas ordonnés l'un après l'autre : le refus qui le nomme, ou rien. */
+function sharedFile(agents: readonly PlanAgent[]): string | undefined {
+  for (const [i, a] of agents.entries()) {
+    const before = ancestors(agents, a)
+    for (const b of agents.slice(i + 1)) {
+      if (before.has(b.key) || ancestors(agents, b).has(a.key)) continue
+      for (const p of a.files ?? []) {
+        const q = (b.files ?? []).find(f => pathsOverlap(p, f))
+        if (q !== undefined) return `« ${a.name} » et « ${b.name} » déclarent tous deux ${p === q ? p : `${p} et ${q}`} : ordonne-les avec apres, ou redécoupe.`
+      }
+    }
+  }
+  return undefined
+}
+
+/** Le niveau de chaque agent : 1 sans dépendance, sinon 1 de plus que sa dépendance la plus tardive. */
+function levels(agents: readonly Ordered[]): Map<string, number> {
+  const memo = new Map<string, number>()
+  const level = (a: Ordered, seen: ReadonlySet<string>): number => {
+    const known = memo.get(a.key)
+    if (known !== undefined) return known
+    if (seen.has(a.key)) return 0 // cycle : refusé par parsePlan, jamais atteint ici
+    const next = new Set(seen).add(a.key)
+    const deps = agentDeps(agents, a).flatMap(k => agents.find(b => b.key === k) ?? [])
+    const n = 1 + Math.max(0, ...deps.map(d => level(d, next)))
+    memo.set(a.key, n)
+    return n
+  }
+  for (const a of agents) level(a, new Set())
+  return memo
+}
+
+/** Les vagues de noms d'agents, dans l'ordre : la première sans dépendance, la dernière avec le vérificateur. */
+export function waves(agents: readonly Ordered[]): string[][] {
+  const lvl = levels(agents)
+  const last = Math.max(0, ...lvl.values())
+  return Array.from({ length: last }, (_, i) => agents.filter(a => lvl.get(a.key) === i + 1).map(a => a.name))
+}
+
+/** Les agents pas encore lancés (waiting, sans agentId) dont toutes les dépendances ont fini (done). */
+export function readyAgents(flow: Pick<Flow, 'agents'>): FlowAgent[] {
+  return flow.agents.filter(a => a.status === 'waiting' && !a.agentId && pendingDeps(flow, a).length === 0 && failedDeps(flow, a).length === 0)
+}
+
+/** `b`, bloqué, attend-il `a` lui-même ? Alors refuser `a` à cause de `b` ne se dénouerait jamais. */
+const waitsOn = (b: FlowAgent, a: FlowAgent) => b.waitingFor?.key === a.key
+
+/**
+ * Les dépendances de `a` qui n'ont pas fini et n'ont pas échoué (en attente, en cours, bloquées). Pour le vérificateur, une dépendance
+ * bloquée (elle attend un agent qui ne viendra pas la relancer) compte comme finie, comme dans allFinished : sinon il ne partirait jamais.
+ * Une dépendance bloquée qui attend `a` lui-même ne le retient pas non plus (attente croisée) : elle est signalée par failedDeps.
+ */
+function pendingDeps(flow: Pick<Flow, 'agents'>, a: FlowAgent): FlowAgent[] {
+  const over = (b: FlowAgent) => b.status === 'done' || b.status === 'failed' || (b.status === 'blocked' && (isVerifier(a) || waitsOn(b, a)))
+  return agentDeps(flow.agents, a).flatMap(k => flow.agents.find(b => b.key === k && !over(b)) ?? [])
+}
+
+/** Les dépendances de `a` qui ont échoué (failed) ou qui, bloquées, l'attendent lui-même : l'orchestrateur décide de lancer quand même ou de reprendre. */
+export function failedDeps(flow: Pick<Flow, 'agents'>, a: FlowAgent): FlowAgent[] {
+  const lost = (b: FlowAgent) => b.status === 'failed' || (b.status === 'blocked' && waitsOn(b, a))
+  return agentDeps(flow.agents, a).flatMap(k => flow.agents.find(b => b.key === k && lost(b)) ?? [])
+}
+
+/**
+ * Le refus de lancer `a` tant qu'une dépendance n'a pas fini (en attente, en cours ou bloquée), en la nommant ; rien sinon.
+ * Une dépendance échouée (failed) ne refuse pas : le flow n'aurait plus d'issue, l'orchestrateur décide (failedDeps pour l'avertir).
+ */
+export function launchDenial(flow: Pick<Flow, 'agents'>, a: FlowAgent): string | undefined {
+  const wait = pendingDeps(flow, a)
+  if (wait.length === 0) return undefined
+  const names = joinNames(wait.map(w => w.name))
+  const [has, will] = wait.length > 1 ? ["n'ont", 'auront rendu leur'] : ["n'a", 'aura rendu son']
+  return `revo-flow : « ${a.name} » passe après ${names}, qui ${has} pas fini. Lance-le quand ${names} ${will} rapport.`
+}
+
+/** L'agent du plan déjà lancé (parmi `claimed`, au travail) que cet appel Agent nomme exactement une seconde fois, ou rien. */
+export function runningTwin(claimed: readonly FlowAgent[], description: string, name?: string): FlowAgent | undefined {
+  const asked = [slug(description), slug(name ?? '')].filter(Boolean)
+  return claimed.find(a => a.status === 'running' && asked.includes(a.key))
+}
+
+/** Le message à l'orchestrateur quand la fin de `a` rend d'autres agents prêts (tous leurs « apres » ont fini). */
+export function readyText(a: Pick<FlowAgent, 'name'>, ready: readonly Pick<FlowAgent, 'name'>[]): string {
+  return `revo-flow : « ${a.name} » a fini : lance maintenant ${joinNames(ready.map(r => r.name))} avec l’outil Agent (description = son nom exact).`
+}
+
+/** L'avertissement ajouté à la consigne d'un agent lancé alors qu'un agent dont il dépend a échoué ; '' sans échec. */
+export function failedDepsNote(failed: readonly Pick<FlowAgent, 'name'>[]): string {
+  if (!failed.length) return ''
+  const [has, its] = failed.length > 1 ? ['ont échoué ou restent bloqués', 'leur travail'] : ['a échoué ou reste bloqué', 'son travail']
+  return `Attention (revo-flow) : ${joinNames(failed.map(f => f.name))}, que tu devais attendre, ${has} : ${its} peut manquer ou être incomplet ; vérifie ce dont tu as besoin avant de t’en servir.`
+}
+
+/** Les chemins modifiés par l'agent qui ne correspondent à aucun de ses fichiers déclarés ([] s'il n'en a pas déclaré). */
+export function outOfScope(a: Pick<FlowAgent, 'files'>, paths: readonly string[]): string[] {
+  const files = a.files ?? []
+  if (files.length === 0) return []
+  return paths.filter(p => !files.some(f => norm(p) === f || (isGlob(f) && globMatch(f, p))))
 }
 
 /** Le type de sous-agent : « verifier » ou « revo-flow:verifier » désignent le vérificateur enregistré par revo-flow. */
@@ -152,7 +392,7 @@ const hasWords = (whole: string, part: string) => `-${whole}-`.includes(`-${part
  * L'agent du plan que nomme `text` (sa clé ou son nom ; guillemets, accents et casse ignorés), hors `self`, ou rien.
  * Sert à l'outil step quand un agent dit qui il attend.
  */
-export function findAgent(agents: readonly FlowAgent[], text: string, self?: string): FlowAgent | undefined {
+export function findAgent<T extends Pick<FlowAgent, 'key' | 'name'>>(agents: readonly T[], text: string, self?: string): T | undefined {
   const s = slug(text)
   if (!s) return undefined
   const others = agents.filter(a => a.key !== self)
@@ -322,9 +562,9 @@ export function leadBrief(withCache: boolean, withVerif = true, withCrap = true,
     ? `4. Fin : quand tous ont fini, la porte revo-flow vérifie (lint, typage et tests liés${withCrap ? ' et score CRAP des fonctions modifiées' : ''} sur les fichiers du flow, comparés à la base de référence) ; lis son rapport et décide : corrige toi-même, reprends l'agent avec SendMessage ou relance-le. Seules les erreurs nouvelles bloquent ; demande une exception (${VERIF_TOOL} action exception, avec motif) seulement pour une erreur qui ne relève pas de ce flow`
     : `4. Fin : quand tous ont fini, vérifie l'ensemble (tests et lint ciblés) et corrige si besoin`
   return `# revo-flow — tu es l'orchestrateur de cette demande
-1. Plan : ${cache(`commence par le cache revo-flow ci-dessous s'il y en a un, une carte, pas la vérité : vérifie dans le code ce que tu affirmes ou changes. S'il connaît la feature, ne lis que les fichiers à modifier et ceux modifiés depuis l'apprentissage. Puis `)}lis toi-même la demande et les specs utiles, seulement le nécessaire, sans rien modifier. Pas de sous-agent avant le plan, sauf un éclaireur Explore (lecture seule, haiku ou sonnet) quand la lecture est large : revo-flow demande l'accord de l'utilisateur.
-2. Équipe : appelle UNE fois l'outil ${PLAN_TOOL} : titre, résumé, et 1 à 6 sous-agents, pas plus que le travail ne le demande. Pour chacun : nom court et unique, rôle, type (general-purpose par défaut, Explore pour de la lecture seule${agents(`, ou le type d'un agent installé du catalogue ci-dessous quand son rôle correspond à ses tâches (code, doc, test, revue) : revo-flow lui laisse alors le modèle et l'effort de sa définition, donne quand même modele et effort pour l'estimation`)}), modèle le plus fiable pour SES tâches (haiku : mécanique et localisé ; sonnet : la plupart des features et correctifs ; opus : transverse, ambigu, délicat, sécurité), effort (low à xhigh), et 2 à 10 tâches courtes à l'infinitif avec leur type. Découpe pour qu'ils avancent en parallèle sans modifier les mêmes fichiers.${verif(`
-   Vérification : donne des critères d'acceptation (criteres, 1 à 8, chacun vérifiable par une commande ou un test) quand la demande s'y prête. Avec des critères, à toi de juger s'il faut un testeur (un agent dont toutes les tâches sont de type test, au moins du niveau des implémenteurs : il écrit les tests à partir des critères et des interfaces, revo-flow les gèle à sa fin) et un vérificateur (type ${VERIFIER_TYPE}, sonnet medium, lecture seule : il juge chaque critère avec une preuve exécutée, après les autres ; lance-le avec l’outil Agent comme les autres, même en arrière-plan : sa preuve à l'exécution, web ou mobile, se suit en direct dans le panneau et sur l'appareil ; ne juge jamais les critères toi-même à sa place).${archi} Un gros flow (beaucoup de fichiers, plusieurs agents) mérite aussi une revue (/code-review) avant de conclure.`)}
+1. Plan : ${cache(`commence par le cache revo-flow ci-dessous s'il y en a un, une carte, pas la vérité : vérifie dans le code ce que tu affirmes ou changes. S'il connaît la feature, ne lis que les fichiers à modifier et ceux modifiés depuis l'apprentissage. Puis `)}lis toi-même la demande et les specs utiles, seulement le nécessaire, sans rien modifier. Pas de sous-agent avant le plan, sauf un éclaireur Explore (lecture seule, haiku ou sonnet) quand la lecture est large : revo-flow demande l'accord de l'utilisateur. Si un point de la demande change le plan et que ni elle ni le code ne le tranchent, pose 1 à 3 questions à l'utilisateur (AskUserQuestion) avant le plan, sinon prends le défaut raisonnable et dis-le.
+2. Équipe : appelle UNE fois l'outil ${PLAN_TOOL} : titre, résumé, et 1 à 6 sous-agents, pas plus que le travail ne le demande. Pour chacun : nom court et unique, rôle, type (general-purpose par défaut, Explore pour de la lecture seule${agents(`, ou le type d'un agent installé du catalogue ci-dessous quand son rôle correspond à ses tâches (code, doc, test, revue) : revo-flow lui laisse alors le modèle et l'effort de sa définition, donne quand même modele et effort pour l'estimation`)}), modèle le plus fiable pour SES tâches (haiku : mécanique et localisé ; sonnet : la plupart des features et correctifs ; opus : transverse, ambigu, délicat, sécurité), effort (low à xhigh), et 2 à 10 tâches courtes à l'infinitif avec leur type. Découpe pour qu'ils avancent en parallèle sans modifier les mêmes fichiers : fichiers (chemins ou motifs relatifs à la racine qu'il modifiera, 20 au plus) et apres (agents à attendre) ; deux agents ne déclarent le même fichier que s'ils sont ordonnés par apres.${verif(`
+   Vérification : donne des critères d'acceptation (criteres, 1 à 8, chacun vérifiable par une commande ou un test) quand la demande s'y prête. Un critère que le vérificateur ne peut pas rejouer (banc externe, recette manuelle, service absent) finira « non vérifiable » : qu'une commande, un test nommé ou la preuve web ou mobile le tranche. Avec des critères, à toi de juger s'il faut un testeur (un agent dont toutes les tâches sont de type test, au moins du niveau des implémenteurs : il écrit les tests à partir des critères et des interfaces, revo-flow les gèle à sa fin) et un vérificateur (type ${VERIFIER_TYPE}, sonnet medium, lecture seule : il juge chaque critère avec une preuve exécutée, après les autres ; lance-le avec l’outil Agent comme les autres, même en arrière-plan : sa preuve à l'exécution, web ou mobile, se suit en direct dans le panneau et sur l'appareil ; ne juge jamais les critères toi-même à sa place).${archi} Un gros flow (beaucoup de fichiers, plusieurs agents) mérite aussi une revue (/code-review) avant de conclure.`)}
 3. Exécution : lance chaque agent avec l'outil Agent (description = son nom exact), dans un même message quand ils sont indépendants ; prompt = sa mission et le contexte utile (fichiers, conventions, contraintes, ce que font les autres). revo-flow ajoute lui-même son modèle, son effort, sa liste de tâches${cache(` et l'extrait de fiche du cache qui le concerne : ajoute seulement ce qui manque (pièges transverses, décisions)`)} ; ne les recopie pas.
 ${end}${cache(`. Puis, pour chaque feature touchée, ${CACHE_TOOL} action « apprendre » (feature, titre, alias, resume, flux, entrees, fichiers et rôles, pièges, corrections de ce que le cache disait de faux) ; pour une fiche seulement périmée et toujours juste, action « rafraichir » (feature, fichiers relus)`)}. Conclus par une synthèse courte.
 Ne fais pas toi-même les tâches confiées aux sous-agents. Pas de commit, de push ni de MR sans que l'utilisateur le demande : à la fin d'un flow vérifié, revo-flow lui propose lui-même la PR, ne la propose pas toi-même.`
@@ -333,14 +573,29 @@ Ne fais pas toi-même les tâches confiées aux sous-agents. Pas de commit, de p
 /** Le rôle de l'orchestrateur, cache compris (l'option par défaut). */
 export const LEAD_BRIEF = leadBrief(true)
 
-/** La réponse de l'outil plan : ce que l'orchestrateur doit lancer maintenant. */
+/** La réponse de l'outil plan : ce que l'orchestrateur doit lancer maintenant, et ce qui suit quand le plan est ordonné (apres). */
 export function dispatchText(plan: PlanInput): string {
   // Le modèle vient d'écrire le plan : les noms suffisent, ses tâches ne lui sont pas répétées.
   const names = plan.agents.map(a => `« ${a.name} » (${a.subagentType}, ${MODELS[a.model].label})`).join(', ')
-  return [
-    `revo-flow : plan « ${plan.title} » enregistré, ${plan.agents.length} sous-agent${plan.agents.length > 1 ? 's' : ''} : ${names}.`,
-    `Lance-les maintenant avec l'outil Agent (description = le nom exact entre guillemets). Un agent dont la description ne reprend pas un de ces noms n'est pas suivi.`,
-  ].join('\n')
+  const head = `revo-flow : plan « ${plan.title} » enregistré, ${plan.agents.length} sous-agent${plan.agents.length > 1 ? 's' : ''} : ${names}.`
+  const tail = `avec l'outil Agent (description = le nom exact entre guillemets). Un agent dont la description ne reprend pas un de ces noms n'est pas suivi.`
+  // Dès qu'il y a plus d'une vague (un « apres », ou le vérificateur, qui passe après tous les autres), ne faire lancer que la première.
+  if (waves(plan.agents).length < 2) return [head, `Lance-les maintenant ${tail}`].join('\n')
+  return [head, `Lance maintenant ${joinNames(waves(plan.agents)[0] ?? [])} ${tail}`, ...followUps(plan.agents)].join('\n')
+}
+
+/** Les phrases « Ensuite, quand « porte » et « plan » auront fini : « integration ». » : une par groupe d'agents qui attendent les mêmes. */
+function followUps(agents: readonly Ordered[]): string[] {
+  const lvl = levels(agents)
+  const groups = new Map<string, { deps: string[]; names: string[] }>()
+  for (const a of agents.filter(x => (lvl.get(x.key) ?? 1) > 1).sort((x, y) => lvl.get(x.key)! - lvl.get(y.key)!)) {
+    const deps = agentDeps(agents, a)
+    const waits = agents.filter(b => deps.includes(b.key)).map(b => b.name)
+    const group = groups.get(waits.join('|')) ?? { deps: waits, names: [] }
+    group.names.push(a.name)
+    groups.set(waits.join('|'), group)
+  }
+  return [...groups.values()].map(g => `Ensuite, quand ${joinNames(g.deps)} ${g.deps.length > 1 ? 'auront' : 'aura'} fini : ${joinNames(g.names)}.`)
 }
 
 const PHASE_LABEL: Record<Phase, string> = {
@@ -364,7 +619,9 @@ export function flowRecap(flow: Flow, cache?: string | false, withVerif = true):
     const left = remainingTasks(a)
     const todo = left.length ? `reste : ${left.map(t => t.title).join(' ; ')}` : 'plus rien à faire'
     const state = a.status === 'blocked' ? `en attente de « ${a.waitingFor?.name ?? '?'} »` : a.status
-    return `- « ${a.name} » (${MODELS[a.model].label}, effort ${a.effort}) [${state}] — ${todo}`
+    const order = a.status === 'waiting' && !a.agentId && a.after?.length ? ` après ${joinNames(afterNames(flow.agents, a))}` : ''
+    const files = a.files?.length && a.status !== 'done' ? ` · fichiers : ${a.files.join(', ')}` : ''
+    return `- « ${a.name} » (${MODELS[a.model].label}, effort ${a.effort}) [${state}]${order}${files} — ${todo}`
   })
   return [
     leadBrief(cache !== false, withVerif),
@@ -384,10 +641,10 @@ export function flowRecap(flow: Flow, cache?: string | false, withVerif = true):
 /**
  * Le texte du dialogue de validation du plan : chaque agent, son modèle, son effort, son nombre de tâches et son type s'il n'est
  * pas general-purpose (un agent installé, Explore) ; puis les critères
- * d'acceptation et le coût estimé du testeur et du vérificateur s'il y en a.
+ * d'acceptation, le coût estimé du testeur et du vérificateur s'il y en a, et la ligne du budget (v3.6) quand elle est donnée.
  */
-export function planQuestion(plan: PlanInput): string {
-  const rows = plan.agents.map(a => `• ${a.name} — ${MODELS[a.model].label}, effort ${a.effort}, ${a.tasks.length} tâche${a.tasks.length > 1 ? 's' : ''}${agentMark(a)}`)
+export function planQuestion(plan: PlanInput, budget?: string): string {
+  const rows = plan.agents.map(a => `• ${a.name} — ${MODELS[a.model].label}, effort ${a.effort}, ${a.tasks.length} tâche${a.tasks.length > 1 ? 's' : ''}${agentMark(a)}${a.after?.length ? `, après ${joinNames(afterNames(plan.agents, a))}` : ''}`)
   const criteres = plan.criteres?.length ? [`Critères d'acceptation (${plan.criteres.length}) :`, ...plan.criteres.map(c => `  ${c.id} ${c.texte}`)] : []
   const cost = verifCost(plan)
   return [
@@ -395,6 +652,7 @@ export function planQuestion(plan: PlanInput): string {
     ...rows,
     ...criteres,
     ...(cost ? [`Coût estimé : ${cost}`] : []),
+    ...(budget ? [budget] : []),
     'Lancer ce plan ?',
   ].join('\n')
 }
@@ -418,8 +676,8 @@ export function verifCost(plan: PlanInput): string | undefined {
   return parts.length ? parts.join(' · ') : undefined
 }
 
-/** Ce que le fichier plan.md ajoute à l'aperçu : la demande, le projet et l'heure. */
-export type PlanMeta = { request?: string; project?: string; branch?: string; date?: string }
+/** Ce que le fichier plan.md ajoute à l'aperçu : la demande, le projet, l'heure et la ligne du budget (v3.6). */
+export type PlanMeta = { request?: string; project?: string; branch?: string; date?: string; budget?: string }
 
 /**
  * Le plan en markdown : l'aperçu du dialogue de validation (sans meta) et le fichier plan.md (avec).
@@ -433,6 +691,7 @@ export function planMarkdown(plan: PlanInput, meta?: PlanMeta): string {
     if (meta.request) out.push(`**Demande** : ${meta.request}  `)
     if (where) out.push(`**Projet** : ${where}  `)
     if (meta.date) out.push(`**Posé le** : ${meta.date}  `)
+    if (meta.budget) out.push(`**Budget** : ${meta.budget}  `)
     out.push('')
   }
   if (plan.summary) out.push(plan.summary, '')
@@ -443,7 +702,9 @@ export function planMarkdown(plan: PlanInput, meta?: PlanMeta): string {
     if (cost) out.push(`*Coût estimé : ${cost}*`, '')
   }
   for (const [i, a] of plan.agents.entries()) {
-    out.push(`## ${i + 1}. ${a.name}`, '', `${MODELS[a.model].label} · effort ${a.effort} · ${a.subagentType}`, '')
+    const order = a.after?.length ? ` · après ${joinNames(afterNames(plan.agents, a))}` : ''
+    out.push(`## ${i + 1}. ${a.name}`, '', `${MODELS[a.model].label} · effort ${a.effort} · ${a.subagentType}${order}`, '')
+    if (a.files?.length) out.push(`Fichiers : ${a.files.map(f => `\`${f}\``).join(', ')}`, '')
     if (a.role) out.push(`*${a.role}*`, '')
     if (a.why) out.push(`> ${a.why}`, '')
     out.push(...a.tasks.map((t, j) => `${j + 1}. ${t.title} \`${t.kind}\``), '')
@@ -482,9 +743,10 @@ export function agentBrief(a: FlowAgent, cache: AgentCache | boolean = 'fiches',
     verif && a.subagentType !== 'Explore' && !isVerifier(a)
       ? `\nNe lance pas toi-même le lint, le typage ni les tests du projet : revo-flow les lance une seule fois, quand tous les agents ont fini (la porte). Si elle trouve une erreur nouvelle dans tes fichiers, l'orchestrateur te renverra la corriger.${crap ? SCOUT : ''}`
       : ''
+  const scope = a.files?.length ? `Ton périmètre : ${a.files.join(', ')} ; un fichier hors de ce périmètre sera signalé dans le rapport.\n` : ''
   return `# Tes tâches (revo-flow) — « ${a.name} »${a.role ? ` : ${a.role}` : ''}
 ${a.tasks.map((t, i) => `${i + 1}. ${t.title}${t.status === 'completed' ? ' ✓ déjà faite' : ''}`).join('\n')}
-${resume ? `Reprise : les tâches cochées ✓ ont été faites lors d'un lancement précédent ; ne les refais pas, reprends à la première qui ne l'est pas (garde sa numérotation).\n` : ''}${mode ? `\n${AGENT_CACHE[mode]}\n` : ''}
+${scope}${resume ? `Reprise : les tâches cochées ✓ ont été faites lors d'un lancement précédent ; ne les refais pas, reprends à la première qui ne l'est pas (garde sa numérotation).\n` : ''}${mode ? `\n${AGENT_CACHE[mode]}\n` : ''}
 Suivi : fais ces tâches dans l'ordre. Au début de chacune, appelle l'outil ${STEP_TOOL} avec {"tache": <numéro>, "statut": "en_cours"} : cela clôt la précédente, et la dernière est close quand tu finis, donc "fait" est inutile. "attente" avec "attend" = le nom de l'agent du plan dont tu dépends si la tâche ne peut pas avancer tant qu'il n'a pas fini (termine alors ta réponse en disant ce qui manque : revo-flow te relancera quand il aura fini) ; "echec" seulement pour ce que tu ne peux pas faire du tout, en expliquant pourquoi dans ta réponse. N'utilise cet outil pour rien d'autre.${others.length ? `\nLes autres agents du plan (à nommer dans "attend") : ${others.map(n => `« ${n} »`).join(', ')}.` : ''}${check}`
 }
 
@@ -742,6 +1004,10 @@ export type JournalEntry = {
   }[]
   /** La vérification du flow (v2) ; absente pour un flow d'avant la v2 ou sans porte. */
   verif?: VerifJournal
+  /** Le budget (v3.6) : estimé, plafond, réel, plafond atteint, en dollars ; absent sans budget. */
+  budget?: BudgetJournal
+  /** Pourquoi le flow a été arrêté, quand ce n'est pas l'utilisateur : « budget » (plafond atteint, « Arrêter »). */
+  motif?: 'budget'
 }
 
 /** Au plus autant de flows gardés dans le journal. */
@@ -756,17 +1022,34 @@ export function addToJournal(prev: unknown, entry: JournalEntry): JournalEntry[]
   return [entry, ...list].slice(0, JOURNAL_MAX)
 }
 
-/**
- * La colonne « vérif » de l'historique : ✓ vérifié ; ✗ accepté (fini rouge sur décision de l'utilisateur) ; ✗ (rouge sans
- * décision, sans personne à qui demander) ; ✗ erreur (revo-flow a planté, la porte s'est ouverte) ; observé ; — sans porte.
- */
-export function verifMark(v: VerifJournal | undefined): string {
-  if (!v) return '—'
+/** Le journal tel que le store le rend : ses entrées lisibles seulement (le budget y estime le coût d'un plan). */
+export const journalOf = (raw: unknown): JournalEntry[] => (Array.isArray(raw) ? raw.filter(isEntry) : [])
+
+/** « critères 6/8 · 1 ko » : les critères d'un verdict ; '' sans critères. */
+export function criteresMark(c: { total: number; ok: number; ko?: number } | undefined): string {
+  if (!c?.total) return ''
+  return `critères ${c.ok}/${c.total}${c.ko ? ` · ${c.ko} ko` : ''}`
+}
+
+/** La marque de la porte seule : ✓, ✗ panne, ✗ accepté, ✗, ✗ erreur, observé ou —. */
+function porteMark(v: VerifJournal): string {
   if (v.etat === 'verifie') return '✓'
-  if (v.etat === 'non-verifie') return v.accepte ? '✗ accepté' : '✗'
+  if (v.etat === 'non-verifie') return v.pannes?.length && !v.nouvelles ? '✗ panne' : v.accepte ? '✗ accepté' : '✗'
   if (v.etat === 'erreur') return '✗ erreur'
   if (v.etat === 'observe') return 'observé'
   return '—'
+}
+
+/**
+ * La colonne « vérif » de l'historique : ✓ vérifié ; ✗ panne (la porte n'a pas pu juger) ; ✗ accepté (fini rouge sur décision de
+ * l'utilisateur) ; ✗ (rouge sans décision, sans personne à qui demander) ; ✗ erreur (revo-flow a planté, la porte s'est ouverte) ;
+ * observé ; — sans porte. Puis les critères s'il y en a : « ✓ · critères 6/8 · 1 ko ».
+ */
+export function verifMark(v: VerifJournal | undefined): string {
+  if (!v) return '—'
+  const mark = porteMark(v)
+  const crit = criteresMark(v.criteres)
+  return crit && mark !== '—' ? `${mark} · ${crit}` : mark
 }
 
 /** Le coût d'un flow : l'orchestrateur et ses agents. */
@@ -785,7 +1068,7 @@ export function historyText(raw: unknown, n = 10): string {
     const failed = e.agents.filter(a => a.status === 'failed').length
     const relaunched = e.agents.reduce((k, a) => k + Math.max(0, a.attempts - 1), 0)
     const extra = [
-      e.isStopped ? 'arrêté' : '',
+      e.isStopped ? `arrêté${e.motif === 'budget' ? ' (budget)' : ''}` : '',
       failed ? `${failed} en échec` : '',
       relaunched ? `${relaunched} relance${relaunched > 1 ? 's' : ''}` : '',
     ].filter(Boolean)

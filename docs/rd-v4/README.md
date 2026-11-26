@@ -12,6 +12,8 @@
 >
 > Question posée : « une R&D sur le futur de ce que pourrait avoir le mod, qui serait vraiment utile pour les gens »,
 > pour la diapo « La suite » de la présentation publique.
+>
+> Lot « confiance » livré en partie en v3.6 le 2026-11-26 : voir « Livré en v3.6 ».
 
 ## Verdict
 
@@ -283,6 +285,43 @@ l'auteur.
   Control » et Faros de seconde main ; LinearB, Sonar et amplifying.ai sont des chiffres d'éditeurs, corrélationnels.
 - **Aucune mesure n'existe** du gain d'un dossier de preuve sur le délai de relecture : c'est l'hypothèse centrale du
   lot 1, et le seuil du §4 la testera.
+
+## Livré en v3.6 (2026-11-26)
+
+### Le constat tiré du journal réel
+
+Le journal de 61 flows avec porte, sur le poste de l'auteur, a remplacé le flow unique du §1.4 :
+
+- **14 flows** finis « non vérifié » à la première tentative avec **0 erreur nouvelle** : une commande de tests en délai dépassé, que la porte traitait comme une fin en silence.
+- **29 flows** « vérifié ✓ » avec des critères `ko`, non vérifiables ou non jugés : le verdict ne disait rien des critères.
+- **Aucun plafond de coût** : médiane de 9,69 € par flow sur 49 rapports, maximum de 58,59 €.
+- **Preuve mobile : 0 réussite sur 12**, dont 4 délais de 300 s au premier build.
+
+### Par piste de l'étude
+
+| Piste | État | Ce qui est livré |
+|---|---|---|
+| P3, budget par flow | Livré | `hooks/budget.ts`, option `budget` (`auto`, un nombre en euros, `off` ou `0`), estimation à la validation du plan, alerte à 80 %, question à 100 % (Arrêter, +50 %, Laisser finir), flow journalisé « arrêté (budget) », bande `0,41 € / 1,80 €`, ligne Budget du rapport |
+| P2, résumé en clair | Livré | section « En clair » en tête du rapport (Changé, Vérifié, Non vérifié) ; le correctif des fichiers hors dépôt, filtrés du rapport et comptés |
+| P1, dossier de preuve | Son périmètre seulement | section « Périmètre » du rapport (fichiers touchés hors de ce que le plan donnait à l'agent) ; le rapport sert déjà de description de PR ou de MR depuis la v3.4 (livraison) ; la trace des commandes par agent et la liste des refus, elles, ne sont pas faites |
+| P5, porte pour Python, mods, Go, Rust | Dépôts de mods seulement | `.claude-plugin/plugin.json` donne `claude plugin validate .` (lint) et, avec des `*.test.ts(x)`, `claude plugin test .` (tests, format `bun-test`, portée projet, hors base de référence) ; Python, Go et Rust non faits |
+| P4, garde-fous secrets et commandes dangereuses | Non fait | |
+| P6, sans surveillance | Non fait | |
+
+### Ce qui s'ajoute hors de l'étude
+
+- **Porte en panne** : une commande en délai dépassé est relancée une fois au délai maximal (10 min), les tests liés sont découpés en paquets d'après une durée apprise par fichier, et une commande `texte` qui sort en code non nul sans rien de lisible est une erreur bloquante. Si la porte reste en panne, une question (Relancer la porte 2 fois au plus, Terminer non vérifié, Voir le détail) remplace la fin en silence ; verdict « non vérifié (porte en panne : …) », historique « ✗ panne ».
+- **Critère `ko` bloquant** : porte verte et un critère `ko`, la conclusion est refusée et le critère renvoyé à l'orchestrateur, sur le modèle de la revue d'architecture (ordre porte, critères, architecture). Un critère non vérifiable ne bloque pas. Verdict « vérifié ✓ · critères 6/8 · 1 ko ».
+- **Plan ordonné** : `apres` et `fichiers` par agent, plan refusé sur un cycle, un nom inconnu ou deux agents non ordonnés sur le même fichier, agent lancé trop tôt refusé, orchestrateur prévenu des agents prêts, vérificateur implicitement en dernier.
+- **Preuve mobile** : délai d'attente de l'app porté de 5 à 15 min, et un état « fermé » (dialogue fermé ou personne) distinct du refus explicite.
+
+### Décisions
+
+- **Le plafond n'est pas modifiable dans le dialogue du plan** : le dialogue le montre (« Estimation ≈ 0,90 € (historique : 11 flows) · plafond 1,80 € »), l'option `budget` le règle. Écart avec le §2.2, qui le prévoyait modifiable ; il n'y a pas non plus de segment `budget 82 %`, seul le segment de coût et de plafond.
+- **Dialogue fermé : laisser finir** ; **sans personne : arrêt**. Un arrêt par le budget écrit quand même le rapport.
+- **Un `ko` accepté garde l'état « vérifié »**, comme la revue d'architecture, et la livraison reste proposée ; le `ko` figure dans le verdict et le journal.
+- **Le coût reste une estimation côté client**, avec les tarifs publics des modèles ; le rapport le dit.
+- **Version 3.6.0.**
 
 ## Sources
 

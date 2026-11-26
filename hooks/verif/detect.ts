@@ -23,11 +23,15 @@ export const MANIFESTES: string[] = [
   'env.test',
 ]
 
+/** Le manifeste d'un mod Claude Code : sa présence fait proposer `claude plugin validate` et `claude plugin test`. */
+export const PLUGIN_JSON = '.claude-plugin/plugin.json'
+
 /**
  * Chemins dont seule la présence compte (pièges d'environnement), jamais hachés : à passer dans `sondes` de detectCommands (chemin → existe).
- * node_modules : l'un des quatre suffit ; .dart_tool : `flutter pub get` fait.
+ * node_modules : l'un des quatre suffit ; .dart_tool : `flutter pub get` fait ; plugin.json : un mod (sa version change à chaque livraison,
+ * le hacher redemanderait la confirmation à chaque fois).
  */
-export const SONDES: string[] = ['node_modules/.package-lock.json', 'node_modules/.yarn-integrity', 'node_modules/.modules.yaml', 'node_modules/.yarn-state.yml', '.dart_tool/package_config.json']
+export const SONDES: string[] = ['node_modules/.package-lock.json', 'node_modules/.yarn-integrity', 'node_modules/.modules.yaml', 'node_modules/.yarn-state.yml', '.dart_tool/package_config.json', PLUGIN_JSON]
 
 /** Paquets de monorepo lus au plus. */
 const MAX_PAQUETS = 40
@@ -330,6 +334,19 @@ const CRAP_COMMANDE: VerifCommande = {
 }
 
 /**
+ * Les commandes d'un mod Claude Code (PLUGIN_JSON présent, lu ou sondé) : `claude plugin validate .` (lint, tout le projet) ; et s'il a
+ * des *.test.ts(x), `claude plugin test .` (tests, tout le projet : il lance tous les tests, sans argument de fichier, au format bun-test).
+ */
+export function modCommands(files: string[], present: boolean): VerifCommande[] {
+  if (!present) return []
+  const origine = PLUGIN_JSON
+  const out: VerifCommande[] = [{ id: 'plugin-validate', outil: 'lint', argv: ['claude', 'plugin', 'validate', '.'], portee: 'projet', format: 'texte', source: 'deduit', origine }]
+  if (files.some(f => /\.test\.tsx?$/.test(f) && !/(^|\/)node_modules\//.test(f)))
+    out.push({ id: 'plugin-test', outil: 'tests', argv: ['claude', 'plugin', 'test', '.'], portee: 'projet', format: 'bun-test', source: 'deduit', origine: `${PLUGIN_JSON}, *.test.ts` })
+  return out
+}
+
+/**
  * Les commandes du projet et les pièges d'environnement. Ordre de confiance : CI (lignes qui appellent un outil ou un script connu),
  * scripts de package.json, outils présents (« déduit »). `sondes` : chemin de SONDES → existe (facultatif ; sans lui, aucun piège de dossier).
  * `crap` (option du plugin, vrai par défaut) : les tests liés mesurent leur couverture et la commande « crap » suit les tests.
@@ -526,6 +543,9 @@ export function detectCommands(input: { stack: string; files: string[]; read: Re
     if (ciRef && read['env.test'] === undefined && !pieges.some(p => p.startsWith('env.test absent'))) pieges.push('env.test absent : la CI y fait référence ; les tests qui en dépendent échoueront')
   }
 
+  // ── Mod Claude Code ──
+  commandes.push(...modCommands(files, present(PLUGIN_JSON) || input.sondes?.[PLUGIN_JSON] === true))
+
   commandes.sort((a, b) => ORDRE.indexOf(a.outil) - ORDRE.indexOf(b.outil))
   return { commandes, pieges }
 }
@@ -556,6 +576,7 @@ export function commandLabel(c: VerifCommande): string {
   const i = c.argv.findIndex(x => x.toLowerCase() === t || x.endsWith(`/${t}`))
   const sub = c.argv[i + 1]
   if (t === 'npm' || t === 'yarn' || t === 'pnpm') return c.argv.slice(i + 1).filter(x => x !== 'run').join(' ') || c.id
+  if (t === 'claude' && sub === 'plugin') return `claude plugin ${c.argv[i + 2] ?? ''}`.trim()
   if (t === 'nuxi' || t === 'dart' || t === 'flutter' || (t === 'vitest' && sub === 'related') || t === 'biome') {
     if (t === 'dart' && sub === 'run') return c.argv[i + 2] ?? c.id
     return sub && !sub.startsWith('-') ? `${t} ${sub}` : t

@@ -45,6 +45,7 @@ import {
   usagePercents,
   type Progress,
 } from '../lib'
+import { budgetSegment, budgetState, flowCost } from '../budget'
 
 /** Tout ce que les vues ont besoin de savoir : de la donnée simple, aucun appel à `$`. */
 export type ViewData = {
@@ -227,6 +228,7 @@ export function webLine(v: VerifView): { mark: string; tone: VerifTone; text: st
   if (w.etat === 'demarrage') return { mark: '…', tone: 'dim', text: `preuve web : démarrage de « ${w.commande ?? 'le serveur de dev'} »` }
   if (w.etat === 'pret') return { mark: '✓', tone: 'ok', text: `preuve web : ${w.url ?? 'serveur prêt'} (${w.existant ? 'serveur déjà en marche' : 'serveur démarré'})${captures}` }
   if (w.etat === 'refuse') return { mark: '–', tone: 'dim', text: 'preuve web : serveur non démarré (votre choix)' }
+  if (w.etat === 'ferme') return { mark: '–', tone: 'dim', text: 'preuve web : serveur non démarré (question restée sans réponse)' }
   if (w.etat === 'erreur') return { mark: '⚠', tone: 'warn', text: `preuve web : ${w.note ?? 'erreur'}` }
   if (w.etat === 'arrete') return { mark: '·', tone: 'dim', text: `preuve web : serveur arrêté${captures}` }
   return undefined
@@ -240,9 +242,10 @@ export function mobileLine(v: VerifView): { mark: string; tone: VerifTone; text:
   const captures = n > 0 ? ` · ${n} capture${n > 1 ? 's' : ''}` : ''
   const ou = m.appareil ?? 'l’appareil'
   if (m.etat === 'demarrage') return { mark: '…', tone: 'dim', text: `preuve mobile : démarrage de ${ou} (regardez sa fenêtre)` }
-  if (m.etat === 'installation') return { mark: '…', tone: 'dim', text: `preuve mobile : « ${m.commande ?? 'lancement de l’app'} » sur ${ou}` }
+  if (m.etat === 'installation') return { mark: '…', tone: 'dim', text: `preuve mobile : « ${m.commande ?? 'lancement de l’app'} » sur ${ou} (le premier build peut être long, 15 min au plus)` }
   if (m.etat === 'pret') return { mark: '✓', tone: 'ok', text: `preuve mobile : app${m.framework ? ` ${m.framework}` : ''} à l’écran sur ${ou}, en direct${captures}` }
   if (m.etat === 'refuse') return { mark: '–', tone: 'dim', text: 'preuve mobile : app non lancée (votre choix)' }
+  if (m.etat === 'ferme') return { mark: '–', tone: 'dim', text: 'preuve mobile : app non lancée (question restée sans réponse)' }
   if (m.etat === 'erreur') return { mark: '⚠', tone: 'warn', text: `preuve mobile : ${m.note ?? 'erreur'}` }
   if (m.etat === 'arrete') return { mark: '·', tone: 'dim', text: `preuve mobile : app arrêtée${m.emulateurLance ? ', émulateur éteint' : ''}${captures}` }
   return undefined
@@ -289,10 +292,10 @@ export function verifLine(v: VerifView | null | undefined): string | undefined {
   if (!v || !verifShown(v)) return undefined
   if (v.etat === 'a-confirmer') return 'vérif ? à confirmer'
   if (v.etat === 'en_cours') return 'vérif …'
-  if (v.etat === 'erreur') return 'vérif ⚠ erreur'
+  if (v.etat === 'erreur') return panneLine(v)
   if (v.etat === 'vert') {
     const run = v.commandes.filter(c => c.etat !== 'saute')
-    return `vérif ✓ ${run.filter(c => c.etat === 'ok').length}/${run.length}`
+    return `vérif ✓ ${run.filter(c => c.etat === 'ok').length}/${run.length}${criteresSuffix(v)}`
   }
   if (v.etat === 'rouge') {
     const ko = v.commandes.find(c => c.etat === 'ko' || c.etat === 'erreur')
@@ -305,15 +308,49 @@ export function verifLine(v: VerifView | null | undefined): string | undefined {
   return undefined
 }
 
-/** La couleur du segment : vert, rouge, orange (attention) ou discret. */
+/** « vérif ⚠ panne flutter-test » : une commande n'a pas pu tourner (délai dépassé, plantage) ; « vérif ⚠ erreur » quand revo-flow a planté. */
+function panneLine(v: VerifView): string {
+  const panne = v.commandes.find(c => c.etat === 'erreur')
+  return panne ? `vérif ⚠ panne ${panne.id}` : 'vérif ⚠ erreur'
+}
+
+/** « · critères 6/8 · 1 ko » après le verdict de la porte ; '' sans critères au plan. */
+export function criteresSuffix(v: VerifView): string {
+  const c = v.criteres
+  if (!c?.total) return ''
+  const ko = c.verdicts.filter(x => x.verdict === 'ko').length
+  return ` · critères ${c.ok}/${c.total}${ko ? ` · ${ko} ko` : ''}`
+}
+
+/** La couleur du segment : vert, rouge, orange (attention : porte verte avec un critère ko, panne, à confirmer) ou discret. */
 export function verifTone(v: VerifView | null | undefined): VerifTone {
   if (!v) return 'dim'
-  if (v.etat === 'vert') return 'ok'
+  if (v.etat === 'vert') return v.criteres?.verdicts.some(x => x.verdict === 'ko') ? 'warn' : 'ok'
   if (v.etat === 'rouge') return 'ko'
   if (v.etat === 'erreur' || v.etat === 'a-confirmer') return 'warn'
   return 'dim'
 }
 const VERIF_TEXT_COLOR = { ok: PALETTE.live, ko: PALETTE.redText, warn: PALETTE.orange, dim: undefined } as const
+
+// ── Le budget du flow (v3.6) ─────────────────────────────────────────────
+
+/** Le budget du flow : « 0,41 € / 1,80 € », sa part du plafond et sa couleur (orange à 80 %, rouge à 100 %) ; undefined sans plafond. */
+export function budgetView(d: Pick<ViewData, 'flow' | 'lead'>): { text: string; percent: number; tone: VerifTone } | undefined {
+  const plafond = d.flow?.budget?.plafond
+  if (!d.flow || plafond === undefined) return undefined
+  const spent = flowCost(d.flow, d.lead)
+  const etat = budgetState(spent, plafond)
+  return { text: budgetSegment(spent, plafond), percent: (spent / plafond) * 100, tone: etat === 'atteint' ? 'ko' : etat === 'alerte' ? 'warn' : 'dim' }
+}
+
+/** Le texte à droite de la bande du bureau : la vérification, puis le budget ; la couleur du budget l'emporte dès l'alerte. */
+export function bandNote(d: ViewData): { text: string; tone: VerifTone } | undefined {
+  const vl = verifLine(d.verif)
+  const b = budgetView(d)
+  if (!b) return vl ? { text: vl, tone: verifTone(d.verif) } : undefined
+  const text = `budget ${b.text}`
+  return vl ? { text: `${vl} · ${text}`, tone: b.tone === 'dim' ? verifTone(d.verif) : b.tone } : { text, tone: b.tone }
+}
 
 // ── Le cache du projet : le texte et les chiffres partagés ───────────────
 
@@ -541,7 +578,7 @@ export function DesktopBand(t: Elements['desktop'], d: ViewData, widthPx: number
   const { Box, Svg } = t
   const width = Math.max(340, Math.min(1100, widthPx - 24))
   const cp = cacheParts(d, width / 7.6)
-  const vl = verifLine(d.verif)
+  const note = bandNote(d)
   return (
     <Box key="bar" flexDirection="column">
       <Svg
@@ -552,10 +589,10 @@ export function DesktopBand(t: Elements['desktop'], d: ViewData, widthPx: number
           agents: m.agents,
           isDone: m.isDone,
           ...(d.context ? { context: d.context.percent } : {}),
-          ...(vl ? { verif: { text: vl, tone: verifTone(d.verif) } } : {}),
+          ...(note ? { verif: note } : {}),
           ...(d.lastTurn ? { lastPrompt: `${d.lastTurn.isLive ? '…' : ''}${fmt(d.lastTurn.tokens.input)}↑ ${fmt(d.lastTurn.tokens.output)}↓ · ${turnCost(d.lastTurn)}` } : {}),
         })}
-        alt={`revo-flow ${m.flow.title} : ${stageAlt(m.stages)}, ${m.percent} %, ${m.agents} agent${m.agents > 1 ? 's' : ''} actif${m.agents > 1 ? 's' : ''}${d.context ? `, contexte ${Math.round(d.context.percent)} %` : ''}${vl ? `, ${vl}` : ''}`}
+        alt={`revo-flow ${m.flow.title} : ${stageAlt(m.stages)}, ${m.percent} %, ${m.agents} agent${m.agents > 1 ? 's' : ''} actif${m.agents > 1 ? 's' : ''}${d.context ? `, contexte ${Math.round(d.context.percent)} %` : ''}${note ? `, ${note.text}` : ''}`}
         width={width}
         isInteractive
       />
@@ -582,6 +619,7 @@ export function TerminalBand(t: Elements['terminal'], d: ViewData, columns = 100
   const lt = d.lastTurn
   const cp = cacheParts(d, columns)
   const vl = verifLine(d.verif)
+  const bv = budgetView(d)
   const cut = cp?.saved ? cp.text.indexOf(cp.saved) : -1
   return (
     <Box borderStyle="round" borderColor={PALETTE.border} paddingX={1} flexDirection="column">
@@ -594,6 +632,7 @@ export function TerminalBand(t: Elements['terminal'], d: ViewData, columns = 100
         <Text bold>{` ${m.percent}%`}</Text>
         {m.agents > 0 && <Text color={PALETTE.live}>{`  ● ${m.agents} actif${m.agents > 1 ? 's' : ''}`}</Text>}
         {vl ? <Text color={VERIF_TEXT_COLOR[verifTone(d.verif)]} dimColor={verifTone(d.verif) === 'dim'}>{`  ${vl}`}</Text> : null}
+        {bv ? <Text color={VERIF_TEXT_COLOR[bv.tone]} dimColor={bv.tone === 'dim'}>{`  budget ${bv.text}`}</Text> : null}
       </Text>
       {(lt || d.context) && (
         <Box justifyContent="space-between">
@@ -688,6 +727,7 @@ export function DesktopPane(t: Elements['desktop'], d: ViewData, actions: PaneAc
   const pct = usagePercents(d.limits, day, week)
   const p = pill(d)
   const isPending = isPendingPlan(d)
+  const budget = budgetView(d)
 
   const line = (l: Line, i: number) => (
     <Text
@@ -963,6 +1003,13 @@ export function DesktopPane(t: Elements['desktop'], d: ViewData, actions: PaneAc
           alt={`Session : ${fmt(total(d.session))}${d.sessionCostUsd > 0 ? `, ${euros(d.sessionCostUsd)}` : ''}`}
           width={inner}
         />
+        {budget && (
+          <Svg
+            source={usageRowSvg({ label: 'Budget du flow', value: budget.text, note: `${Math.floor(budget.percent)} %`, percent: budget.percent, width: inner, warnAt: [80, 100] })}
+            alt={`Budget du flow : ${budget.text}, ${Math.floor(budget.percent)} %`}
+            width={inner}
+          />
+        )}
         {d.context && (
           <Svg
             source={usageRowSvg({
@@ -1019,6 +1066,7 @@ export function TerminalPane(t: Elements['terminal'], d: ViewData, actions: Pane
   const pct = usagePercents(d.limits, day, week)
   const p = pill(d)
   const isPending = isPendingPlan(d)
+  const budget = budgetView(d)
   const running = all.filter(c => c.tone === 'live' && !c.isLead).length
   const where = flow ? [flow.project, flow.branch].filter(Boolean).join(' · ') : ''
   const icon = (tone: Tone) => (tone === 'live' ? '●' : tone === 'wait' ? '○' : tone === 'fail' ? '✕' : '✓')
@@ -1268,6 +1316,7 @@ export function TerminalPane(t: Elements['terminal'], d: ViewData, actions: Pane
 
       <Box flexDirection="column">
         {gauge('Session', fmt(total(d.session)), pct.session, [80, 95], d.sessionCostUsd > 0 ? euros(d.sessionCostUsd) : '')}
+        {budget && gauge('Budget', budget.text, budget.percent, [80, 100])}
         {d.context && gauge('Contexte', `${fmt(d.context.tokens)} / ${fmt(d.context.window)}`, d.context.percent, [70, 85])}
         {gauge('Semaine', fmt(week), pct.week)}
         {d.limits.some(l => l.resetsAt) && (

@@ -2,12 +2,11 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { rapportMarkdown, type RapportInput } from '../hooks/rapport'
-import type { Entry, Flow, Lead, WebView } from '../types'
+import { enClair, rapportMarkdown, type RapportInput } from '../hooks/rapport'
+import type { Entry, Flow, Lead, VerifJournal, WebView } from '../types'
 import { OSES, WINDOWS, diskKey, native, type Os } from './helpers/os'
 
 const rootOf = (os: Os) => native(os, 'Documents', 'Front', 'ui-vel')
-const ROOT = rootOf(WINDOWS)
 const NOW = Date.UTC(2026, 9, 12, 9)
 
 const PLAN = {
@@ -362,9 +361,10 @@ test('rapportMarkdown : sans porte, sans critères, sans fichiers ni cache, chaq
 
 // ── Fin de flow, fichier et bouton ───────────────────────────────────────
 
-const finish = async ($: Engine, w: ReturnType<typeof world>) => {
+/** Le flow fini : un fichier du dépôt modifié par « Front panier » (chemin de la machine : le rapport écarte ceux hors du dépôt). */
+const finish = async ($: Engine, w: ReturnType<typeof world>, os: Os = WINDOWS) => {
   const { front, api } = await twoRunning($, w)
-  await $.tool.call({ tool: 'Edit', file_path: `${ROOT}\\components\\Basket.vue`, agentId: front, tool_use_id: 'u1' } as never)
+  await $.tool.call({ tool: 'Edit', file_path: native(os, 'Documents', 'Front', 'ui-vel', 'components', 'Basket.vue'), agentId: front, tool_use_id: 'u1' } as never)
   for (const id of [front, api]) {
     w.status[id] = 'completed'
     await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'x', reason: 'answer', agentId: id } as never)
@@ -385,7 +385,7 @@ async function twoRunning($: Engine, w: ReturnType<typeof world>) {
 for (const os of OSES) {
   test(`rapport.md (${os.nom}) : écrit en fin de flow dans ~/.claude/revo-flow/rapports, le bouton du panneau l'ouvre`, async ($, on) => {
     const w = world(on, os)
-    await finish($, w)
+    await finish($, w, os)
     const md = w.disk['/Users/x/.claude/revo-flow/rapports/code-promo-panier.md']
     expect(md).toBeDefined()
     expect(md!).toMatch(/^# Rapport : Code promo panier\n/)
@@ -489,4 +489,117 @@ test('rapportMarkdown : la revue d’architecture, conforme, ko avec sa preuve, 
   expect(rapportMarkdown({ ...BASE, archi: { verdict: 'ok', preuve: 'rien à redire' } })).toContain('## Architecture\n\n**Revue du vérificateur** : conforme ✓\n> rien à redire')
   expect(rapportMarkdown({ ...BASE, archi: { verdict: 'ko', preuve: 'lib/x.ts redéfinit Panier (types/cart.ts:3)' } })).toContain('**Revue du vérificateur** : ko ✗\n> lib/x.ts redéfinit Panier (types/cart.ts:3)')
   expect(rapportMarkdown({ ...BASE, archi: { verdict: 'passee' } })).toContain('terminé sans revue (décision de l’utilisateur)')
+})
+
+// ── v4 : « En clair », périmètre, budget, fichiers hors dépôt ────────────
+
+const cmd = (id: string, etat: 'ok' | 'ko' | 'erreur' | 'saute', note?: string) =>
+  ({ id, outil: 'tests', etat, dureeMs: 1000, nouvelles: 0, preexistantes: 0, instables: 0, fichiers: 1, note }) as never
+const porteAvec = (...commandes: unknown[]) => ({ resultat: { etat: 'vert', le: 'x', dureeMs: 1, commandes, erreurs: [] } }) as unknown as NonNullable<RapportInput['porte']>
+const VERIF_OK: VerifJournal = { etat: 'verifie', tentatives: 1, premierRouge: false, nouvelles: 0, preexistantes: 0, dureeMs: 1000, triches: 0 }
+
+test('enClair : trois lignes ; changé, vérifié (vert), non vérifié (rien à signaler)', () => {
+  const lines = enClair({
+    ...BASE,
+    verif: VERIF_OK,
+    porte: porteAvec(cmd('lint', 'ok'), cmd('typecheck', 'ok')),
+    criteres: [{ id: 'C1', texte: 'a' }, { id: 'C2', texte: 'b' }],
+    verdicts: [{ id: 'C1', verdict: 'ok', preuve: 'x' }, { id: 'C2', verdict: 'ok', preuve: 'y' }],
+    archi: { verdict: 'ok' },
+    web: { etat: 'arrete', captures: ['/c/capture-1.png', '/c/capture-2.png'] },
+  })
+  expect(lines).toEqual([
+    'Changé : 3 fichiers, 2 agents : Code promo panier',
+    'Vérifié : porte verte (lint, typecheck), critères 2/2, revue d\'architecture, preuve web (2 captures).',
+    'Non vérifié : rien à signaler.',
+  ])
+})
+
+test('enClair : le non vérifié réunit critères, commandes en panne ou sautées, architecture, exceptions et flow arrêté', () => {
+  const lines = enClair({
+    ...BASE,
+    flow: { ...FLOW, isStopped: true },
+    verif: { ...VERIF_OK, etat: 'non-verifie', accepte: true, triches: 2 },
+    porte: { ...porteAvec(cmd('flutter-test', 'erreur', 'délai dépassé'), cmd('crap', 'saute', 'rien à mesurer'), cmd('lint', 'ko'), cmd('tsc', 'ok')), accepte: true, gelesModifies: [{ p: 't.ts', par: 'x', decision: 'accepte' }] },
+    criteres: [{ id: 'C1', texte: 'a' }, { id: 'C2', texte: 'b' }, { id: 'C3', texte: 'c' }, { id: 'C4', texte: 'd' }],
+    verdicts: [{ id: 'C1', verdict: 'ko', preuve: 'x' }, { id: 'C2', verdict: 'non-verifiable', preuve: 'y' }, { id: 'C3', verdict: 'ok', preuve: 'z' }],
+    archi: { verdict: 'ko' },
+  })
+  expect(lines[1]).toBe('Vérifié : porte verte (tsc), critères 1/4.')
+  // Revue de la PR #5 : sur une porte rouge, « porte verte » ne s'écrit pas ; seules les commandes vertes sont nommées.
+  const rouge = porteAvec(cmd('lint', 'ko'), cmd('tsc', 'ok'))
+  rouge.resultat = { ...rouge.resultat!, etat: 'rouge' }
+  expect(enClair({ ...BASE, verif: { ...VERIF_OK, etat: 'non-verifie' }, porte: rouge })[1]).toBe('Vérifié : commandes vertes de la porte (tsc).')
+  const nv = lines[2]!
+  for (const part of ['flow arrêté', 'fini rouge sur décision de l\'utilisateur', '2 triches détectées', '1 test gelé modifié, accepté', 'flutter-test : délai dépassé', 'crap : rien à mesurer', 'lint : ko', 'C1 ko', 'C2 non vérifiable', 'C4 sans verdict', 'revue d\'architecture ko'])
+    expect(nv).toContain(part)
+  expect(nv).not.toContain('C3')
+  expect(lines).toHaveLength(3)
+})
+
+test('enClair : sans porte ni revue d\'architecture, ils sont dits non vérifiés ; rien de prouvé', () => {
+  const lines = enClair(BASE)
+  expect(lines[1]).toBe('Vérifié : rien de prouvé.')
+  expect(lines[2]).toBe('Non vérifié : pas de porte de vérification ; pas de revue d\'architecture.')
+  expect(enClair({ ...BASE, archi: { verdict: 'passee' }, verif: VERIF_OK })[2]).toContain('revue d\'architecture terminé sans revue')
+})
+
+test('rapportMarkdown : « En clair » juste après l\'en-tête, avant le plan', () => {
+  const md = rapportMarkdown(BASE)
+  expect(md.indexOf('## En clair')).toBeGreaterThan(md.indexOf('**Fin**'))
+  expect(md.indexOf('## En clair')).toBeLessThan(md.indexOf('## Demande et plan'))
+  expect(md).toContain('Changé : 3 fichiers, 2 agents : Code promo panier  \nVérifié : rien de prouvé.  \nNon vérifié :')
+})
+
+test('rapportMarkdown : « Périmètre » après les fichiers modifiés, et « dont 1 hors plan » dans En clair', () => {
+  const md = rapportMarkdown({ ...BASE, horsPlan: [{ agent: 'promo-ui', fichiers: ['locales/fr.json'] }] })
+  expect(md).toContain('## Périmètre\n\nHors plan, touché quand même : locales/fr.json (agent promo-ui)\n')
+  expect(md.indexOf('## Périmètre')).toBeGreaterThan(md.indexOf('## Fichiers modifiés'))
+  expect(md.indexOf('## Périmètre')).toBeLessThan(md.indexOf('## Vérification (porte)'))
+  expect(md).toContain('3 fichiers (dont 1 hors plan)')
+})
+
+test('rapportMarkdown : sans champs nouveaux ou avec des champs vides, rien de plus (pas de Périmètre ni de Budget)', () => {
+  const base = rapportMarkdown(BASE)
+  expect(base).not.toContain('## Périmètre')
+  expect(base).not.toContain('**Budget**')
+  expect(rapportMarkdown({ ...BASE, horsPlan: [], budget: undefined })).toBe(base)
+  // Les sections existantes sont inchangées : tout ce qui suit « En clair » est le rapport d'avant.
+  const apres = base.slice(base.indexOf('## Demande et plan'))
+  for (const s of SECTIONS) expect(apres).toContain(s)
+  expect(apres).toContain('**Tokens** : 5k\n\n- orchestrateur')
+})
+
+test('rapportMarkdown : budget estimé, plafond, réel ; plafond atteint ; sans plafond ; mention d\'honnêteté', () => {
+  const usd = (eur: number) => eur / 0.92
+  const md = rapportMarkdown({ ...BASE, budget: { estime: usd(0.9), plafond: usd(1.8), reel: usd(1.12), atteint: false } })
+  expect(md).toContain('**Budget** : estimé 0,90 € · plafond 1,80 € · réel 1,12 €')
+  expect(md).not.toContain('plafond atteint')
+  expect(md).toContain('estimation côté client')
+  expect(md.indexOf('**Budget**')).toBeGreaterThan(md.indexOf('## Durée, coût et tokens'))
+  expect(rapportMarkdown({ ...BASE, budget: { estime: usd(0.9), plafond: usd(1.8), reel: usd(1.9), atteint: true } })).toContain('réel 1,90 € · plafond atteint')
+  expect(rapportMarkdown({ ...BASE, budget: { estime: usd(0.9), reel: usd(1), atteint: false } })).toContain('estimé 0,90 € · sans plafond · réel 1,00 €')
+})
+
+test('rapportMarkdown : les fichiers hors du dépôt (scratchpad, hors racine) ne sont pas listés', () => {
+  const entries: Entry[] = [
+    ...ENTRIES,
+    { path: '/tmp/claude/scratchpad/notes.txt', rel: 'claude/scratchpad/notes.txt', reason: '', count: 1, at: NOW, by: 'api-promo' },
+    { path: '/autre/worktree/x.ts', rel: 'worktree/x.ts', reason: '', count: 1, at: NOW },
+  ]
+  // Sans racine : seuls les scratchpads sont écartés.
+  const sansRacine = rapportMarkdown({ ...BASE, entries })
+  expect(sansRacine).not.toContain('notes.txt')
+  expect(sansRacine).toContain('worktree/x.ts')
+  // Avec la racine : tout ce qui n'y est pas.
+  const md = rapportMarkdown({ ...BASE, entries, racine: '/r/' })
+  expect(md).not.toContain('worktree/x.ts')
+  expect(md).toContain('*2 fichiers hors du dépôt non listés.*')
+  expect(md).toContain('Changé : 3 fichiers')
+  // Windows : barres inverses, casse de la lettre de lecteur.
+  const win: Entry[] = [{ path: 'C:\\Dev\\app\\a.ts', rel: 'a.ts', reason: '', count: 1, at: NOW }, { path: 'D:\\x\\b.ts', rel: 'x/b.ts', reason: '', count: 1, at: NOW }]
+  const w = rapportMarkdown({ ...BASE, entries: win, racine: 'c:\\dev\\app' })
+  expect(w).toContain('`a.ts`')
+  expect(w).not.toContain('b.ts')
+  expect(rapportMarkdown({ ...BASE, entries: [win[1]!], racine: 'C:\\Dev\\app' })).toContain('*Absent : aucun fichier modifié pendant ce flow.*\n*1 fichier hors du dépôt non listé.*')
 })

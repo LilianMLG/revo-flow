@@ -1,12 +1,12 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import type { ProjetVerif, VerifBase, VerifCommande, VerifErreur, VerifEtatCommande, VerifResultat } from '../../types/verif'
-import { MANIFESTES, argvText, commandLabel, commandsQuestion, detectCommands, flutterVersionTrap, fvmVersion, manifestPaths, needsConfirm, withoutCrap } from '../../hooks/verif/detect'
-import { dartTests, globMatch, hasGenAnnotation, plan, relative, withShell } from '../../hooks/verif/scope'
-import { normalizeMessage, parseOutput, signatureKey, toRoot } from '../../hooks/verif/parse'
+import { MANIFESTES, PLUGIN_JSON, SONDES, argvText, commandLabel, commandsQuestion, detectCommands, flutterVersionTrap, fvmVersion, manifestPaths, modCommands, needsConfirm, withoutCrap } from '../../hooks/verif/detect'
+import { PAQUET_MS, dartTests, globMatch, hasGenAnnotation, paquetMax, parFichierOf, plan, relative, withShell } from '../../hooks/verif/scope'
+import { normalizeMessage, parseOutput, signatureKey, SORTIE_MESSAGE, toRoot } from '../../hooks/verif/parse'
 import { addBase, baseFor, classify } from '../../hooks/verif/base'
-import { reportText, summaryLine } from '../../hooks/verif/report'
-import { durationOf, fillSorties, projectArgv, purgeOutputs, runBase, runGate, timeoutOf, type VerifIo } from '../../hooks/verif/runner'
+import { criteresKoText, panneQuestion, panneText, pannesOf, reportText, summaryLine } from '../../hooks/verif/report'
+import { durationOf, fillSorties, glisse, projectArgv, purgeOutputs, runBase, runGate, timeoutFor, timeoutOf, type VerifIo } from '../../hooks/verif/runner'
 import { OSES, WINDOWS, native, type Os } from '../helpers/os'
 
 const json = (x: unknown) => JSON.stringify(x)
@@ -492,14 +492,109 @@ for (const os of OSES) {
       ])
     })
 
-    test('texte : dart format (Changed) et prettier --check ([warn]) ; le reste est illisible', () => {
+    test('texte : dart format (Changed) et prettier --check ([warn]) ; code 0 sans ligne lisible : rien', () => {
       const out = [`Changed lib${os.sep}main.dart`, 'Formatted 3 files (1 changed) in 0.12 seconds.'].join(eol)
       expect(parseOutput('texte', { stdout: out, stderr: '', exitCode: 1 }, { outil: 'dart-format', cwd: 'packages/core', racine })).toEqual([
         { outil: 'dart-format', fichier: 'packages/core/lib/main.dart', code: 'format', message: 'formatage à refaire (dart format)' },
       ])
       const pr = ['Checking formatting...', '[warn] components/Cart.vue', '[warn] Code style issues found in the above file. Run Prettier with --write to fix.'].join(eol)
       expect(parseOutput('texte', { stdout: pr, stderr: '', exitCode: 1 }, ctx('prettier')).map(e => e.fichier)).toEqual(['components/Cart.vue'])
-      expect(parseOutput('texte', { stdout: 'Error: schema unreachable', stderr: '', exitCode: 1 }, ctx('codegen'))).toEqual([])
+      expect(parseOutput('texte', { stdout: 'Error: schema unreachable', stderr: '', exitCode: 0 }, ctx('codegen'))).toEqual([])
+    })
+
+    test('C3 · format texte : code de sortie non nul sans ligne lisible → une erreur bloquante, message = dernière ligne utile', () => {
+      const codegen = ctx('codegen')
+      expect(parseOutput('texte', { stdout: 'Error: schema unreachable', stderr: '', exitCode: 1 }, codegen)).toEqual([{ outil: 'codegen', fichier: '', code: 'sortie', message: SORTIE_MESSAGE, detail: 'Error: schema unreachable' }])
+      // stderr d'abord ; bruit de npm écarté ; durée retirée (signature stable).
+      const npm = ['✖ GraphQL Document Validation failed with 2 errors in 1.2s', 'npm ERR! code ELIFECYCLE', 'npm ERR! A complete log of this run can be found in: /x.log', ''].join(eol)
+      const e = parseOutput('texte', { stdout: 'Parsing schema…', stderr: npm, exitCode: 2 }, codegen)
+      expect(e).toEqual([{ outil: 'codegen', fichier: '', code: 'sortie', message: SORTIE_MESSAGE, detail: '✖ GraphQL Document Validation failed with 2 errors in' }])
+      expect(parseOutput('texte', { stdout: '', stderr: '', exitCode: 3 }, codegen)).toEqual([{ outil: 'codegen', fichier: '', code: 'sortie', message: SORTIE_MESSAGE }])
+      // Revue de la PR #5 : le compte de la dernière ligne diffère entre la base (tout le projet) et la porte (les fichiers du flow) ; il
+      // reste hors signature, pour qu'une commande déjà en échec avant le flow soit préexistante et non nouvelle.
+      const [base] = parseOutput('texte', { stdout: 'Found 12 errors.', stderr: '', exitCode: 1 }, codegen)
+      const [porte] = parseOutput('texte', { stdout: 'Found 2 errors.', stderr: '', exitCode: 1 }, codegen)
+      expect(signatureKey(porte!)).toBe(signatureKey(base!))
+      // Introuvable (127, 9009) et délai dépassé (code -1) : une panne pour le runner, pas une erreur du code.
+      expect(parseOutput('texte', { stdout: '', stderr: 'sh: codegen: not found', exitCode: 127 }, codegen)).toEqual([])
+      expect(parseOutput('texte', { stdout: '', stderr: "'x' n'est pas reconnu", exitCode: 9009 }, codegen)).toEqual([])
+      expect(parseOutput('texte', { stdout: '', stderr: 'Timed out', exitCode: -1 }, codegen)).toEqual([])
+      // dart format et prettier gardent leurs lignes lisibles, sans erreur « sortie » en plus.
+      expect(parseOutput('texte', { stdout: `Changed lib${os.sep}a.dart`, stderr: '', exitCode: 1 }, ctx('dart-format')).map(x => x.code)).toEqual(['format'])
+    })
+
+    test('texte : claude plugin validate en échec, une erreur par « ❯ » des blocs ✘ ; avertissements et plugin directory ignorés', () => {
+      const out = [
+        `Validating plugin manifest: ${abs('.claude-plugin/plugin.json')}`,
+        '',
+        '✘ Found 1 error:',
+        '',
+        '  ❯ name: Invalid input: expected string, received number',
+        '',
+        `Validating hooks: ${abs('hooks/register.tsx')}`,
+        '',
+        '⚠ Found 1 warning:',
+        '',
+        "  ❯ line 3, column 9: error TS2305: Module '../types' has no exported member 'X'.",
+        '',
+        `Validating hooks: ${abs('hooks/hooks.json')}`,
+        '',
+        '✘ Found 1 error:',
+        '',
+        '  ❯ modules../register.tsx: no export named register',
+        '',
+        'Plugin directory checks for x.',
+        '',
+        '✘ Found 2 problems the plugin directory refuses a submission for:',
+        '',
+        '  ❯ README.md: README missing (README_MISSING).',
+        '',
+        '✘ Validation failed',
+      ].join(eol)
+      const v = ctx('plugin-validate')
+      expect(parseOutput('texte', { stdout: out, stderr: '', exitCode: 1 }, v)).toEqual([
+        { outil: 'plugin-validate', fichier: '.claude-plugin/plugin.json', code: 'validate', message: 'name: Invalid input: expected string, received number' },
+        { outil: 'plugin-validate', fichier: 'hooks/hooks.json', code: 'validate', message: 'modules../register.tsx: no export named register' },
+      ])
+      // Validation passée avec avertissements : code 0, rien.
+      expect(parseOutput('texte', { stdout: out, stderr: '', exitCode: 0 }, v)).toEqual([])
+    })
+
+    test('bun-test (claude plugin test) : un (fail) = une erreur, fichier de l’en-tête, détail en retrait ; fichier qui ne charge pas ; signature sans durée', () => {
+      const sortie = (ms: string) =>
+        [
+          '',
+          'tests/a.test.ts:',
+          `(pass) suite A > passe [${ms}ms]`,
+          `(fail) suite A > échoue (avec parenthèses) > flèche [${ms}ms]`,
+          '  AssertionError: expect(received).toBe()',
+          '  ',
+          '  Expected: 2',
+          `(fail) hors describe [${ms}ms]`,
+          '  Error: boum',
+          '',
+          'tests/sub/b.test.tsx:',
+          '(fail) the file did not load',
+          '  tests/sub/b.test.tsx: cannot import "./nexistepas"',
+          '',
+          ' 1 pass',
+          ' 3 fail',
+          `Ran 4 tests across 2 files. [${ms}s]`,
+        ].join(eol)
+      const b = ctx('plugin-test')
+      const e = parseOutput('bun-test', { stdout: sortie('0.72'), stderr: '', exitCode: 1 }, b)
+      expect(e).toEqual([
+        { outil: 'plugin-test', fichier: 'tests/a.test.ts', code: 'echec', message: 'suite A > échoue (avec parenthèses) > flèche', detail: 'AssertionError: expect(received).toBe()' },
+        { outil: 'plugin-test', fichier: 'tests/a.test.ts', code: 'echec', message: 'hors describe', detail: 'Error: boum' },
+        { outil: 'plugin-test', fichier: 'tests/sub/b.test.tsx', code: 'chargement', message: 'le fichier de test ne se charge pas', detail: 'tests/sub/b.test.tsx: cannot import "./nexistepas"' },
+      ])
+      const encore = parseOutput('bun-test', { stdout: sortie('13.05'), stderr: '', exitCode: 1 }, b)
+      expect(encore.map(signatureKey)).toEqual(e.map(signatureKey))
+      // Tout vert : rien ; mod qui ne se charge pas (aucun test, code 1) : erreur bloquante avec la dernière ligne.
+      expect(parseOutput('bun-test', { stdout: ['tests/a.test.ts:', '(pass) ok [1.00ms]', ' 1 pass', ' 0 fail'].join(eol), stderr: '', exitCode: 0 }, b)).toEqual([])
+      expect(parseOutput('bun-test', { stdout: '', stderr: 'claude plugin test: x: no hooks module to load', exitCode: 1 }, b)).toEqual([
+        { outil: 'plugin-test', fichier: '', code: 'sortie', message: SORTIE_MESSAGE, detail: 'claude plugin test: x: no hooks module to load' },
+      ])
     })
 
     test('toRoot : absolu sous la racine (casse du lecteur ignorée sous Windows), file://, hors racine gardé', () => {
@@ -951,6 +1046,215 @@ for (const os of OSES) {
       expect(r3.resultat.commandes[1]).toMatchObject({ etat: 'saute' })
       const r4 = await runGate(couverte.io, verifOf(JEST), { changed: ['src/calc.test.ts', 'README.md'], files: [], commit: 'abc1234' })
       expect(r4.resultat.commandes.find(c => c.id === 'crap')).toMatchObject({ etat: 'saute', note: 'aucun fichier analysable' })
+    })
+  })
+}
+
+// ── Fiabilité de la porte : délais, paquets, pannes, dépôts de mods ─────────
+
+describe('paquets selon la durée apprise par fichier', () => {
+  const flutter = (c: Partial<VerifCommande> = {}): VerifCommande => ({ id: 'flutter-test', outil: 'tests', argv: ['flutter', 'test', '--machine', '{fichiers}'], portee: 'lies', format: 'flutter-json', source: 'deduit', ...c })
+  const tests = (dir: string, n: number) => Array.from({ length: n }, (_, i) => `${dir}test/t${String(i).padStart(2, '0')}_test.dart`)
+  const FILES = ['pubspec.yaml', 'packages/core/pubspec.yaml']
+
+  test('sans durée par fichier (projet.verif rangé avant) : un seul lancement, comme avant', () => {
+    const l = plan(flutter({ dureeMs: 106_000 }), { changed: tests('', 12), files: FILES })
+    expect(l).toHaveLength(1)
+    expect(l[0]!.fichiers).toHaveLength(12)
+    expect(paquetMax(flutter())).toBe(Infinity)
+  })
+
+  test('durée par fichier apprise : paquets de PAQUET_MS au plus, par paquet de monorepo (ordre des cwd), aucun fichier perdu', () => {
+    const c = flutter({ dureeParFichierMs: 40_000 })
+    expect(paquetMax(c)).toBe(Math.floor(PAQUET_MS / 40_000))
+    const l = plan(c, { changed: [...tests('packages/core/', 7), ...tests('', 12)], files: FILES })
+    expect(l.map(x => [x.cwd, x.fichiers.length])).toEqual([
+      ['', 5],
+      ['', 5],
+      ['', 2],
+      ['packages/core', 5],
+      ['packages/core', 2],
+    ])
+    expect(l[3]!.argv.at(-5)).toBe('test/t00_test.dart')
+    // Un fichier plus long que le paquet entier : un fichier par lancement, jamais zéro.
+    expect(paquetMax(flutter({ dureeParFichierMs: 900_000 }))).toBe(1)
+  })
+
+  test('parFichierOf : seulement les tests liés qui reçoivent leurs fichiers ; timeoutFor : le plus long des deux délais', () => {
+    expect(parFichierOf(flutter({ dureeParFichierMs: 10_000 }))).toBe(10_000)
+    expect(parFichierOf(flutter({ dureeParFichierMs: 10_000, portee: 'projet' }))).toBeUndefined()
+    expect(parFichierOf(flutter({ dureeParFichierMs: 10_000, argv: ['flutter', 'test'] }))).toBeUndefined()
+    expect(parFichierOf(flutter({ dureeParFichierMs: 0 }))).toBeUndefined()
+    // 106 s apprises sur de petits flows : 318 s ; un paquet de 5 fichiers à 35 s : 525 s.
+    expect(timeoutFor(flutter({ dureeMs: 106_000 }), { fichiers: ['a', 'b', 'c', 'd', 'e'] })).toBe(318_000)
+    expect(timeoutFor(flutter({ dureeMs: 106_000, dureeParFichierMs: 35_000 }), { fichiers: ['a', 'b', 'c', 'd', 'e'] })).toBe(525_000)
+    expect(timeoutFor(flutter({ dureeMs: 106_000, dureeParFichierMs: 1000 }), { fichiers: ['a'] })).toBe(318_000)
+    expect(timeoutFor(flutter({ dureeParFichierMs: 35_000 }), { fichiers: [] })).toBe(600_000)
+  })
+
+  test('glisse : moyenne glissante, relevée d’un coup après un délai dépassé, jamais baissée d’un coup', () => {
+    expect(glisse(undefined, 12_345.4)).toBe(12_345)
+    expect(glisse(100_000, 200_000)).toBe(130_000)
+    expect(glisse(100_000, 320_000, true)).toBe(320_000)
+    expect(glisse(100_000, 50_000, true)).toBe(85_000)
+  })
+})
+
+describe('pannesOf', () => {
+  const etat = (c: Partial<VerifEtatCommande> & Pick<VerifEtatCommande, 'id' | 'etat'>): VerifEtatCommande => ({ outil: 'tests', dureeMs: 0, nouvelles: 0, preexistantes: 0, instables: 0, fichiers: 0, ...c })
+  test('les commandes en erreur avec leur note ; vide si aucune', () => {
+    const r: VerifResultat = {
+      etat: 'erreur',
+      le: 'x',
+      dureeMs: 0,
+      commandes: [etat({ id: 'eslint', etat: 'ok' }), etat({ id: 'flutter-test', etat: 'erreur', note: 'délai dépassé (10 min 00)' }), etat({ id: 'jest', etat: 'erreur' }), etat({ id: 'tsc', etat: 'ko' })],
+      erreurs: [],
+    }
+    expect(pannesOf(r)).toEqual(['flutter-test : délai dépassé (10 min 00)', 'jest : en panne, voir la sortie complète'])
+    expect(pannesOf({ ...r, etat: 'vert', commandes: [etat({ id: 'eslint', etat: 'ok' })] })).toEqual([])
+  })
+
+  test('panneText : la raison courte du verdict (dernière note, sans parenthèse) ; panneQuestion : avec ou sans relance', () => {
+    const r: VerifResultat = {
+      etat: 'erreur',
+      le: 'x',
+      dureeMs: 0,
+      commandes: [etat({ id: 'flutter-test', etat: 'erreur', note: 'durée apprise 6 min 00 : au-delà de 5 min ; délai dépassé (10 min 00)' }), etat({ id: 'jest', etat: 'erreur' })],
+      erreurs: [],
+    }
+    expect(panneText(r)).toBe('porte en panne : flutter-test délai dépassé, jest')
+    expect(panneText({ ...r, commandes: [] })).toBe('porte en panne : erreur')
+    expect(panneQuestion(['flutter-test : délai dépassé (10 min 00)'], true)).toBe("La porte n'a pas pu juger : flutter-test : délai dépassé (10 min 00). Relancer la porte, ou terminer non vérifié ?")
+    expect(panneQuestion([], false)).toBe("La porte n'a pas pu juger : une commande en panne. Elle a déjà été relancée deux fois : terminer non vérifié ?")
+  })
+
+  test('criteresKoText : chaque critère ko et sa preuve, puis quoi faire ; un nouveau verdict quand le code a changé', () => {
+    const outils = { verificateur: 'revo-flow:verifier', verif: 'mcp__revo-flow__verif' }
+    const kos = [{ id: 'C2', texte: 'Le total est arrondi au centime', preuve: 'expected 10.005\n to be 10.01' }]
+    const t = criteresKoText(kos, 8, false, outils)
+    expect(t.split('\n')[0]).toBe("Critères d'acceptation (revo-flow) : 1 critère ko sur 8.")
+    expect(t).toContain('- C2 Le total est arrondi au centime : expected 10.005 to be 10.01')
+    expect(t).toMatch(/relance le vérificateur \(subagent_type « revo-flow:verifier »\)[\s\S]*mcp__revo-flow__verif action exception/)
+    expect(criteresKoText([...kos, { id: 'C5', preuve: 'y' }], 8, true, outils)).toMatch(/le code a changé depuis le « ko » de C2, C5 ; un nouveau verdict est obligatoire\.\nLance le vérificateur/)
+  })
+})
+
+describe('C4 · dépôt de mod Claude Code : claude plugin validate et claude plugin test', () => {
+  test('plugin.json présent → plugin-validate ; avec des *.test.ts(x) → plugin-test (portée projet, bun-test) ; rien sans plugin.json', () => {
+    const files = [PLUGIN_JSON, 'hooks/register.tsx', 'tests/verif/coeur.test.ts']
+    const { commandes } = detectCommands({ stack: 'Plugin Claude Code', files, read: {} })
+    expect(commandes).toEqual([
+      { id: 'plugin-validate', outil: 'lint', argv: ['claude', 'plugin', 'validate', '.'], portee: 'projet', format: 'texte', source: 'deduit', origine: PLUGIN_JSON },
+      { id: 'plugin-test', outil: 'tests', argv: ['claude', 'plugin', 'test', '.'], portee: 'projet', format: 'bun-test', source: 'deduit', origine: `${PLUGIN_JSON}, *.test.ts` },
+    ])
+    // Présence sondée (le graphe ne liste pas forcément .claude-plugin/) ; sans test : validate seul.
+    expect(SONDES).toContain(PLUGIN_JSON)
+    expect(detectCommands({ stack: '', files: ['hooks/register.tsx', 'tests/ui/a.test.tsx'], read: {}, sondes: { [PLUGIN_JSON]: true } }).commandes.map(c => c.id)).toEqual(['plugin-validate', 'plugin-test'])
+    expect(detectCommands({ stack: '', files: ['hooks/register.tsx'], read: {}, sondes: { [PLUGIN_JSON]: true } }).commandes.map(c => c.id)).toEqual(['plugin-validate'])
+    expect(detectCommands({ stack: '', files: ['hooks/register.tsx', 'tests/a.test.ts'], read: {}, sondes: { [PLUGIN_JSON]: false } }).commandes).toEqual([])
+    expect(modCommands(['node_modules/x/a.test.ts'], true).map(c => c.id)).toEqual(['plugin-validate'])
+  })
+
+  test('libellés, une fois par porte à la racine, base de référence : validate oui, tests non ; cmd /c sous Windows', () => {
+    const [validate, tests] = modCommands(['a.test.ts'], true) as [VerifCommande, VerifCommande]
+    expect(commandLabel(validate)).toBe('claude plugin validate')
+    expect(commandLabel(tests)).toBe('claude plugin test')
+    expect(commandsQuestion('revo-flow', [validate, tests], [])).toContain('claude plugin test (tout le projet) : claude plugin test . · déduit (.claude-plugin/plugin.json, *.test.ts)')
+    expect(plan(tests, { changed: ['hooks/a.ts', 'hooks/b.ts'], files: [] })).toEqual([{ id: 'plugin-test', cwd: '', argv: ['claude', 'plugin', 'test', '.'], fichiers: [] }])
+    expect(projectArgv(validate)).toEqual(['claude', 'plugin', 'validate', '.'])
+    expect(withShell(['claude', 'plugin', 'test', '.'], 'windows')).toEqual(['cmd', '/c', 'claude', 'plugin', 'test', '.'])
+    expect(withShell(['claude', 'plugin', 'test', '.'], 'posix')).toEqual(['claude', 'plugin', 'test', '.'])
+  })
+})
+
+for (const os of OSES) {
+  describe(`porte fiable (${os.nom})`, () => {
+    const ui = projet(os, 'application-mobile-ui')
+    const FLUTTER: VerifCommande = {
+      id: 'flutter-test',
+      outil: 'tests',
+      argv: ['flutter', 'test', '--machine', '--coverage', '--coverage-path={sorties}/couverture/lcov.info', '{fichiers}'],
+      portee: 'lies',
+      format: 'flutter-json',
+      source: 'deduit',
+      dureeMs: 106_000,
+    }
+    const vert = [json({ success: true, type: 'done' })].join('\n')
+    const input = { changed: ['test/a_test.dart', 'test/b_test.dart'], files: ['pubspec.yaml'], commit: 'abc' }
+
+    test('C2 · un lancement qui dépasse son délai appris est relancé une fois au délai maximal : pas de panne, la durée apprise suit', async () => {
+      const { io, calls, writes, removed } = fakeIo(os, ui.racine, (_argv, _cwd, n) => (n === 1 ? new Error('Timed out after 318000 ms') : { exitCode: 0, stdout: vert, ms: 320_000 }))
+      const { resultat, verif } = await runGate(io, verifOf([FLUTTER]), input)
+      expect(calls.map(c => c.timeoutMs)).toEqual([318_000, 600_000])
+      expect(resultat.etat).toBe('vert')
+      expect(resultat.commandes[0]).toMatchObject({ id: 'flutter-test', etat: 'ok' })
+      expect(pannesOf(resultat)).toEqual([])
+      // La durée apprise monte d'un coup à la mesure de la relance (sans la tentative en délai dépassé) ; la durée par fichier aussi.
+      expect(durationOf(verif, 'flutter-test')).toBe(320_000)
+      expect(verif.commandes[0]!.dureeParFichierMs).toBe(160_000)
+      // Couverture : dossier vidé avant chaque tentative.
+      expect(removed).toEqual([[io.sorties, 'couverture'].join(os.sep), [io.sorties, 'couverture'].join(os.sep)])
+      expect(writes.get(resultat.commandes[0]!.sortie!)).toContain('relancé au délai maximal (10 min 00)')
+    })
+
+    test('C2 · relance en délai dépassé elle aussi : panne lisible (pannesOf) ; délai déjà maximal : pas de relance', async () => {
+      const lent = fakeIo(os, ui.racine, () => new Error('Timed out'))
+      const r1 = await runGate(lent.io, verifOf([FLUTTER]), input)
+      expect(lent.calls.map(c => c.timeoutMs)).toEqual([318_000, 600_000])
+      expect(r1.resultat.etat).toBe('erreur')
+      expect(pannesOf(r1.resultat)).toEqual(['flutter-test : délai dépassé (10 min 00)'])
+      expect(durationOf(r1.verif, 'flutter-test')).toBe(106_000)
+      const max = fakeIo(os, ui.racine, () => new Error('Timed out'))
+      await runGate(max.io, verifOf([{ ...FLUTTER, dureeMs: undefined }]), input)
+      expect(max.calls.map(c => c.timeoutMs)).toEqual([600_000])
+    })
+
+    test('délai vu sans exception : code non nul au bout du délai → relancé ; durée par fichier apprise puis glissée', async () => {
+      const { io, calls } = fakeIo(os, ui.racine, (_a, _c, n) => (n === 1 ? { exitCode: 143, stdout: '', ms: 318_000 } : { exitCode: 0, stdout: vert, ms: 30_000 }))
+      const { resultat, verif } = await runGate(io, verifOf([FLUTTER]), input)
+      expect(calls).toHaveLength(2)
+      expect(resultat.etat).toBe('vert')
+      expect(verif.commandes[0]!.dureeParFichierMs).toBe(15_000)
+      const ensuite = fakeIo(os, ui.racine, () => ({ exitCode: 0, stdout: vert, ms: 10_000 }))
+      const r2 = await runGate(ensuite.io, verif, input)
+      expect(r2.verif.commandes[0]!.dureeParFichierMs).toBe(Math.round(15_000 * 0.7 + 5000 * 0.3))
+    })
+
+    test('C3 · une commande texte de l’orchestrateur en code non nul tient la porte : rouge, pas erreur', async () => {
+      const cmd: VerifCommande = { id: 'check', outil: 'lint', argv: ['npm', 'run', 'check'], portee: 'projet', format: 'texte', source: 'orchestrateur' }
+      const { io } = fakeIo(os, ui.racine, () => ({ exitCode: 1, stdout: 'checking…', stderr: `Error: 3 problems found${ui.eol}npm ERR! code ELIFECYCLE` }))
+      const { resultat } = await runGate(io, verifOf([cmd]), input)
+      expect(resultat.etat).toBe('rouge')
+      expect(resultat.commandes[0]).toMatchObject({ etat: 'ko', nouvelles: 1 })
+      expect(resultat.erreurs).toEqual([{ outil: 'check', fichier: '', code: 'sortie', message: SORTIE_MESSAGE, detail: 'Error: 3 problems found', statut: 'nouvelle?' }])
+      expect(pannesOf(resultat)).toEqual([])
+    })
+
+    test('C4 · claude plugin test : une fois à la racine, test rouge relancé avec toute la suite → instable ; runBase ne lance que validate', async () => {
+      const [validate, tests] = modCommands(['tests/a.test.ts'], true) as [VerifCommande, VerifCommande]
+      const rouge = ['', 'tests/a.test.ts:', '(fail) panier > total [3.10ms]', '  Error: attendu 45', ' 0 pass', ' 1 fail'].join(ui.eol)
+      const { io, calls } = fakeIo(os, ui.racine, (argv, _c, n) => (argv[2] === 'test' && n === 1 ? { exitCode: 1, stdout: rouge } : { exitCode: 0, stdout: ' 1 pass' }))
+      const { resultat, verif } = await runGate(io, verifOf([validate, tests]), { changed: ['hooks/a.ts', 'hooks/b.ts'], files: [], commit: 'abc' })
+      expect(calls.map(c => c.argv.filter(x => x !== 'cmd' && x !== '/c').join(' '))).toEqual(['claude plugin validate .', 'claude plugin test .', 'claude plugin test .'])
+      expect(calls.every(c => c.cwd === ui.racine)).toBe(true)
+      expect(resultat.etat).toBe('vert')
+      expect(resultat.erreurs.map(e => [e.fichier, e.statut])).toEqual([['tests/a.test.ts', 'instable']])
+      expect(verif.instables).toEqual(['plugin-test|tests/a.test.ts|echec|panier > total'])
+      const base = fakeIo(os, ui.racine, () => ({ exitCode: 0, stdout: '✔ Validation passed' }))
+      const b = await runBase(base.io, verifOf([validate, tests]), 'abc')
+      expect(base.calls).toHaveLength(1)
+      expect(b.commandes).toEqual(['plugin-validate'])
+    })
+
+    test('revue de la PR #5 · une relance des tests rouges qui plante ne rejuge rien : les rouges restent rouges, jamais instables', async () => {
+      const [, tests] = modCommands(['tests/a.test.ts'], true) as [VerifCommande, VerifCommande]
+      const rouge = ['', 'tests/a.test.ts:', '(fail) panier > total [3.10ms]', '  Error: attendu 45', ' 0 pass', ' 1 fail'].join(ui.eol)
+      // 1er lancement : un test rouge ; la relance sort en 1 sans aucun (fail) (le mod ne se charge plus).
+      const { io } = fakeIo(os, ui.racine, (_a, _c, n) => (n === 1 ? { exitCode: 1, stdout: rouge } : { exitCode: 1, stdout: '', stderr: 'claude plugin test: x: no hooks module to load' }))
+      const { resultat, verif } = await runGate(io, verifOf([tests!]), { changed: ['hooks/a.ts'], files: [], commit: 'abc' })
+      expect(resultat.etat).toBe('rouge')
+      expect(resultat.erreurs.map(e => [e.fichier, e.statut])).toEqual([['tests/a.test.ts', 'nouvelle?']])
+      expect(verif.instables ?? []).toEqual([])
     })
   })
 }

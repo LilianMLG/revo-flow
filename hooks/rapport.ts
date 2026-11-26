@@ -1,6 +1,7 @@
 // Le rapport de flow (docs/rd-v3 §2.4) : un markdown écrit en fin de flow, à côté du plan, qui sert de description de MR.
 // Pur : une mise en forme de ce que le flow sait déjà (agents, fichiers, porte, critères, cache), aucune collecte.
 import type { ArchiView, CacheStats, Critere, CritereVerdict, Entry, Flow, Lead, MobileView, VerifErreur, VerifJournal, VerifResultat, WebView } from '../types'
+import { BUDGET_HONNETETE, type BudgetJournal } from './budget'
 import { MODELS, euros, fmt, fmtDuration, total } from './lib'
 import { dureeText } from './verif/report'
 
@@ -31,6 +32,12 @@ export type RapportInput = {
   mobile?: MobileView
   /** La revue d'architecture du vérificateur (étape ARCHI, v3.2) ; absente si elle n'a pas eu lieu. */
   archi?: ArchiView
+  /** Les fichiers modifiés par un agent hors du périmètre qu'il avait déclaré au plan ; absent ou vide : pas de section « Périmètre ». */
+  horsPlan?: { agent: string; fichiers: string[] }[]
+  /** Le budget du flow (docs/rd-v4 §2.2) : estimé, plafond, réel (en dollars) ; absent sans budget. */
+  budget?: BudgetJournal
+  /** La racine du dépôt : les fichiers modifiés qui n'y sont pas (scratchpad, worktree) ne sont pas listés. Absente : seuls les chemins de scratchpad sont écartés. */
+  racine?: string
 }
 
 const plural = (n: number, un: string, plusieurs: string) => `${n} ${n > 1 ? plusieurs : un}`
@@ -46,6 +53,97 @@ const ETAT: Record<VerifJournal['etat'], string> = {
 }
 
 const VERDICT: Record<CritereVerdict['verdict'], string> = { ok: 'ok ✓', ko: 'ko ✗', 'non-verifiable': 'non vérifiable' }
+
+/** Un chemin au format unique : barres obliques, sans barre finale. */
+const norm = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '')
+
+/** Le fichier est-il dans le dépôt ? Hors de la racine (si connue) ou dans un scratchpad : non (docs/rd-v4 §1.4). */
+function dansDepot(path: string, racine: string | undefined): boolean {
+  const p = norm(path)
+  if (p.includes('/scratchpad/')) return false
+  if (!racine) return true
+  const r = norm(racine)
+  const win = /^[a-z]:/i.test(r)
+  return (win ? p.toLowerCase() : p).startsWith(`${win ? r.toLowerCase() : r}/`)
+}
+
+/** « Changé : » le nombre de fichiers (dont ceux hors plan) et d'agents, et le titre du flow. */
+function changeLine(flow: Flow, entries: readonly Entry[], horsPlan: RapportInput['horsPlan']): string {
+  const hors = new Set((horsPlan ?? []).flatMap(h => h.fichiers)).size
+  const fichiers = `${plural(entries.length, 'fichier', 'fichiers')}${hors ? ` (dont ${hors} hors plan)` : ''}`
+  return `Changé : ${fichiers}, ${plural(flow.agents.length, 'agent', 'agents')} : ${flow.title}`
+}
+
+/** « Vérifié : » ce qui est vert : commandes de la porte, critères, revue d'architecture, preuve web ou mobile. */
+function verifieLine({ porte, criteres, verdicts, archi, web, mobile }: RapportInput): string {
+  const vertes = (porte?.resultat?.commandes ?? []).filter(c => c.etat === 'ok').map(c => c.id)
+  const ok = verdicts?.filter(v => v.verdict === 'ok').length ?? 0
+  const captures = (web?.captures.length ?? 0) + (mobile?.captures.length ?? 0)
+  const parts = [
+    // « porte verte » seulement quand toute la porte l'est : sur une porte rouge ou en panne, seules les commandes vertes sont nommées.
+    vertes.length ? `${porte?.resultat?.etat === 'vert' ? 'porte verte' : 'commandes vertes de la porte'} (${vertes.join(', ')})` : '',
+    criteres?.length && ok ? `critères ${ok}/${criteres.length}` : '',
+    archi?.verdict === 'ok' ? 'revue d\'architecture' : '',
+    captures ? `preuve ${mobile?.captures.length ? 'mobile' : 'web'} (${plural(captures, 'capture', 'captures')})` : '',
+  ].filter(Boolean)
+  return `Vérifié : ${parts.length ? parts.join(', ') : 'rien de prouvé'}.`
+}
+
+/** Les critères ko, non vérifiables ou sans verdict, par identifiant. */
+function criteresNonVerifies(criteres: readonly Critere[] | undefined, verdicts: readonly CritereVerdict[] | undefined): string[] {
+  return (criteres ?? []).flatMap(c => {
+    const v = verdicts?.find(x => x.id === c.id)?.verdict
+    return v === 'ok' ? [] : [`${c.id} ${v ? VERDICT[v].replace(/ [✓✗]/, '') : 'sans verdict'}`]
+  })
+}
+
+/** Les commandes de la porte qui n'ont pas dit « vert » : en panne, sautées ou rouges, avec leur raison. */
+function commandesNonVerifiees(porte: RapportPorte | undefined): string[] {
+  const NOTE = { erreur: 'en panne', saute: 'sautée', ko: 'ko' } as const
+  return (porte?.resultat?.commandes ?? []).flatMap(c => (c.etat in NOTE ? [`${c.id} : ${c.note ?? NOTE[c.etat as keyof typeof NOTE]}`] : []))
+}
+
+/** La revue d'architecture quand elle n'est pas conforme : ko, non vérifiable, en attente, passée ou absente. */
+function archiNonVerifiee(archi: ArchiView | undefined): string[] {
+  if (!archi) return ['pas de revue d\'architecture']
+  return archi.verdict === 'ok' ? [] : [`revue d'architecture ${ARCHI_TEXTE[archi.verdict].replace(/ [✓✗]/, '')}`]
+}
+
+/** Les exceptions de la porte : rouge accepté, triches, tests gelés modifiés et acceptés ; et la porte elle-même quand elle n'est pas verte. */
+function porteNonVerifiee(verif: VerifJournal | undefined, porte: RapportPorte | undefined): string[] {
+  if (!verif || verif.etat === 'off') return ['pas de porte de vérification']
+  const gel = (porte?.gelesModifies ?? []).filter(g => g.decision === 'accepte').length
+  return [
+    ...(verif.etat === 'erreur' ? ['porte en erreur'] : []),
+    ...(porte?.accepte || verif.accepte ? ['fini rouge sur décision de l\'utilisateur'] : []),
+    ...(verif.triches ? [plural(verif.triches, 'triche détectée', 'triches détectées')] : []),
+    ...(gel ? [`${plural(gel, 'test gelé modifié', 'tests gelés modifiés')}, accepté`] : []),
+  ]
+}
+
+/** « Non vérifié : » tout ce qu'un relecteur doit savoir ; « rien à signaler » sinon. */
+function nonVerifieLine(input: RapportInput): string {
+  const items = [
+    ...(input.flow.isStopped ? ['flow arrêté'] : []),
+    ...porteNonVerifiee(input.verif, input.porte),
+    ...commandesNonVerifiees(input.porte),
+    ...criteresNonVerifies(input.criteres, input.verdicts),
+    ...archiNonVerifiee(input.archi),
+  ]
+  return items.length ? `Non vérifié : ${items.join(' ; ')}.` : 'Non vérifié : rien à signaler.'
+}
+
+/** « En clair » : trois lignes au plus, par gabarit : ce qui a changé, ce qui est vérifié, ce qui ne l'est pas. */
+export function enClair(input: RapportInput): string[] {
+  const entries = input.entries.filter(e => dansDepot(e.path, input.racine))
+  return [changeLine(input.flow, entries, input.horsPlan), verifieLine(input), nonVerifieLine(input)]
+}
+
+/** 0. La section « En clair » : les trois lignes de enClair, une par ligne dans le rendu. */
+function enClairSection(input: RapportInput): string[] {
+  const lines = enClair(input)
+  return ['## En clair', '', ...lines.map((l, i) => (i < lines.length - 1 ? `${l}  ` : l)), '']
+}
 
 /** 1. La demande et le plan : chaque agent, son modèle, son effort et ses tâches (✓ faite). */
 function planSection(flow: Flow): string[] {
@@ -63,9 +161,9 @@ function planSection(flow: Flow): string[] {
 }
 
 /** 2. Les fichiers modifiés, groupés par agent (le champ `by`, « lead » sans auteur). */
-function filesSection(flow: Flow, entries: readonly Entry[]): string[] {
+function filesSection(flow: Flow, entries: readonly Entry[], ecartes = 0): string[] {
   const out = ['## Fichiers modifiés', '']
-  if (!entries.length) return [...out, `${ABSENT}aucun fichier modifié pendant ce flow.*`, '']
+  if (!entries.length) return [...out, `${ABSENT}aucun fichier modifié pendant ce flow.*`, ...(ecartes ? [`*${plural(ecartes, 'fichier hors du dépôt non listé', 'fichiers hors du dépôt non listés')}.*`] : []), '']
   const nameOf = (by: string | undefined) => (!by || by === 'lead' ? 'orchestrateur' : (flow.agents.find(a => a.key === by)?.name ?? by))
   const groups = new Map<string, Entry[]>()
   for (const e of entries) groups.set(nameOf(e.by), [...(groups.get(nameOf(e.by)) ?? []), e])
@@ -74,14 +172,27 @@ function filesSection(flow: Flow, entries: readonly Entry[]): string[] {
     out.push(`### ${name} (${list.length})`, '')
     out.push(...list.map(e => `- \`${e.rel}\`${e.count > 1 ? ` ×${e.count}` : ''}${e.reason ? ` : ${e.reason}` : ''}${e.conflict?.length ? ' ⚠ conflit' : ''}`), '')
   }
+  if (ecartes) out.push(`*${plural(ecartes, 'fichier hors du dépôt non listé', 'fichiers hors du dépôt non listés')}.*`, '')
   return out
+}
+
+/** 2 bis. Le périmètre : ce que des agents ont touché hors de ce que le plan leur avait donné ; pas de section sans cela. */
+function perimetreSection(horsPlan: RapportInput['horsPlan']): string[] {
+  const liste = (horsPlan ?? []).filter(h => h.fichiers.length)
+  if (!liste.length) return []
+  return ['## Périmètre', '', ...liste.flatMap(h => [`Hors plan, touché quand même : ${h.fichiers.join(', ')} (agent ${h.agent})`, ''])]
+}
+
+/** Le verdict de la porte : « non vérifié (porte en panne : flutter-test : délai dépassé (10 min 00)) » quand elle n'a pas pu juger (v3.6). */
+function verdictText(verif: VerifJournal): string {
+  return verif.etat === 'non-verifie' && verif.pannes?.length && !verif.nouvelles ? `non vérifié (porte en panne : ${verif.pannes.join(' ; ')})` : ETAT[verif.etat]
 }
 
 /** 3. La porte : verdict, commandes, durée, erreurs nouvelles, exceptions accordées. */
 function gateSection(verif: VerifJournal | undefined, porte: RapportPorte | undefined): string[] {
   const out = ['## Vérification (porte)', '']
   if (!verif || verif.etat === 'off') return [...out, `${ABSENT}pas de porte de vérification pour ce flow.*`, '']
-  out.push(`**Verdict** : ${ETAT[verif.etat]}${verif.accepte ? ' · accepté par l\'utilisateur' : ''}  `)
+  out.push(`**Verdict** : ${verdictText(verif)}${verif.accepte ? ' · accepté par l\'utilisateur' : ''}  `)
   out.push(`**Tentatives** : ${verif.tentatives}${verif.premierRouge ? ' (rouge à la première)' : ''}  `)
   out.push(`**Durée** : ${dureeText(verif.dureeMs)}  `)
   out.push(`**Erreurs** : ${plural(verif.nouvelles, 'nouvelle', 'nouvelles')} · ${plural(verif.preexistantes, 'préexistante', 'préexistantes')}`, '')
@@ -116,6 +227,7 @@ function webParagraph(web: WebView | undefined): string {
   const w = web
   if (!w || w.etat === 'non-demande') return `**Preuve web** : ${ABSENT}le vérificateur n’a pas demandé le navigateur.*`
   if (w.etat === 'refuse') return '**Preuve web** : serveur non démarré (choix de l’utilisateur) : les critères web sont non vérifiables'
+  if (w.etat === 'ferme') return `**Preuve web** : serveur non démarré, question restée sans réponse (${w.note ?? 'dialogue fermé'}) : les critères web sont non vérifiables`
   if (w.etat === 'erreur') return `**Preuve web** : le serveur n’a pas démarré : ${w.note ?? 'erreur inconnue'}`
   if (w.etat === 'demarrage' || w.etat === 'question') return '**Preuve web** : serveur en cours de démarrage'
   const liens = w.captures.map(c => `[${c.split(/[\\/]/).pop()}](<${c}>)`)
@@ -129,6 +241,7 @@ function mobileParagraph(mobile: MobileView | undefined): string | undefined {
   const m = mobile
   if (!m || m.etat === 'non-demande') return undefined
   if (m.etat === 'refuse') return '**Preuve mobile** : app non lancée (choix de l’utilisateur) : les critères mobiles sont non vérifiables'
+  if (m.etat === 'ferme') return `**Preuve mobile** : app non lancée, question restée sans réponse (${m.note ?? 'dialogue fermé'}) : les critères mobiles sont non vérifiables`
   if (m.etat === 'erreur') return `**Preuve mobile** : l’app n’a pas été lancée : ${m.note ?? 'erreur inconnue'}`
   if (m.etat === 'demarrage' || m.etat === 'installation' || m.etat === 'question') return '**Preuve mobile** : app en cours de lancement'
   const liens = m.captures.map(c => `[${c.split(/[\\/]/).pop()}](<${c}>)`)
@@ -182,35 +295,46 @@ function crapSection(verif: VerifJournal | undefined, porte: RapportPorte | unde
   return out
 }
 
+/** « **Budget** : estimé 0,90 € · plafond 1,80 € · réel 1,12 € » ; « plafond atteint » en fin de ligne si c'est le cas. */
+function budgetLine(b: BudgetJournal): string {
+  const plafond = b.plafond === undefined ? 'sans plafond' : `plafond ${euros(b.plafond)}`
+  return `**Budget** : estimé ${euros(b.estime)} · ${plafond} · réel ${euros(b.reel)}${b.atteint ? ' · plafond atteint' : ''}  `
+}
+
 /** 6. Durée, coût, tokens, et tokens évités par le cache. */
-function costSection(flow: Flow, lead: Lead, date: string | undefined, cache: CacheStats['flow'] | undefined): string[] {
+function costSection(flow: Flow, lead: Lead, date: string | undefined, cache: CacheStats['flow'] | undefined, budget?: BudgetJournal): string[] {
   const out = ['## Durée, coût et tokens', '']
   const cost = lead.costUsd + flow.agents.reduce((n, a) => n + a.costUsd, 0)
   const tokens = total(lead.tokens) + flow.agents.reduce((n, a) => n + total(a.tokens), 0)
   out.push(`**Durée** : ${fmtDuration((flow.endedAt ?? flow.startedAt) - flow.startedAt)}${date ? ` (fini le ${date})` : ''}  `)
   out.push(`**Coût** : ${euros(cost)}  `, `**Tokens** : ${fmt(tokens)}`, '')
+  if (budget) out.push(budgetLine(budget), `*${BUDGET_HONNETETE}*`, '')
   out.push(`- orchestrateur : ${euros(lead.costUsd)} · ${fmt(total(lead.tokens))} tokens`)
   out.push(...flow.agents.map(a => `- ${a.name} : ${euros(a.costUsd)} · ${fmt(total(a.tokens))} tokens${a.attempts && a.attempts > 1 ? ` · ${a.attempts} lancements` : ''}`), '')
   out.push(cache ? `**Cache** : ${fmt(cache.evites)} tokens évités, ${fmt(cache.injecte)} injectés (net ${fmt(cache.net)}).` : `${ABSENT}pas de mesure du cache pour ce flow.*`, '')
   return out
 }
 
-/** Le rapport de flow en markdown : six sections, chacune dite absente en une ligne quand elle n'a rien à montrer. */
+/** Le rapport de flow en markdown : « En clair » en tête puis six sections, chacune dite absente en une ligne quand elle n'a rien à montrer. */
 export function rapportMarkdown(input: RapportInput): string {
-  const { flow, lead, entries, verif, porte, criteres, verdicts, cache, date, web, mobile, archi } = input
+  const { flow, lead, verif, porte, criteres, verdicts, cache, date, web, mobile, archi, horsPlan, budget } = input
+  const entries = input.entries.filter(e => dansDepot(e.path, input.racine))
+  const ecartes = input.entries.length - entries.length
   const where = [flow.project, flow.branch].filter(Boolean).join(' · ')
   const head = [`# Rapport : ${flow.title}`, '']
   if (where) head.push(`**Projet** : ${where}  `)
   head.push(`**Fin** : ${flow.isStopped ? 'arrêté' : 'terminé'}${date ? `, le ${date}` : ''}`, '')
   return [
     ...head,
+    ...enClairSection(input),
     ...planSection(flow),
-    ...filesSection(flow, entries),
+    ...filesSection(flow, entries, ecartes),
+    ...perimetreSection(horsPlan),
     ...gateSection(verif, porte),
     ...criteriaSection(criteres, verdicts, web, mobile),
     ...archiSection(archi),
     ...crapSection(verif, porte),
-    ...costSection(flow, lead, date, cache),
+    ...costSection(flow, lead, date, cache, budget),
   ]
     .join('\n')
     .trimEnd() + '\n'

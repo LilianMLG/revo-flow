@@ -28,6 +28,12 @@ export type FlowAgent = Activity & {
   effort: Effort
   why: string
   tasks: FlowTask[]
+  /** Les clés des agents du plan qui doivent avoir fini avant lui (« apres ») ; absent sans dépendance. */
+  after?: string[]
+  /** Les chemins ou motifs glob, relatifs à la racine, qu'il prévoit de modifier (« fichiers »), 20 au plus ; absent sans déclaration. */
+  files?: string[]
+  /** Les fichiers (relatifs à la racine) qu'il a modifiés hors de ses « fichiers » : signalés une fois chacun, repris dans le rapport. */
+  horsPlan?: string[]
   /** Connu une fois l'agent lancé. */
   agentId?: string
   /**
@@ -67,6 +73,24 @@ export type FlowAgent = Activity & {
  */
 export type Phase = 'planning' | 'dispatch' | 'running' | 'review' | 'done'
 
+/**
+ * Le budget d'un flow (v3.6), en dollars : l'estimation faite à la validation du plan (moyenne du journal ou valeur par défaut),
+ * le plafond en cours (absent : aucun, option off ou « Laisser finir »), et ce qui a déjà été signalé, une fois par plafond.
+ */
+export type FlowBudget = {
+  estime: number
+  base: 'historique' | 'defaut'
+  /** Les flows du journal sur lesquels l'estimation s'appuie (0 avec la valeur par défaut). */
+  flows: number
+  plafond?: number
+  /** Le plafond pour lequel l'alerte à 80 % a été donnée. */
+  alerte?: number
+  /** Le plafond pour lequel la question à 100 % a été posée. */
+  question?: number
+  /** Le plafond a été atteint au moins une fois. */
+  atteint?: boolean
+}
+
 export type Flow = {
   id: string
   request: string
@@ -91,6 +115,10 @@ export type Flow = {
   livraison?: { url: string; branche: string }
   /** Arrêté par l'utilisateur (Tout arrêter) : sa fin n'est ni une conclusion, ni une fiche à apprendre. */
   isStopped?: boolean
+  /** Arrêté parce que le plafond du budget était atteint (réponse « Arrêter », ou sans personne à qui demander). */
+  arret?: 'budget'
+  /** Le budget du flow (v3.6), posé à la validation du plan ; absent avec l'option budget à off. */
+  budget?: FlowBudget
 }
 
 /** L'orchestrateur : le fil principal, sur le modèle de la session. */
@@ -177,7 +205,8 @@ export type VerifOutil = 'lint' | 'typage' | 'tests' | 'format' | 'generation' |
 /** fichiers : reçoit les fichiers du flow ; lies : les tests liés aux fichiers du flow ; projet : tout le projet, une fois par porte. */
 export type VerifPortee = 'fichiers' | 'lies' | 'projet'
 export type VerifSource = 'ci' | 'script' | 'deduit' | 'orchestrateur'
-export type VerifFormat = 'eslint-json' | 'tsc' | 'vitest-json' | 'jest-json' | 'biome' | 'dart-machine' | 'flutter-json' | 'texte' | 'crap'
+/** bun-test : la sortie de `claude plugin test` (lignes « (fail) suite > nom » sous l'en-tête « fichier.test.ts: »). */
+export type VerifFormat = 'eslint-json' | 'tsc' | 'vitest-json' | 'jest-json' | 'biome' | 'dart-machine' | 'flutter-json' | 'texte' | 'bun-test' | 'crap'
 /** Une commande de vérification. argv sans shell, '{fichiers}' remplacé par les fichiers de la portée (relatifs au cwd) ; le préfixe Windows est ajouté à l'exécution. */
 export type VerifCommande = {
   id: string
@@ -190,6 +219,11 @@ export type VerifCommande = {
   declencheur?: string
   /** Moyenne glissante des durées, en ms. */
   dureeMs?: number
+  /**
+   * Tests liés avec '{fichiers}' : durée apprise par fichier passé, en ms (moyenne glissante, relevée d'un coup après un délai dépassé).
+   * Sert à découper les lancements en paquets qui tiennent dans le délai, et au délai de chaque paquet. Absent : pas de découpe par durée.
+   */
+  dureeParFichierMs?: number
   /** Motifs de tests exclus (tests qui demandent un service). */
   exclus?: string[]
   /** D'où vient la commande, pour la question : « .gitlab-ci.yml », « script lint », « biome.json »… */
@@ -223,6 +257,18 @@ export type VerifEtatCommande = {
   sortie?: string
   note?: string
 }
+/** Une erreur sans numéro de ligne : la clé de comparaison avec la base (signatureKey). */
+export type VerifSignature = { outil: string; fichier: string; code: string; message: string }
+export type VerifStatut = 'nouvelle' | 'nouvelle?' | 'preexistante' | 'instable'
+export type VerifErreur = VerifSignature & {
+  ligne?: number
+  col?: number
+  statut: VerifStatut
+  /** Première ligne de la raison d'un échec de test (attendu / reçu), hors signature : elle varie d'une exécution à l'autre. */
+  detail?: string
+}
+/** Le résultat d'une porte : son état, ses commandes et ses erreurs (le rapport de flow le lit). */
+export type VerifResultat = { etat: 'vert' | 'rouge' | 'erreur'; le: string; dureeMs: number; commandes: VerifEtatCommande[]; erreurs: VerifErreur[] }
 /** Un critère d'acceptation du plan (lot 2) : C1 à C8, vérifiable. */
 export type Critere = { id: string; texte: string }
 /** La revue d'architecture telle que le panneau et le rapport la montrent : attendue, ou le verdict ARCHI et sa preuve ; passee = terminé sans revue, sur décision. */
@@ -242,8 +288,8 @@ export type TestGele = { p: string; h: string; par: string }
 // Lot 3 : preuve à l'exécution web (docs/rd-v3/README.md §3)
 /** Le serveur de dev d'un projet web (hooks/verif/web.ts, detectDevServer) : argv sans shell, port attendu, d'où il vient (« script dev », « script start »). */
 export type WebServeur = { argv: string[]; port?: number; origine: string }
-/** L'état de la preuve web d'un flow. */
-export type WebEtat = 'non-demande' | 'question' | 'demarrage' | 'pret' | 'refuse' | 'erreur' | 'arrete'
+/** L'état de la preuve web d'un flow : refuse = « Pas cette fois » ; ferme = question restée sans réponse (dialogue fermé, ou personne à qui demander). */
+export type WebEtat = 'non-demande' | 'question' | 'demarrage' | 'pret' | 'refuse' | 'ferme' | 'erreur' | 'arrete'
 /** La preuve web telle que le panneau, le rapport et le journal la voient. */
 export type WebView = {
   etat: WebEtat
@@ -271,8 +317,11 @@ export type Appareil = {
   sdk?: string
   capture?: boolean
 }
-/** L'état de la preuve mobile d'un flow : demarrage = l'émulateur s'allume, installation = l'app se construit et s'installe. */
-export type MobileEtat = 'non-demande' | 'question' | 'demarrage' | 'installation' | 'pret' | 'refuse' | 'erreur' | 'arrete'
+/**
+ * L'état de la preuve mobile d'un flow : demarrage = l'émulateur s'allume, installation = l'app se construit et s'installe ;
+ * refuse = « Pas cette fois » ; ferme = question restée sans réponse (dialogue fermé, ou personne à qui demander).
+ */
+export type MobileEtat = 'non-demande' | 'question' | 'demarrage' | 'installation' | 'pret' | 'refuse' | 'ferme' | 'erreur' | 'arrete'
 /** La preuve mobile telle que le panneau, le rapport et le journal la voient. */
 export type MobileView = {
   etat: MobileEtat
@@ -301,7 +350,10 @@ export type VerifJournal = {
   triches: number
   /** Terminé rouge sur décision de l'utilisateur. */
   accepte?: boolean
-  criteres?: { total: number; ok: number }
+  /** Les critères d'acceptation : leur nombre, ceux jugés ok et ceux jugés ko (absent sans ko). */
+  criteres?: { total: number; ok: number; ko?: number }
+  /** La porte n'a pas pu juger (v3.6) : les commandes en panne, une phrase chacune (« flutter-test : délai dépassé (10 min 00) »). */
+  pannes?: string[]
   /** Score CRAP à la dernière porte : fonctions au-dessus du seuil (fonctions = nouvelles + preexistantes), touchées par le flow (nouvelles) ou non (preexistantes). */
   crap?: { fonctions: number; nouvelles: number; preexistantes: number }
   /** La preuve web (v3) : son état, les captures écrites, les verdicts marqués web (web: true) et ceux parmi eux qui sont ko. */
@@ -349,6 +401,12 @@ export type VerifFlow = {
   blocks: number
   portes: number
   accepte?: boolean
+  /** Les verdicts du vérificateur et l'état de la porte des critères (v3.6) : un critère ko bloque encore après un rechargement du mod. */
+  verdicts?: CritereVerdict[]
+  criteresBlocks?: number
+  criteresPasses?: boolean
+  /** Les relances de la porte en panne déjà demandées par l'utilisateur. */
+  relancesPanne?: number
 }
 
 declare module 'claude-code' {

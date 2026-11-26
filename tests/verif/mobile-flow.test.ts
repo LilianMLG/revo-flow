@@ -272,6 +272,8 @@ async function launch($: Engine, w: World) {
   await w.clock.settle()
   await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN_MOBILE } as never)
   const front = (await spawnAgent($, 'Front écran')).agentId!
+  // Le vérificateur passe après les autres agents du plan (v3.6) : le front a fini quand il part.
+  await endTurn($, w, front)
   const verifier = (await spawnAgent($, 'Vérificateur', 'revo-flow:verifier')).agentId!
   return { front, verifier }
 }
@@ -477,6 +479,10 @@ test('le vérificateur lancé en arrière-plan est accepté et reste un vérific
   await w.clock.advance(1)
   await w.clock.settle()
   await $.tool.call({ tool: 'mcp__revo-flow__plan', ...PLAN_MOBILE } as never)
+  // Avant que le front ait fini, le vérificateur du plan attend son tour (v3.6) : le refus le dit, sans rien de définitif.
+  const tot = await spawnAgent($, 'Vérificateur', 'revo-flow:verifier', { run_in_background: true })
+  expect(tot.deny).toMatch(/« Vérificateur » passe après « Front écran », qui n'a pas fini/)
+  await endTurn($, w, (await spawnAgent($, 'Front écran')).agentId!)
   const r = await spawnAgent($, 'Vérificateur', 'revo-flow:verifier', { run_in_background: true })
   expect(r.deny).toBeUndefined()
   expect(r.agentId).toBeTruthy()
