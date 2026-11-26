@@ -4884,7 +4884,9 @@ async function writePlanFile($: $, plan: PlanInput, flow: Flow, budget?: string)
  */
 async function planBudget($: $, plan: PlanInput): Promise<{ budget: FlowBudget | undefined; line: string | undefined }> {
   if (opts.budget === 'off') return { budget: undefined, line: undefined }
-  const est = estimate(plan, journalOf(await $.store.get(JOURNAL_KEY)))
+  // Le modèle de la session : l'orchestrateur est estimé sur les flows du journal menés par la même famille de modèle.
+  const leadModel = (await read($, leadA))?.modelId
+  const est = estimate(plan, journalOf(await $.store.get(JOURNAL_KEY)), leadModel)
   const plafond = ceilingOf(est.usd, opts.budget)
   return { budget: flowBudget(est, plafond), line: budgetPlanLine(est, plafond) }
 }
@@ -5784,6 +5786,9 @@ export const register: Register = (on, options) => {
     const flow = await read($, flowA)
     const who = flow && flow.phase !== 'done' ? whoIs(flow, e.agentId) : undefined
     if (!who) return kept(await next(e))
+    // Code Mode : REPL n'est que l'enveloppe du script ; chaque appel qu'il fait repasse ici sous son propre nom et tient l'activité.
+    // Le suivre aussi doublerait l'historique, et la fin du premier appel interne marquerait l'acteur inactif, script encore en cours.
+    if (tool === 'REPL') return kept(await next(e))
     const label = describeCall(tool, input)
     const isEdit = tool === 'Edit' || tool === 'Write' || tool === 'NotebookEdit'
     const path = isEdit ? String(input.file_path ?? input.notebook_path ?? '') : ''

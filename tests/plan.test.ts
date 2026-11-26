@@ -7,6 +7,7 @@ import {
   failedDeps,
   flowRecap,
   launchDenial,
+  modelLabel,
   leadBrief,
   outOfScope,
   parsePlan,
@@ -349,5 +350,12 @@ describe('coût par modèle', () => {
     // Sonnet 5.5 : lecture de cache à 0,10 $.
     proche(costUsd('claude-sonnet-5-5', million), 2 + 10 + 0.1 + 2.5)
     expect(costUsd('modele-inconnu', million)).toBe(0)
+  })
+
+  test('revue de la PR #6 · un Sonnet d’avant le 5.5 garde sa lecture de cache à 0,20 $ ; Mythos a son libellé', () => {
+    expect(['claude-sonnet-5', 'claude-sonnet-4-6'].map(priceKey)).toEqual(['sonnetAncien', 'sonnetAncien'])
+    proche(costUsd('claude-sonnet-5', million), 2 + 10 + 0.2 + 2.5)
+    expect(modelLabel('claude-mythos-5-2')).toBe('Mythos 5.2')
+    expect(modelLabel('claude-fable-5-2')).toBe('Fable 5.2')
   })
 })

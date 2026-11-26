@@ -95,7 +95,9 @@ export type PaneActions = {
 const MODEL_COLOR = { haiku: PALETTE.haiku, sonnet: PALETTE.sonnet, opus: PALETTE.opus } as const
 const colorOf = (modelId: string) => {
   const k = modelKey(modelId)
-  return k ? MODEL_COLOR[k] : PALETTE.muted
+  if (k) return MODEL_COLOR[k]
+  // Fable et Mythos, au-dessus d'Opus, prennent sa couleur plutôt que celle d'un modèle inconnu.
+  return priceKey(modelId) === 'fable' ? PALETTE.opus : PALETTE.muted
 }
 const mascotOf = (modelId: string): MascotKind => modelKey(modelId) ?? 'none'
 const shortModel = (modelId: string) => modelLabel(modelId).split(' ')[0] || modelLabel(modelId)
