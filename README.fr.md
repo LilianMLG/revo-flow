@@ -64,6 +64,7 @@ Sans `/revo-flow`, le mod ne fait rien, sauf la **garde anti-merge** (voir plus 
 | `/revo-flow historique [n]` | les n derniers flows (10 par défaut) : date, durée, coût, agents, échecs et relances, puis par modèle le coût moyen d'un agent, son taux d'échec et ses relances |
 | `/revo-flow stop` | arrête vraiment : les agents en cours (TaskStop) et le tour de l'orchestrateur, après confirmation (Échap : rien ne change), puis retire la barre et le panneau |
 | `/revo-flow doctor` | ce que le mod a trouvé sur le projet courant : stack, commandes de vérification, base de référence, cache, agents installés, preuve à l'exécution (ligne `Web` : commande et port détectés, d'où ils viennent, outils, état de `REVO_WEB_LOGIN` ; ou « aucun serveur de dev détecté (pas de script dev) : pas de preuve web » ; ou « preuve web désactivée (option web) » ; sur une app mobile, ligne `Mobile` à la place : framework, plateformes, appareils vus (téléphone branché, émulateur, simulateur) ; c'est la seule commande qui liste les appareils), Code Mode (actif ou non), pièges ; lecture seule, rien n'est lancé ni modifié |
+| `/revo-flow papercuts [clear]` | les papercuts signalés par les agents sur le projet courant (v3.7) ; `clear` les efface après confirmation |
 | `/revo-flow version` | la version du mod |
 | `/revo-flow cache` | le graphe du projet courant : panneau (section « Cache » dépliée) et texte dans le terminal |
 | `/revo-flow cache <projet>` | le graphe de n'importe quel projet de `Documents/Front` ou `Documents/Back` (`reservation-tool`, `back/graphql`) |
@@ -248,6 +249,19 @@ Claude Code a un mode expérimental, **Code Mode** (`CLAUDE_CODE_EXPERIMENTAL_CO
 - **`/revo-flow doctor`** : la ligne `Code Mode` dit s'il est actif, et rappelle ces deux points quand il l'est.
 - **Activer** : `{"env": {"CLAUDE_CODE_EXPERIMENTAL_CODE_MODE": "1"}}` dans `~/.claude/settings.json` (les réglages d'un projet sont ignorés pour cette variable) ; avec `claude -p`, la passer par `--settings`. Le mode est expérimental et peut changer ou disparaître.
 
+### Papercuts et agent bloqué (v3.7)
+
+Idée tirée de l'article d'Uber Engineering du 24 novembre 2026 sur l'évaluation de leurs skills d'agents : les agents signalent eux-mêmes ce qui les gêne, une session qui part mal se reconnaît à ses échecs d'outils en série, et un worker rend un résumé borné.
+
+- **Papercut** : quand une commande, un script, une doc ou un outil gêne un sous-agent (option refusée, erreur silencieuse, doc fausse, test instable), la consigne lui dit de ne pas s'acharner et d'appeler l'outil `mcp__revo-flow__papercut` : `cible` (`projet`, `revo-flow` ou `outil`), `quoi` (ce qu'il essayait) et `obtenu` (ce qui s'est passé) obligatoires, `attendu`, `correctif` et `contournement` facultatifs ; chaque texte est tronqué à 300 caractères. Puis il continue autrement.
+- **Rangement** : par projet, dans le store du plugin (clé `papercuts:<projet>`), 50 au plus (les plus anciens tombent). Deux signalements de la même gêne (même cible, même outil, même erreur à chiffres et chemins près) sont fusionnés : le compteur « vu ×n » monte, le correctif et le contournement sont mis à jour s'ils sont fournis.
+- **Retour aux flows suivants** : les 5 papercuts les plus vus vont dans le contexte de `/revo-flow`, les 3 plus vus dans le prompt de chaque sous-agent, avec leur contournement : « Évite ces pièges ».
+- **Agent bloqué** : revo-flow compte les appels d'outils et les échecs de chaque sous-agent. Après **3 échecs de suite** (ou 2 fois la même erreur), un toast « semble bloqué » est affiché une fois, la carte de l'agent montre « ⚠ semble bloqué », et le résultat de l'outil porte une consigne : arrêter de réessayer à l'identique, relire l'erreur, changer d'approche et signaler la gêne. Un succès efface l'alerte. Les éclaireurs et les outils de revo-flow ne comptent pas.
+- **Réponse finale bornée** : la consigne de chaque sous-agent limite sa réponse finale à **15 lignes** (ce qu'il a fait, les fichiers touchés, ce qui reste ouvert), sans code ni journal recopiés : l'orchestrateur relit les fichiers s'il en a besoin. Toujours actif, quelle que soit l'option.
+- **Affichage** : ligne « papercuts : n ce flow · n au projet » dans le panneau, section « Papercuts et trajectoire » du rapport (papercuts du flow, appels d'outils et échecs par agent), champs `papercuts` et `echecsOutils` du journal.
+- **`/revo-flow papercuts`** liste ceux du projet ; **`/revo-flow papercuts clear`** les efface après confirmation.
+- **Option `papercuts`** (`/config`, oui par défaut) : `non` retire l'outil, la consigne, le suivi des échecs et l'alerte ; la réponse bornée reste.
+
 ### Revue d'architecture
 
 Depuis la v3.2, chaque flow vérifié finit par une **revue d'architecture obligatoire** : le vérificateur juge l'étape **ARCHI** en plus des critères. Le code de la branche (ou de la PR) respecte-t-il l'architecture du projet ? Même sans critère dans le plan, le vérificateur est lancé pour cette revue.
@@ -293,6 +307,7 @@ Depuis la v2.2, revo-flow découvre les agents déjà installés sur ton Claude 
 | `web` | `extension` | preuve web du vérificateur (v3.0) : `extension` démarre le serveur de dev du projet après confirmation et navigue avec Claude in Chrome ; `devtools` déclare en plus le MCP Chrome DevTools en repli ; `off` : aucune preuve web |
 | `mobile` | `appareil` | preuve mobile du vérificateur (v3.1) : `appareil` choisit l'appareil (téléphone branché, sinon émulateur ou simulateur démarré avec sa fenêtre), lance l'app après confirmation et l'observe en direct avec l'outil `mobile` ; `mcp` déclare en plus le MCP mobile-mcp ; `off` : aucune preuve mobile |
 | `budget` | `auto` | plafond de coût par flow (v3.6) : `auto` = 2 × l'estimation du plan, 2 € au moins ; un nombre en euros (`15`, `12,5`) ; `off` ou `0` : aucun plafond. Alerte à 80 %, question à 100 % (Arrêter, +50 %, Laisser finir) ; voir « Budget » |
+| `papercuts` | oui | papercuts et agent bloqué (v3.7) : outil `papercut` pour les sous-agents, papercuts connus rappelés aux flows suivants, alerte après 3 échecs d'outils de suite ; `non` : rien de tout cela (la réponse finale bornée à 15 lignes reste) ; voir « Papercuts et agent bloqué » |
 | `livraison` | oui | livraison (v3.4 GitHub, v3.5 GitLab) : en fin de flow vérifié, propose d'ouvrir la PR ou la MR (brouillon ou prête) ; revo-flow fait branche, commit des fichiers du flow, push nommé et `gh pr create` ou `glab mr create` avec le rapport ; jamais de merge ; `non` : rien n'est proposé |
 | `gardeMerge` | oui | garde anti-merge (v3.3) : refuse toute commande de Claude qui fusionnerait une PR ou une MR, armerait l'auto-merge ou pousserait sur la branche par défaut, dans un flow ou non ; `non` : aucune garde |
 | `architecture` | oui | revue d'architecture obligatoire du vérificateur à la fin de chaque flow vérifié (v3.2) : fichiers au bon endroit, conventions, rien de redéfini ; la porte attend son verdict ; `non` la rend facultative |
@@ -325,6 +340,7 @@ revo-flow/
 │   ├── reprise.ts         reprise d'un flow après redémarrage : instantané, flow restauré, question
 │   ├── budget.ts          budget par flow : estimation, plafond, alerte et question
 │   ├── livraison.ts       livraison en fin de flow : forge, branche, message de commit, fichiers du flow, question, gh pr create
+│   ├── papercut.ts        papercuts et trajectoire : fiche, fusion, rappel aux flows suivants, détection d'un agent bloqué, réponse bornée
 │   ├── merge.ts           garde anti-merge : lecture de la commande shell, refus du merge et du push sur la branche par défaut
 │   ├── lib.ts             logique pure du flow : plan, tâches, progression, consignes, coûts
 │   ├── ui/
@@ -345,6 +361,7 @@ revo-flow/
 │   ├── budget.test.ts
 │   ├── doctor.test.ts
 │   ├── rapport.test.ts
+│   ├── papercut.test.ts   papercuts, trajectoire, consignes
 │   ├── agents/            catalogue.test.ts
 │   ├── cache/             graph.test.ts, store.test.ts
 │   ├── verif/             coeur.test.ts, garde.test.ts, crap.test.ts, web.test.ts, web-flow.test.ts, mobile.test.ts, mobile-flow.test.ts

@@ -64,6 +64,11 @@ export type FlowAgent = Activity & {
   lastActiveAt?: number
   /** Nombre de lancements : 1 au premier, +1 à chaque relance. */
   attempts?: number
+  /**
+   * Il semble bloqué (v3.7) : outil du dernier échec, échecs d'outils de suite, heure de l'alerte. Effacé par le premier appel réussi
+   * ou un nouveau lancement ; absent avec l'option papercuts à off.
+   */
+  bloque?: { outil: string; suite: number; depuis: number }
 }
 
 /**
@@ -432,6 +437,8 @@ declare module 'claude-code' {
       verif: VerifView | null
       /** L'état de la porte du flow courant qui survit à un rechargement du mod (gel, critères, tentatives). */
       verifFlow: VerifFlow | null
+      /** Les papercuts (v3.7) : signalés pendant le flow courant, et connus du projet ; null avant le premier flow ou avec l'option à off. */
+      papercuts: { flow: number; projet: number } | null
     }
   }
 }

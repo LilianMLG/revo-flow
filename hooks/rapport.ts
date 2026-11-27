@@ -3,6 +3,7 @@
 import type { ArchiView, CacheStats, Critere, CritereVerdict, Entry, Flow, Lead, MobileView, VerifErreur, VerifJournal, VerifResultat, WebView } from '../types'
 import { BUDGET_HONNETETE, type BudgetJournal } from './budget'
 import { MODELS, euros, fmt, fmtDuration, total } from './lib'
+import { papercutRapport, type Papercut } from './papercut'
 import { dureeText } from './verif/report'
 
 /** Ce que la porte a vu : le dernier résultat (commandes, erreurs) et les décisions de l'utilisateur. */
@@ -38,6 +39,10 @@ export type RapportInput = {
   budget?: BudgetJournal
   /** La racine du dépôt : les fichiers modifiés qui n'y sont pas (scratchpad, worktree) ne sont pas listés. Absente : seuls les chemins de scratchpad sont écartés. */
   racine?: string
+  /** Les papercuts signalés pendant ce flow (v3.7) ; absent ou vide : la section dit qu'il n'y en a pas. */
+  papercuts?: Papercut[]
+  /** Les appels d'outils et les échecs de chaque sous-agent (v3.7) ; absent : pas de tableau. */
+  trajectoires?: { nom: string; appels: number; echecs: number }[]
 }
 
 const plural = (n: number, un: string, plusieurs: string) => `${n} ${n > 1 ? plusieurs : un}`
@@ -283,6 +288,12 @@ function criteriaSection(criteres: readonly Critere[] | undefined, verdicts: rea
   return [...out, '', mobileP ?? webParagraph(web), '']
 }
 
+/** 4 bis. Les papercuts signalés pendant le flow et la trajectoire des agents (v3.7). */
+function papercutsSection(papercuts: RapportInput['papercuts'], trajectoires: RapportInput['trajectoires']): string[] {
+  const corps = papercutRapport(papercuts ?? [], trajectoires ?? [])
+  return [...(corps[0]?.startsWith('## ') ? [] : ['## Papercuts et trajectoire', '']), ...corps, '']
+}
+
 /** 5. Le score CRAP : les fonctions au-dessus du seuil, touchées par le flow (nouvelles) ou non (préexistantes). */
 function crapSection(verif: VerifJournal | undefined, porte: RapportPorte | undefined): string[] {
   const out = ['## Score CRAP', '']
@@ -333,6 +344,7 @@ export function rapportMarkdown(input: RapportInput): string {
     ...gateSection(verif, porte),
     ...criteriaSection(criteres, verdicts, web, mobile),
     ...archiSection(archi),
+    ...papercutsSection(input.papercuts, input.trajectoires),
     ...crapSection(verif, porte),
     ...costSection(flow, lead, date, cache, budget),
   ]

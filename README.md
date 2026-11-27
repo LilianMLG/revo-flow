@@ -65,6 +65,8 @@ A red flow means the gate still finds new lint, type or test errors, or a functi
 
 Without `/revo-flow`, the mod does nothing, except the merge guard.
 
+**Papercuts and stuck agents (v3.7).** Idea from Uber Engineering's 24 November 2026 article on evaluating agent skills. A sub-agent hit by a broken command, script or doc reports it with the `mcp__revo-flow__papercut` tool instead of retrying; reports are stored per project (merged when repeated, 50 at most) and the most seen ones are recalled, with their workaround, to later flows. After 3 failed tool calls in a row an agent is flagged as stuck (toast, panel, hint in the tool result). Sub-agents' final answers are capped at 15 lines. `/revo-flow papercuts` lists them, `/revo-flow papercuts clear` erases them.
+
 **Code Mode (v3.6.1).** revo-flow runs under Claude Code's experimental Code Mode (`CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1`), where the model's only tool is `REPL`. Tried on Claude Code 2.1.332: the merge guard refuses a push to `main` and `gh pr merge` made from a script, a tool removed from an agent does not exist in its script, and a full flow runs. Not tried: a flow with the gate, frozen tests and the verifier. `/revo-flow doctor` shows whether Code Mode is on.
 
 **Delivery (v3.4 GitHub, v3.5 GitLab).** At the end of a verified flow, on a GitHub repository with `gh` logged in or a GitLab one with `glab` logged in (self-hosted included), revo-flow offers to open the PR (the MR on GitLab) (Draft, Ready for review, or Not now; on a branch that already has an open PR, Push to the PR). With your consent it runs the commands itself: a `revo/<title>` branch when you are on the default branch, a commit of the flow's files only, in the style of your recent commits, a named push, and `gh pr create` or `glab mr create` with the flow report as the description. A self-hosted GitLab is recognized once `glab auth login --hostname <host>` is done, or from a `.gitlab-ci.yml`. It never merges: type `/ship` for the review and the watch, merging stays with you.
@@ -93,6 +95,7 @@ Run it first on a new project. It is read-only: it shows what revo-flow detected
 | `/revo-flow historique [n]` | the last n flows: date, duration, cost, agents, failures |
 | `/revo-flow stop` | stop the running agents and the orchestrator's turn, after confirmation |
 | `/revo-flow doctor` | what revo-flow found on the project (read-only) |
+| `/revo-flow papercuts [clear]` | friction reports filed by agents on this project (v3.7) |
 | `/revo-flow version` | the mod version |
 | `/revo-flow cache` | the project's file graph and feature sheets |
 | `/revo-flow cache build` / `clear` / `<keyword>` | rebuild, delete, or search the cache |
@@ -110,6 +113,7 @@ Set in `/config`.
 | `notifier` | yes | system notification when a flow ends or an agent fails |
 | `verif` | `bloquer` | `bloquer` refuses the end of a flow while new errors remain, `observer` checks and shows without blocking, `off` does not check |
 | `budget` | `auto` | cost ceiling per flow (v3.6): `auto` is 2 × the plan's estimate (2 € at least), a number is a ceiling in euros, `off` or `0` disables it; alert at 80 %, question at 100 % (Stop, +50 %, Let it finish) |
+| `papercuts` | yes | `papercut` tool for sub-agents, known papercuts recalled to later flows, stuck-agent alert after 3 failed tool calls in a row; `non` turns it off (the 15-line final answer cap stays) |
 | `crap` | yes | CRAP score in the gate: a function changed by the flow above 30 is a new error |
 | `cache` | yes | inject the project cache brief and feature excerpts, and offer the `cache` tool |
 | `web` | `extension` | web proof by the verifier: `extension` starts the dev server (after confirmation) and browses with Claude in Chrome, `devtools` also declares the Chrome DevTools MCP as a fallback, `off` disables it |

@@ -1,6 +1,7 @@
 /** La logique pure du flow : plan, appariement des agents, tâches et progression, consignes, tokens et coûts, journal. */
 import type { Critere, Effort, Flow, FlowAgent, FlowTask, ModelKey, Phase, TaskKind, TaskStatus, Tally, VerifJournal } from '../types'
 import type { BudgetJournal } from './budget'
+import { PAPERCUT_BRIEF, REPONSE_BORNEE } from './papercut'
 import { parseCriteres } from './verif/garde'
 import { globMatch, norm } from './verif/scope'
 
@@ -9,6 +10,8 @@ export const PLAN_TOOL = `mcp__${PLUGIN}__plan`
 export const STEP_TOOL = `mcp__${PLUGIN}__step`
 export const CACHE_TOOL = `mcp__${PLUGIN}__cache`
 export const VERIF_TOOL = `mcp__${PLUGIN}__verif`
+/** L'outil des papercuts (v3.7) : un sous-agent signale ce qui le gêne (commande, doc, outil). */
+export const PAPERCUT_TOOL = `mcp__${PLUGIN}__papercut`
 /** Le type d'agent du vérificateur (lot 2) : lecture seule, enregistré par register.tsx. */
 export const VERIFIER_TYPE = `${PLUGIN}:verifier`
 
@@ -733,9 +736,11 @@ const SCOUT =
  * Ajouté au prompt du sous-agent : ses tâches (celles déjà faites lors d'un lancement précédent cochées), comment
  * les signaler et, avec le cache, comment s'en servir. `others` : les noms des autres agents du plan, ceux qu'il
  * peut attendre (statut attente). `verif` : la porte est active, l'agent lance verif sur ses fichiers avant de finir
- * (sauf un agent en lecture seule : Explore ou vérificateur) ; `crap` : avec la règle du scout du score CRAP.
+ * (sauf un agent en lecture seule : Explore ou vérificateur) ; `crap` : avec la règle du scout du score CRAP. `papercuts` (v3.7) : la
+ * consigne de signaler ce qui le gêne avec l'outil papercut ; la réponse bornée (15 lignes) vaut pour tous, sauf le vérificateur, dont les
+ * verdicts et preuves restent complets (sa sortie est cadrée par son prompt).
  */
-export function agentBrief(a: FlowAgent, cache: AgentCache | boolean = 'fiches', others: readonly string[] = [], verif = true, crap = true): string {
+export function agentBrief(a: FlowAgent, cache: AgentCache | boolean = 'fiches', others: readonly string[] = [], verif = true, crap = true, papercuts = true): string {
   const mode = cache === true ? 'fiches' : cache
   const done = a.tasks.filter(t => t.status === 'completed').length
   const resume = done > 0 && done < a.tasks.length
@@ -747,7 +752,7 @@ export function agentBrief(a: FlowAgent, cache: AgentCache | boolean = 'fiches',
   return `# Tes tâches (revo-flow) — « ${a.name} »${a.role ? ` : ${a.role}` : ''}
 ${a.tasks.map((t, i) => `${i + 1}. ${t.title}${t.status === 'completed' ? ' ✓ déjà faite' : ''}`).join('\n')}
 ${scope}${resume ? `Reprise : les tâches cochées ✓ ont été faites lors d'un lancement précédent ; ne les refais pas, reprends à la première qui ne l'est pas (garde sa numérotation).\n` : ''}${mode ? `\n${AGENT_CACHE[mode]}\n` : ''}
-Suivi : fais ces tâches dans l'ordre. Au début de chacune, appelle l'outil ${STEP_TOOL} avec {"tache": <numéro>, "statut": "en_cours"} : cela clôt la précédente, et la dernière est close quand tu finis, donc "fait" est inutile. "attente" avec "attend" = le nom de l'agent du plan dont tu dépends si la tâche ne peut pas avancer tant qu'il n'a pas fini (termine alors ta réponse en disant ce qui manque : revo-flow te relancera quand il aura fini) ; "echec" seulement pour ce que tu ne peux pas faire du tout, en expliquant pourquoi dans ta réponse. N'utilise cet outil pour rien d'autre.${others.length ? `\nLes autres agents du plan (à nommer dans "attend") : ${others.map(n => `« ${n} »`).join(', ')}.` : ''}${check}`
+Suivi : fais ces tâches dans l'ordre. Au début de chacune, appelle l'outil ${STEP_TOOL} avec {"tache": <numéro>, "statut": "en_cours"} : cela clôt la précédente, et la dernière est close quand tu finis, donc "fait" est inutile. "attente" avec "attend" = le nom de l'agent du plan dont tu dépends si la tâche ne peut pas avancer tant qu'il n'a pas fini (termine alors ta réponse en disant ce qui manque : revo-flow te relancera quand il aura fini) ; "echec" seulement pour ce que tu ne peux pas faire du tout, en expliquant pourquoi dans ta réponse. N'utilise cet outil pour rien d'autre.${others.length ? `\nLes autres agents du plan (à nommer dans "attend") : ${others.map(n => `« ${n} »`).join(', ')}.` : ''}${check}${papercuts ? `\n${PAPERCUT_BRIEF}` : ''}${isVerifier(a) ? '' : `\n${REPONSE_BORNEE}`}`
 }
 
 // ── Tokens, jour et semaine ──────────────────────────────────────────────
@@ -1031,6 +1036,10 @@ export type JournalEntry = {
   budget?: BudgetJournal
   /** Pourquoi le flow a été arrêté, quand ce n'est pas l'utilisateur : « budget » (plafond atteint, « Arrêter »). */
   motif?: 'budget'
+  /** Les papercuts signalés pendant le flow (v3.7) ; absent avec l'option papercuts à off. */
+  papercuts?: number
+  /** Les échecs d'outils des sous-agents, additionnés (v3.7) ; absent avec l'option papercuts à off. */
+  echecsOutils?: number
 }
 
 /** Au plus autant de flows gardés dans le journal. */

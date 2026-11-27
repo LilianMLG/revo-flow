@@ -276,7 +276,7 @@ const ENTRIES: Entry[] = [
 ]
 const BASE: RapportInput = { flow: FLOW, lead: LEAD, entries: ENTRIES, date: '2026-10-12 09:03' }
 
-const SECTIONS = ['## Demande et plan', '## Fichiers modifiés', '## Vérification (porte)', "## Critères d'acceptation", '## Architecture', '## Score CRAP', '## Durée, coût et tokens']
+const SECTIONS = ['## Demande et plan', '## Fichiers modifiés', '## Vérification (porte)', "## Critères d'acceptation", '## Architecture', '## Papercuts et trajectoire', '## Score CRAP', '## Durée, coût et tokens']
 
 test('rapportMarkdown : rapport complet, les six sections', () => {
   const md = rapportMarkdown({
@@ -310,9 +310,13 @@ test('rapportMarkdown : rapport complet, les six sections', () => {
     cache: { injecte: 1200, evites: 8400, net: 7200, lus: 3, completude: 1 },
     web: { etat: 'arrete', commande: 'npm run dev', url: 'http://localhost:3000', captures: [] },
     archi: { verdict: 'ok', preuve: '3 fichiers lus ; Basket.vue sous components/ comme les autres vues ; Promo importé de types/promo.ts' },
+    papercuts: [{ id: 'pc-12345678', cible: 'projet', outil: 'npm run lint', quoi: 'lancer le lint', obtenu: 'option --fix refusée', par: 'API promo', flow: 'Code promo panier', le: '2026-10-12T09:00:00Z', vu: 1 }],
+    trajectoires: [{ nom: 'API promo', appels: 14, echecs: 2 }],
   })
   for (const s of SECTIONS) expect(md).toContain(s)
   expect(md).not.toMatch(/\*Absent/)
+  expect(md).toContain('option --fix refusée')
+  expect(md).toContain('| API promo | 14 | 2 |')
   expect(md).toMatch(/^# Rapport : Code promo panier\n/)
   expect(md).toContain('**Demande** : ajoute un code promo dans le panier')
   expect(md).toContain('Sonnet 5.5 · effort medium')
@@ -348,7 +352,8 @@ test('rapportMarkdown : rapport complet, les six sections', () => {
 test('rapportMarkdown : sans porte, sans critères, sans fichiers ni cache, chaque section dit son absence', () => {
   const md = rapportMarkdown({ ...BASE, entries: [] })
   for (const s of SECTIONS) expect(md).toContain(s)
-  expect(md.match(/\*Absent : /g)).toHaveLength(6)
+  expect(md.match(/\*Absent : /g)).toHaveLength(7)
+  expect(md).toContain('*Absent : aucun papercut signalé.*')
   expect(md).toContain("*Absent : pas de revue d'architecture pour ce flow.*")
   expect(md).toContain('*Absent : pas de porte de vérification pour ce flow.*')
   expect(md).toContain("*Absent : le plan n'avait pas de critères.*")
@@ -602,4 +607,13 @@ test('rapportMarkdown : les fichiers hors du dépôt (scratchpad, hors racine) n
   expect(w).toContain('`a.ts`')
   expect(w).not.toContain('b.ts')
   expect(rapportMarkdown({ ...BASE, entries: [win[1]!], racine: 'C:\\Dev\\app' })).toContain('*Absent : aucun fichier modifié pendant ce flow.*\n*1 fichier hors du dépôt non listé.*')
+})
+
+test('rapportMarkdown : « Papercuts et trajectoire » entre Architecture et Score CRAP, un seul titre', () => {
+  const md = rapportMarkdown(BASE)
+  const [a, p, c] = ['## Architecture', '## Papercuts et trajectoire', '## Score CRAP'].map(h => md.indexOf(h))
+  expect(a).toBeGreaterThan(-1)
+  expect(p).toBeGreaterThan(a!)
+  expect(c).toBeGreaterThan(p!)
+  expect(md.match(/## Papercuts et trajectoire/g)).toHaveLength(1)
 })

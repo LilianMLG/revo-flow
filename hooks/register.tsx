@@ -1,6 +1,7 @@
 /**
- * Le cœur du mod : commande /revo-flow, outils plan, step, cache et verif, suivi des agents (lancement, attente, relance, arrêt),
- * vérification du flow (commandes confirmées, base de référence, porte de fin, tests gelés, vérificateur) et rendu du panneau.
+ * Le cœur du mod : commande /revo-flow, outils plan, step, cache, verif et papercut, suivi des agents (lancement, attente, relance, arrêt,
+ * agent qui semble bloqué), vérification du flow (commandes confirmées, base de référence, porte de fin, tests gelés, vérificateur) et rendu
+ * du panneau.
  */
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, PluginOptions, Register, SessionContextUsage } from 'claude-code'
@@ -83,6 +84,7 @@ import {
   CACHE_TOOL,
   EMPTY,
   MODELS,
+  PAPERCUT_TOOL,
   PLAN_TOOL,
   PLUGIN,
   STEP_TOOL,
@@ -188,6 +190,7 @@ import {
   type Forge,
 } from './livraison'
 import { brancheParDefaut, dossiersDuPush, mergeDenial, refusPrudent, type MergeContexte } from './merge'
+import { addPapercut, papercutBrief, papercutListText, parsePapercut, readPapercuts, stepTrajectoire, struggleHint, type Papercut, type Trajectoire } from './papercut'
 import { rapportMarkdown } from './rapport'
 import {
   BUDGET_CHOIX,
@@ -311,6 +314,7 @@ const flowCacheA = atom({ plugin: 'revo-flow', key: 'flowCache' } as const, null
 const cacheOpenA = atom({ plugin: 'revo-flow', key: 'cacheOpen' } as const, false)
 const verifA = atom({ plugin: 'revo-flow', key: 'verif' } as const, null)
 const verifFlowA = atom({ plugin: 'revo-flow', key: 'verifFlow' } as const, null)
+const papercutsA = atom({ plugin: 'revo-flow', key: 'papercuts' } as const, null)
 
 /** Les options du plugin (userConfig), fixées pour ce chargement : un changement recharge le module. */
 const opts = {
@@ -330,6 +334,8 @@ const opts = {
   architecture: true,
   /** Le budget par flow (v3.6) : auto (2 × l'estimation), off, ou un plafond en euros (« 12,5 »). */
   budget: 'auto',
+  /** Les papercuts (v3.7) : l'outil papercut, les papercuts connus dans les briefs, la trajectoire des agents et l'alerte d'agent bloqué. */
+  papercuts: true,
 }
 
 /** L'outil mobile de la preuve mobile (v3.1) : capture, arbre, journal, gestes, réservé au vérificateur. */
@@ -593,6 +599,34 @@ async function registerTools($: $) {
   })
   if (opts.verif !== 'off') await registerVerifTool($)
   if (opts.verif !== 'off' && opts.mobile !== 'off') await registerMobileTool($)
+  if (opts.papercuts) await registerPapercutTool($)
+}
+
+/** L'outil papercut (v3.7) : un agent signale ce qui le gêne, gardé par projet et rappelé aux flows suivants. */
+async function registerPapercutTool($: $) {
+  await $.tool.register({
+    name: 'papercut',
+    description:
+      'revo-flow : signale une friction qui t’a coûté des essais (option refusée, erreur silencieuse, doc fausse, test instable, outil qui ne fait pas ce qu’il dit), puis continue autrement. Elle est gardée pour le projet et rappelée aux flows suivants : dis ce que tu essayais (quoi), ce que tu attendais (attendu), ce qui s’est passé (obtenu), ce qui corrigerait la cause (correctif) et comment tu t’en es sorti (contournement).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        cible: {
+          type: 'string',
+          enum: ['projet', 'revo-flow', 'outil'],
+          description: 'projet : le dépôt (commande, script, doc, test) ; revo-flow : le mod lui-même ; outil : un outil de Claude Code ou un MCP',
+        },
+        outil: { type: 'string', description: 'L’outil ou la commande en cause : « Bash », « npm run lint », « mcp__x__y »' },
+        quoi: { type: 'string', description: 'Ce que tu essayais de faire (300 caractères au plus)' },
+        attendu: { type: 'string', description: 'Ce que tu attendais' },
+        obtenu: { type: 'string', description: 'Ce qui s’est passé : l’erreur ou le comportement, en une phrase' },
+        correctif: { type: 'string', description: 'Ce qui corrigerait la cause' },
+        contournement: { type: 'string', description: 'Comment tu t’en es sorti, utile aux flows suivants' },
+      },
+      required: ['quoi', 'obtenu'],
+    },
+    isDeferred: false,
+  })
 }
 
 /** L'outil mobile (v3.1) : ce que le vérificateur fait sur l'appareil pendant la preuve mobile, sous les yeux de l'utilisateur. */
@@ -1081,6 +1115,8 @@ const JOURNAL_KEY = 'journal'
 
 /** Ajoute le flow fini au journal : durée, coût et sort de chaque agent, et la vérification, pour /revo-flow historique. */
 async function journalize($: $, flow: Flow, lead: Lead, files: number, verifP: Promise<VerifJournal | undefined> = Promise.resolve(undefined)) {
+  // Lu avant d'attendre la vérification : un flow suivant peut démarrer pendant.
+  const papercuts = papercutFields(flow)
   const entry: JournalEntry = {
     id: flow.id,
     title: flow.title,
@@ -1104,7 +1140,7 @@ async function journalize($: $, flow: Flow, lead: Lead, files: number, verifP: P
   }
   const verif = await verifP.catch(() => undefined)
   const prev = await $.store.get(JOURNAL_KEY)
-  await $.store.set(JOURNAL_KEY, addToJournal(prev, { ...entry, ...(verif ? { verif } : {}), ...budgetFields(flow, lead) }))
+  await $.store.set(JOURNAL_KEY, addToJournal(prev, { ...entry, ...(verif ? { verif } : {}), ...budgetFields(flow, lead), ...papercuts }))
 }
 
 /** Le budget du flow pour le journal (v3.6) : estimé, plafond, réel, atteint ; et le motif d'un arrêt sur le plafond. */
@@ -1113,6 +1149,190 @@ function budgetFields(flow: Flow, lead: Lead): Pick<JournalEntry, 'budget' | 'mo
     ...(flow.budget ? { budget: budgetOfFlow(flow.budget, flowCost(flow, lead)) } : {}),
     ...(flow.arret ? { motif: flow.arret } : {}),
   }
+}
+
+// ── Papercuts et trajectoire des agents (v3.7) ───────────────────────────
+
+/** La clé du store des papercuts d'un projet : celle de son cache (resolveProject). */
+const papercutsKey = (cle: string) => `papercuts:${cle}`
+
+/** Les papercuts signalés pendant le flow courant, fusionnés comme ceux du projet : pour le panneau, le rapport et le journal. */
+const flowPapercuts = { flowId: '', list: [] as Papercut[] }
+
+/** La trajectoire de chaque sous-agent du flow courant (par clé d'agent) : appels d'outils, échecs, série d'échecs en cours. */
+const trajectoires = { flowId: '', parAgent: new Map<string, Trajectoire>() }
+
+/** Le flow courant change (nouveau flow, ou rechargement du module) : papercuts du flow et trajectoires repartent de zéro. */
+function papercutsFor(flowId: string) {
+  if (flowPapercuts.flowId !== flowId) Object.assign(flowPapercuts, { flowId, list: [] })
+  if (trajectoires.flowId !== flowId) {
+    trajectoires.flowId = flowId
+    trajectoires.parAgent.clear()
+  }
+}
+
+/** Les papercuts gardés pour un projet ; [] si le store est illisible. */
+async function projectPapercuts($: $, ref: ProjectRef): Promise<Papercut[]> {
+  return readPapercuts(await $.store.get(papercutsKey(ref.cle)).catch(() => undefined))
+}
+
+/** Le projet des papercuts : celui du flow (son cache), sinon le dépôt de la session. */
+async function papercutRef($: $): Promise<ProjectRef | undefined> {
+  return flowRef ?? (await resolveProject(ioOf($)).catch(() => undefined))
+}
+
+/** Le nom de qui signale : l'agent du plan, l'orchestrateur, un éclaireur, le vérificateur hors plan, sinon « sous-agent ». */
+function papercutAuthor(flow: Flow | null, agentId: string | undefined): string {
+  if (!agentId) return 'orchestrateur'
+  const a = flow?.agents.find(x => x.agentId === agentId)
+  if (a) return a.name
+  return scouts.has(agentId) ? 'éclaireur' : verifierAgents.has(agentId) ? 'vérificateur' : 'sous-agent'
+}
+
+/**
+ * L'outil papercut : le papercut validé (parsePapercut) est fusionné dans la liste du projet (store, clé papercuts:<cle>) et dans celle
+ * du flow en cours ; l'erreur de validation est rendue telle quelle à l'agent.
+ */
+async function papercutTool($: $, e: Record<string, unknown> & { agentId?: string }): Promise<string> {
+  const flow = await read($, flowA)
+  const live = flow && flow.phase !== 'done' ? flow : null
+  const le = new Date(await $.clock.now()).toISOString()
+  const parsed = parsePapercut(e, { par: papercutAuthor(flow, e.agentId), flow: flow?.title ?? '', le })
+  if ('error' in parsed) return parsed.error
+  const p = parsed.papercut
+  let vu = 1
+  if (live) {
+    papercutsFor(live.id)
+    const r = addPapercut(flowPapercuts.list, p)
+    flowPapercuts.list = r.list
+    vu = r.vu
+  }
+  const ref = await papercutRef($)
+  let projet: number | undefined
+  if (ref) {
+    const r = addPapercut(await projectPapercuts($, ref), p)
+    await $.store.set(papercutsKey(ref.cle), r.list)
+    vu = r.vu
+    projet = r.list.length
+  }
+  await update($, papercutsA, v => ({ flow: flowPapercuts.list.length, projet: projet ?? v?.projet ?? 0 }))
+  return `revo-flow papercut : noté (${p.id}, vu ×${vu}) ; merci, continue ta tâche.`
+}
+
+/**
+ * Au lancement d'un flow : papercuts du flow et trajectoires repartent de zéro, le panneau compte ceux du projet, et l'orchestrateur reçoit
+ * les plus vus (5 au plus) ; rien avec l'option papercuts à off.
+ */
+async function startPapercuts($: $, flowId: string): Promise<string | undefined> {
+  papercutsFor(flowId)
+  if (!opts.papercuts) {
+    await update($, papercutsA, () => null)
+    return undefined
+  }
+  const ref = await papercutRef($)
+  const list = ref ? await projectPapercuts($, ref) : []
+  await update($, papercutsA, () => ({ flow: 0, projet: list.length }))
+  return papercutBrief(list, 5) || undefined
+}
+
+/** Les papercuts connus du projet pour la fin du prompt d'un sous-agent (3 au plus) ; '' sans papercut, option à off ou en cas d'erreur. */
+async function agentPapercuts($: $): Promise<string> {
+  if (!opts.papercuts) return ''
+  try {
+    const ref = await papercutRef($)
+    return ref ? papercutBrief(await projectPapercuts($, ref), 3) : ''
+  } catch {
+    return ''
+  }
+}
+
+/** Les trajectoires des sous-agents du flow, dans l'ordre du plan : pour le rapport. */
+function trajectoiresOf(flow: Flow): { nom: string; appels: number; echecs: number }[] {
+  if (trajectoires.flowId !== flow.id) return []
+  return flow.agents.flatMap(a => {
+    const t = trajectoires.parAgent.get(a.key)
+    return t ? [{ nom: a.name, appels: t.appels, echecs: t.echecs }] : []
+  })
+}
+
+/** Ce que le journal garde des papercuts du flow (v3.7) : leur nombre et les échecs d'outils des sous-agents ; rien avec l'option à off. */
+function papercutFields(flow: Flow): Pick<JournalEntry, 'papercuts' | 'echecsOutils'> {
+  if (!opts.papercuts) return {}
+  return {
+    papercuts: flowPapercuts.flowId === flow.id ? flowPapercuts.list.length : 0,
+    echecsOutils: trajectoiresOf(flow).reduce((n, t) => n + t.echecs, 0),
+  }
+}
+
+/**
+ * La trajectoire d'un sous-agent après un appel d'outil : un échec allonge sa série, un succès l'efface. À 3 échecs de suite (ou la même
+ * erreur deux fois), une alerte : un toast, l'agent marqué « bloque » dans le panneau, et le conseil (struggleHint) rendu avec le résultat.
+ * Rend le résultat, complété ou non ; jamais d'exception.
+ */
+async function trackTrajectoire<R extends { deny?: unknown; isError?: boolean; context?: readonly string[] }>($: $, flow: Flow, who: string, tool: string, ran: R, failed: boolean): Promise<R> {
+  try {
+    papercutsFor(flow.id)
+    const before = trajectoires.parAgent.get(who)
+    const r = stepTrajectoire(before, { outil: tool, echec: failed, ...(failed ? { erreur: errorOf(ran) } : {}) })
+    trajectoires.parAgent.set(who, r.t)
+    if (!failed) {
+      if (before?.alerte || flow.agents.find(a => a.key === who)?.bloque) await setAgent($, who, ({ bloque: _b, ...a }) => a)
+      return ran
+    }
+    // Déjà signalé : la série continue de compter dans le panneau, sans nouvelle alerte.
+    if (!r.alerte) {
+      if (r.t.alerte) await setAgent($, who, a => (a.bloque ? { ...a, bloque: { ...a.bloque, outil: tool, suite: r.t.suite } } : a))
+      return ran
+    }
+    const { outil, suite } = r.alerte
+    const depuis = await $.clock.now()
+    await setAgent($, who, a => ({ ...a, bloque: { outil, suite, depuis } }))
+    const name = flow.agents.find(a => a.key === who)?.name ?? who
+    $.ui.toast(`revo-flow : « ${name} » semble bloqué (${suite} échecs de suite, dernier : ${outil})`)
+    return { ...ran, context: [...(ran.context ?? []), struggleHint(outil, suite)] }
+  } catch {
+    // le suivi ne doit jamais gêner l'outil
+    return ran
+  }
+}
+
+/** Le texte d'un appel en échec : le refus, sinon le résultat en erreur tel que le modèle le lit. */
+function errorOf(ran: { deny?: unknown; isError?: boolean }): string {
+  const r = ran as { deny?: unknown; text?: unknown; result?: unknown }
+  if (typeof r.deny === 'string') return r.deny
+  if (typeof r.text === 'string') return r.text
+  if (typeof r.result === 'string') return r.result
+  try {
+    return JSON.stringify(r.result ?? '').slice(0, 300)
+  } catch {
+    return ''
+  }
+}
+
+/** Un agent relancé repart sans alerte : sa série d'échecs est remise à zéro (ses appels et échecs restent comptés). */
+function rearmTrajectoire(flowId: string, key: string) {
+  if (trajectoires.flowId !== flowId) return
+  const t = trajectoires.parAgent.get(key)
+  if (!t) return
+  const { derniereErreur: _d, ...rest } = t
+  trajectoires.parAgent.set(key, { ...rest, suite: 0, memeErreur: 0, alerte: false })
+}
+
+/**
+ * /revo-flow papercuts : les papercuts signalés sur le projet courant. clear : effacés après confirmation (Effacer / Annuler ; sans personne
+ * à qui demander ou dialogue fermé : rien n'est effacé).
+ */
+async function papercutsCommand($: $, isClear: boolean): Promise<string> {
+  const ref = await resolveProject(ioOf($)).catch(() => undefined)
+  if (!ref) return 'revo-flow papercuts : pas de projet git ici.'
+  const list = await projectPapercuts($, ref)
+  if (!isClear || !list.length) return papercutListText(list, ref.nom)
+  const n = list.length
+  const answer = await askOr($, `Effacer les ${plural(n, 'papercut')} de ${ref.nom} ?`, ['Effacer', 'Annuler'], { headless: 'Annuler', dismissed: 'Annuler' })
+  if (answer !== 'Effacer') return `revo-flow papercuts · ${ref.nom} : rien n’a été effacé.`
+  await $.store.delete(papercutsKey(ref.cle))
+  await update($, papercutsA, v => (v ? { ...v, projet: 0 } : v))
+  return `revo-flow papercuts · ${ref.nom} : ${plural(n, 'papercut')} effacé${n > 1 ? 's' : ''}.`
 }
 
 // ── Cache projet ─────────────────────────────────────────────────────────
@@ -4431,7 +4651,14 @@ async function viewData($: $): Promise<ViewData> {
     cacheOpen: await read($, cacheOpenA),
     verif,
     ...(capture ? { capture } : {}),
+    ...(await papercutsView($)),
   }
+}
+
+/** Le compte des papercuts pour le panneau (v3.7) : ce flow, et le projet ; rien avec l'option à off. */
+async function papercutsView($: $): Promise<Pick<ViewData, 'papercuts'>> {
+  const p = opts.papercuts ? await read($, papercutsA) : null
+  return p ? { papercuts: p } : {}
 }
 
 /** Les boutons du panneau. */
@@ -4962,6 +5189,8 @@ async function stopForBudget($: $) {
  */
 async function writeRapport($: $, flow: Flow, lead: Lead, verifP: Promise<VerifJournal | undefined>, g: Gate | undefined): Promise<string | undefined> {
   if (flow.isStopped && flow.arret !== 'budget') return undefined
+  // Les papercuts et la trajectoire du flow (v3.7), lus avant d'attendre : un flow suivant peut démarrer pendant la vérification.
+  const papercuts = opts.papercuts ? { papercuts: flowPapercuts.flowId === flow.id ? [...flowPapercuts.list] : [], trajectoires: trajectoiresOf(flow) } : {}
   const home = await ioOf($).home()
   if (!home) return undefined
   const verif = await verifP.catch(() => undefined)
@@ -4982,6 +5211,7 @@ async function writeRapport($: $, flow: Flow, lead: Lead, verifP: Promise<VerifJ
     ...(g?.web ? { web: webView(g) } : {}),
     ...(g?.mobile ? { mobile: mobileView(g) } : {}),
     ...(await rapportExtras($, flow, lead)),
+    ...papercuts,
   })
   const path = `${normalizePath(home)}/.claude/revo-flow/rapports/${slug(flow.title) || 'rapport'}.md`
   await $.fs.write(path, text)
@@ -5071,6 +5301,8 @@ function readOptions(o: PluginOptions) {
   opts.architecture = (o as { architecture?: unknown }).architecture !== false
   // Le budget par flow (v3.6) : auto par défaut (2 × l'estimation du plan), off, ou un plafond en euros.
   opts.budget = budgetOption((o as { budget?: unknown }).budget)
+  // Les papercuts et l'alerte d'agent bloqué (v3.7) : actifs par défaut.
+  opts.papercuts = (o as { papercuts?: unknown }).papercuts !== false
 }
 
 /**
@@ -5150,8 +5382,8 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'revo-flow',
       description:
-        'revo-flow <demande> : l’orchestrateur lit les specs, fait le plan, répartit les tâches entre des sous-agents et suit chacun dans le panneau · statut · panneau · stop · historique [n] : les derniers flows, leur coût et le bilan par modèle · cache [projet | build [feature | --top N | --tout] | clear [feature] | mot-clé] : le graphe et les fiches de features du projet',
-      argumentHint: '<demande> | statut | panneau | stop | historique [n] | cache [projet | build [feature|--top N|--tout] | clear [feature] | mot-clé]',
+        'revo-flow <demande> : l’orchestrateur lit les specs, fait le plan, répartit les tâches entre des sous-agents et suit chacun dans le panneau · statut · panneau · stop · historique [n] : les derniers flows, leur coût et le bilan par modèle · papercuts [clear] : ce qui a gêné les agents sur ce projet · cache [projet | build [feature | --top N | --tout] | clear [feature] | mot-clé] : le graphe et les fiches de features du projet',
+      argumentHint: '<demande> | statut | panneau | stop | historique [n] | papercuts [clear] | cache [projet | build [feature|--top N|--tout] | clear [feature] | mot-clé]',
       // statut, panneau, stop et cache répondent tout de suite, même pendant un tour ; une nouvelle demande part
       // par prompt.submit, qui attend de toute façon que la session soit libre.
       immediate: true,
@@ -5194,6 +5426,15 @@ export const register: Register = (on, options) => {
     }
     const hist = /^(historique|history)(?:\s+(\d+))?$/.exec(word)
     if (hist) return { text: historyText(await $.store.get(JOURNAL_KEY), hist[2] ? Math.max(1, Number(hist[2])) : 10) }
+    // `papercuts` / `papercuts clear` (v3.7) : les papercuts signalés sur le projet courant, ou leur effacement après confirmation.
+    const pc = /^papercuts(?:\s+(clear))?$/.exec(word)
+    if (pc) {
+      try {
+        return { text: await papercutsCommand($, pc[1] === 'clear') }
+      } catch (err) {
+        return { text: `revo-flow papercuts : ${errText(err)}` }
+      }
+    }
     if (word === 'stop') {
       let isStopped = false
       if (flow?.agents.some(a => a.status === 'running')) {
@@ -5280,6 +5521,8 @@ export const register: Register = (on, options) => {
     }
     // Le brief du cache (si une fiche correspond, après confirmation) ; sans graphe possible, on continue sans.
     const brief = await startFlowCache($, String(now), args).catch(() => undefined)
+    // Les papercuts connus du projet (v3.7), 5 au plus, avec le brief du cache ; le compte du panneau repart de zéro pour ce flow.
+    const papercutsNote = await startPapercuts($, String(now)).catch(() => undefined)
     // Les commandes de vérification du projet (confirmées une fois), puis la base de référence en fond ; jamais bloquant.
     const verifNote = await startVerif($, String(now)).catch(() => undefined)
     // Les agents installés (option agents) : leur bloc suit le rôle d'orchestrateur, qui les propose à l'étape « Équipe ».
@@ -5294,6 +5537,7 @@ export const register: Register = (on, options) => {
         leadBrief(opts.cache, opts.verif !== 'off', opts.crap, agentsInstalles.length > 0, opts.architecture && hasVerifier),
         ...(agentsNote ? [agentsNote] : []),
         ...(brief ? [brief] : []),
+        ...(papercutsNote ? [papercutsNote] : []),
         ...(verifNote ? [verifNote] : []),
       ],
     }
@@ -5328,7 +5572,8 @@ export const register: Register = (on, options) => {
     if (resumed && e.agentId) {
       const at = await $.clock.now()
       claimed.add(resumed.key)
-      await setAgent($, resumed.key, ({ waitingFor: _w, endedAt: _end, ...x }) => ({
+      rearmTrajectoire(flow!.id, resumed.key)
+      await setAgent($, resumed.key, ({ waitingFor: _w, endedAt: _end, bloque: _b, ...x }) => ({
         ...x,
         agentId: e.agentId!,
         status: 'running',
@@ -5534,7 +5779,9 @@ export const register: Register = (on, options) => {
     const criteres = gate?.flowId === flow.id ? gate.criteres : []
     const tester = isTester(a) ? `\n\n${TESTER_BRIEF}${criteres.length ? `\n\nCritères d'acceptation du plan :\n${criteres.map(c => `- ${c.id} : ${c.texte}`).join('\n')}` : ''}` : ''
     const verifier = isVerifier(a) ? await verifierBrief($).catch(() => undefined) : undefined
-    const prompt = `${e.prompt}\n\n${agentBrief(a, await agentCacheMode($), others, isVerifOn, opts.crap)}${failedNote}${tester}${verifier ? `\n\n${verifier}` : ''}${extract ? `\n\n${extract.text}` : ''}`
+    // Les papercuts connus du projet (v3.7), 3 au plus, à la fin du prompt.
+    const papercuts = await agentPapercuts($)
+    const prompt = `${e.prompt}\n\n${agentBrief(a, await agentCacheMode($), others, isVerifOn, opts.crap, opts.papercuts)}${failedNote}${tester}${verifier ? `\n\n${verifier}` : ''}${extract ? `\n\n${extract.text}` : ''}${papercuts ? `\n\n${papercuts}` : ''}`
     const r = await next({ ...e, prompt, ...spawnType(a) })
     if (r.deny !== undefined || !r.agentId) {
       claimed.delete(a.key)
@@ -5551,7 +5798,9 @@ export const register: Register = (on, options) => {
     // Un agent en attente relancé directement par l'orchestrateur (sans relaunch) : c'est une nouvelle tentative.
     const rework = a.status === 'done' || a.status === 'failed' ? reworkTitle(e.prompt, redCommands()) : undefined
     if (rework) $.ui.toast(`revo-flow : « ${a.name} » reprend : ${rework}`)
-    await setAgent($, a.key, ({ waitingFor: _w, ...x }) => ({
+    // Un nouveau lancement repart sans alerte d'agent bloqué (v3.7).
+    rearmTrajectoire(flow.id, a.key)
+    await setAgent($, a.key, ({ waitingFor: _w, bloque: _b, ...x }) => ({
       ...x,
       ...(rework ? { tasks: reworkTasks(x.tasks, rework), hasReported: false } : {}),
       agentId,
@@ -5678,6 +5927,15 @@ export const register: Register = (on, options) => {
     }
   }).catch(() => ({ result: 'revo-flow cache : indisponible pour l’instant, continue sans.' as never }))
 
+  // L'outil papercut (v3.7) : aucune exception ne remonte, l'erreur est dite en texte.
+  on('tool.call', { tool: PAPERCUT_TOOL }, async ($, e) => {
+    try {
+      return { result: (await papercutTool($, e as unknown as Record<string, unknown> & { agentId?: string })) as never }
+    } catch (err) {
+      return { result: `revo-flow papercut : ${errText(err)}` as never }
+    }
+  }).catch(() => ({ result: 'revo-flow papercut : indisponible pour l’instant ; continue ta tâche.' as never }))
+
   // L'outil verif : aucune exception ne remonte, l'erreur est dite en texte.
   on('tool.call', { tool: VERIF_TOOL }, async ($, e) => {
     try {
@@ -5747,7 +6005,7 @@ export const register: Register = (on, options) => {
   // Ce que chacun fait en direct, et les fichiers modifiés : seulement pendant un flow.
   on('tool.call', async ($, e, next) => {
     const tool = String(e.tool)
-    if (tool === PLAN_TOOL || tool === STEP_TOOL || tool === VERIF_TOOL || tool === MOBILE_TOOL) return next(e)
+    if (tool === PLAN_TOOL || tool === STEP_TOOL || tool === VERIF_TOOL || tool === MOBILE_TOOL || tool === PAPERCUT_TOOL) return next(e)
     if (tool === 'SendMessage' && e.agentId === undefined) await noteRework($, e as unknown as Record<string, unknown>).catch(() => undefined)
     const input = e as unknown as Record<string, unknown>
     // La garde anti-merge (v3.3) : dans un flow ou non, pour l'orchestrateur comme pour un sous-agent.
@@ -5839,6 +6097,8 @@ export const register: Register = (on, options) => {
     } catch {
       // idem
     }
+    // La trajectoire d'un sous-agent du flow (v3.7), hors éclaireurs et hors outils de revo-flow : une série d'échecs l'alerte.
+    if (opts.papercuts && flow && who !== 'lead' && !scouts.has(e.agentId ?? '') && tool !== CACHE_TOOL) return kept(await trackTrajectoire($, flow, who, tool, ran, failed))
     return kept(ran)
   }).catch(($, e, next) =>
     // Un plantage du hook : l'outil passe, sauf un outil navigateur du vérificateur (la preuve web se ferme par prudence).

@@ -1888,6 +1888,12 @@ test('consignes v2 : la porte vérifie, testeur et vérificateur proposés avec 
   expect(agentBrief(a, 'fiches', [], false)).not.toMatch(/mcp__revo-flow__verif/)
   expect(agentBrief(agentOf({ subagentType: 'Explore', tasks: [] }))).not.toMatch(/mcp__revo-flow__verif/)
   expect(agentBrief(agentOf({ subagentType: 'revo-flow:verifier', tasks: [] }))).not.toMatch(/mcp__revo-flow__verif/)
+  // La réponse bornée (v3.7) : pour tous les agents, sauf le vérificateur, dont les verdicts et preuves restent complets.
+  expect(agentBrief(a)).toMatch(/15 lignes au plus/)
+  expect(agentBrief(agentOf({ subagentType: 'Explore', tasks: [] }))).toMatch(/15 lignes au plus/)
+  const juge = agentBrief(agentOf({ subagentType: 'revo-flow:verifier', tasks: [] }))
+  expect(juge).not.toMatch(/15 lignes au plus/)
+  expect(juge).toMatch(/mcp__revo-flow__papercut/)
 })
 
 test('historique : la colonne vérif (✓, ✗ accepté, observé, —)', () => {

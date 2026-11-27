@@ -323,6 +323,14 @@ Le journal de 61 flows avec porte, sur le poste de l'auteur, a remplacé le flow
 - **Le coût reste une estimation côté client**, avec les tarifs publics des modèles ; le rapport le dit.
 - **Version 3.6.0.**
 
+## Ce que l'article d'Uber change (2026-11-27)
+
+Uber Engineering, « How Uber Evals 1 Million Agent Skill Invocations a Month » (2026-11-24), sur l'évaluation de leurs skills d'agents. Livré en v3.7.
+
+- **Retenu** : les **papercuts** (l'agent signale lui-même ce qui l'a gêné, regroupé et rappelé aux flows suivants) ; l'**agent bloqué** (les sessions qui partent mal font beaucoup plus d'erreurs d'outils : alerte après 3 échecs de suite) ; les **réponses bornées** (un résumé de 15 lignes, pour que l'orchestrateur ne repaie pas un gros contexte à chaque tour).
+- **Ne s'applique pas à un mod mono-poste** : la marketplace de skills, aifx, les niveaux de skills, l'infrastructure d'évaluation à grande échelle. Un seul poste et un seul utilisateur n'ont ni catalogue à gouverner ni millions d'appels à mesurer.
+- **Existait déjà** : l'exécution de commandes plutôt que de modèle (la porte lance lint, typage et tests), le budget par flow (v3.6), et Code Mode (v3.6.1).
+
 ## Sources
 
 - Sonar, « verification gap », 2026-01-08 [lu] : https://www.sonarsource.com/company/press-releases/sonar-data-reveals-critical-verification-gap-in-ai-coding/

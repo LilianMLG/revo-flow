@@ -69,6 +69,8 @@ export type ViewData = {
   verif: VerifView | null
   /** La dernière capture de la preuve web ou mobile (base64 PNG nue) et son nom (« capture-2.png ») ; remplie par register.tsx. */
   capture?: { png: string; nom: string }
+  /** Les papercuts (v3.7) : signalés pendant ce flow, et connus du projet ; absent quand l'option est coupée. */
+  papercuts?: { flow: number; projet: number }
 }
 
 /** Ce que les boutons du panneau déclenchent : branchés par register.tsx. */
@@ -132,6 +134,8 @@ export type Card = {
   isLead: boolean
   /** Le bouton « Relancer » : un agent en échec, ou qui attend un autre agent. */
   canRetry?: boolean
+  /** « semble bloqué : 3 échecs de suite (Bash) » : un agent actif qui enchaîne les échecs d'outils (v3.7). */
+  bloque?: string
 }
 
 const IDLE_AFTER_MS = 90_000
@@ -434,6 +438,12 @@ export function cacheLine(d: ViewData, columns = 100): string | undefined {
   return p ? `${p.text}${p.stale > 0 ? ` · ⚠ ${p.stale} périmé${p.stale > 1 ? 's' : ''}` : ''}` : undefined
 }
 
+/** `papercuts : 2 ce flow · 5 au projet` ; undefined sans papercut connu du projet. */
+export function papercutsLine(d: Pick<ViewData, 'papercuts'>): string | undefined {
+  const p = d.papercuts
+  return p && p.projet > 0 ? `papercuts : ${p.flow} ce flow · ${p.projet} au projet` : undefined
+}
+
 /** Les lignes « ↳ cache : … » d'une carte : ce que le cache a donné à cet agent (« lead » pour l'orchestrateur). */
 function cacheDetail(d: ViewData, key: string): Line[] {
   const mine = d.cache?.noeuds.filter(n => n.hit === key) ?? []
@@ -530,6 +540,7 @@ function agentCard(a: FlowAgent, index: number, d: ViewData): Card {
       : {}),
     isLead: false,
     canRetry: a.status === 'failed' || isBlocked,
+    ...(a.status === 'running' && a.bloque ? { bloque: `semble bloqué : ${plural(a.bloque.suite, 'échec')} de suite (${a.bloque.outil})` } : {}),
   }
 }
 
@@ -731,6 +742,7 @@ export function DesktopPane(t: Elements['desktop'], d: ViewData, actions: PaneAc
   const p = pill(d)
   const isPending = isPendingPlan(d)
   const budget = budgetView(d)
+  const papercuts = papercutsLine(d)
 
   const line = (l: Line, i: number) => (
     <Text
@@ -853,6 +865,7 @@ export function DesktopPane(t: Elements['desktop'], d: ViewData, actions: PaneAc
               </Box>
               {c.lines.length > 0 && <Svg source={ruleSvg(cardInner)} alt="" width={cardInner} />}
               <Box flexDirection="column">{c.lines.map(line)}</Box>
+              {c.bloque && <Svg source={verifNoteSvg({ mark: '⚠', tone: 'warn', text: c.bloque, width: cardInner })} alt={`⚠ ${c.bloque}`} width={cardInner} />}
               {!c.isLead && c.tone === 'live' && (
                 <Box justifyContent="flex-end" width="100%">
                   <Button key={`stop-${c.id}`} plain label="Arrêter" onPress={() => actions.stopAgent(c.id)} />
@@ -1013,6 +1026,7 @@ export function DesktopPane(t: Elements['desktop'], d: ViewData, actions: PaneAc
             width={inner}
           />
         )}
+        {papercuts && <Svg source={verifNoteSvg({ mark: '✎', tone: 'dim', text: papercuts, width: inner })} alt={papercuts} width={inner} />}
         {d.context && (
           <Svg
             source={usageRowSvg({
@@ -1070,6 +1084,7 @@ export function TerminalPane(t: Elements['terminal'], d: ViewData, actions: Pane
   const p = pill(d)
   const isPending = isPendingPlan(d)
   const budget = budgetView(d)
+  const papercuts = papercutsLine(d)
   const running = all.filter(c => c.tone === 'live' && !c.isLead).length
   const where = flow ? [flow.project, flow.branch].filter(Boolean).join(' · ') : ''
   const icon = (tone: Tone) => (tone === 'live' ? '●' : tone === 'wait' ? '○' : tone === 'fail' ? '✕' : '✓')
@@ -1107,6 +1122,11 @@ export function TerminalPane(t: Elements['terminal'], d: ViewData, actions: Pane
         {c.idle ? (
           <Text color={PALETTE.orange} wrap="truncate-end">
             {`  ⚠ ${c.idle}`}
+          </Text>
+        ) : null}
+        {c.bloque ? (
+          <Text color={PALETTE.orange} wrap="truncate-end">
+            {`  ⚠ ${c.bloque}`}
           </Text>
         ) : null}
         {c.lines
@@ -1320,6 +1340,7 @@ export function TerminalPane(t: Elements['terminal'], d: ViewData, actions: Pane
       <Box flexDirection="column">
         {gauge('Session', fmt(total(d.session)), pct.session, [80, 95], d.sessionCostUsd > 0 ? euros(d.sessionCostUsd) : '')}
         {budget && gauge('Budget', budget.text, budget.percent, [80, 100])}
+        {papercuts ? <Text dimColor wrap="truncate-end">{papercuts}</Text> : null}
         {d.context && gauge('Contexte', `${fmt(d.context.tokens)} / ${fmt(d.context.window)}`, d.context.percent, [70, 85])}
         {gauge('Semaine', fmt(week), pct.week)}
         {d.limits.some(l => l.resetsAt) && (

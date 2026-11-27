@@ -4,8 +4,10 @@ import { barSvg, verifNoteSvg, verifRowSvg } from '../../hooks/ui/art'
 import {
   bandNote,
   budgetView,
+  cards,
   criteresSuffix,
   mobileLine,
+  papercutsLine,
   verifCommandRow,
   verifCommandText,
   verifCriteriaText,
@@ -257,5 +259,23 @@ describe('v3.6 : critères, panne, budget et preuve restée sans réponse dans l
     expect(mobileLine(view({ mobile: m({ etat: 'installation', commande: 'flutter run -d x', appareil: 'Pixel 8' }) }))!.text).toBe(
       'preuve mobile : « flutter run -d x » sur Pixel 8 (le premier build peut être long, 15 min au plus)',
     )
+  })
+})
+
+describe('papercuts et agent bloqué (v3.7)', () => {
+  test('papercutsLine : flow et projet ; rien si le projet n’en connaît aucun ou sans option', () => {
+    expect(papercutsLine({ papercuts: { flow: 2, projet: 5 } })).toBe('papercuts : 2 ce flow · 5 au projet')
+    expect(papercutsLine({ papercuts: { flow: 0, projet: 0 } })).toBeUndefined()
+    expect(papercutsLine({})).toBeUndefined()
+  })
+
+  test('la carte d’un agent actif bloqué porte « semble bloqué » ; pas sans bloque ni à l’arrêt', () => {
+    const agent = (o: object) => ({ key: 'a1', name: 'API', status: 'running', model: 'sonnet', effort: 'high', modelId: '', tasks: [], tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, costUsd: 0, ...o })
+    const d = (a: object) =>
+      ({ flow: { phase: 'running', agents: [agent(a)], startedAt: 0 }, lead: { tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, costUsd: 0 }, busy: false, now: 1000, cache: null }) as never
+    const bloque = { outil: 'Bash', suite: 3, depuis: 500 }
+    expect(cards(d({ bloque })).find(c => c.id === 'a1')!.bloque).toBe('semble bloqué : 3 échecs de suite (Bash)')
+    expect(cards(d({})).find(c => c.id === 'a1')!.bloque).toBeUndefined()
+    expect(cards(d({ bloque, status: 'done' })).find(c => c.id === 'a1')!.bloque).toBeUndefined()
   })
 })
