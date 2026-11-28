@@ -227,6 +227,15 @@ describe('GitLab (v3.5)', () => {
     expect(finLivraison({ nom: 'PR', url: 'u', brouillon: true, existante: false, base: 'main' })).toBe('PR ouverte en brouillon : u. Tape /ship pour la revue et le suivi ; le merge reste à toi.')
   })
 
+  test('sous Windows, /ship ne fait que la revue : le message de fin et le rapport ne promettent pas le suivi', () => {
+    expect(finLivraison({ nom: 'PR', url: 'u', brouillon: false, existante: false, base: 'main', windows: true })).toBe(
+      'PR ouverte : u. Tape /ship pour la revue (sous Windows, pas de suivi : CI, conflits et commentaires restent à toi) ; le merge reste à toi.',
+    )
+    expect(finLivraison({ nom: 'MR', url: 'u', brouillon: false, existante: true, base: 'develop', windows: true })).toContain('pas de suivi')
+    expect(ligneRapport('u', 'b', false, false, 'PR', true)).toContain('/ship fait la revue (sous Windows, pas de suivi')
+    expect(ligneRapport('u', 'b', false, false, 'PR', true)).not.toContain('la revue et le suivi')
+  })
+
   test('la description d’une MR est coupée plus tôt (elle passe en argument de glab)', () => {
     const r = corpsDePr('x\n'.repeat(20_000), '/h/r.md', CORPS_MAX_GLAB, 'GitLab')
     expect(r.coupe).toBe(true)

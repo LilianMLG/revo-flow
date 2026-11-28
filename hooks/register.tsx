@@ -192,6 +192,7 @@ import {
 import { brancheParDefaut, dossiersDuPush, mergeDenial, refusPrudent, type MergeContexte } from './merge'
 import { addPapercut, papercutBrief, papercutListText, parsePapercut, readPapercuts, stepTrajectoire, struggleHint, type Papercut, type Trajectoire } from './papercut'
 import { rapportMarkdown } from './rapport'
+import { STEWARD_PATH, stewardSkill, type StewardEntree } from './steward'
 import {
   BUDGET_CHOIX,
   budgetAction,
@@ -1103,9 +1104,11 @@ async function livrer($: $, flow: Flow, verif: VerifJournal | undefined, g: Gate
     url = ops.lireUrl(creation.stdout) ?? ops.lireUrl(creation.sortie)
     if (!creation.ok || !url) return echec(`${ops.cli} ${ops.nom === 'MR' ? 'mr' : 'pr'} create`, creation.sortie)
   }
-  if (texteRapport) await $.fs.write(rapport, `${texteRapport.trimEnd()}\n${ligneRapport(url, cible, brouillon, !!ouverte, ops.nom)}`).catch(() => undefined)
+  // Sous Windows, le suivi de /ship ne démarre pas : le rapport et le message de fin ne le promettent pas.
+  const windows = await isWindows($)
+  if (texteRapport) await $.fs.write(rapport, `${texteRapport.trimEnd()}\n${ligneRapport(url, cible, brouillon, !!ouverte, ops.nom, windows)}`).catch(() => undefined)
   await setFlow($, f => (f.id === flow.id ? { ...f, livraison: { url, branche: cible } } : f))
-  const fin = finLivraison({ nom: ops.nom, url, brouillon, existante: !!ouverte, base })
+  const fin = finLivraison({ nom: ops.nom, url, brouillon, existante: !!ouverte, base, windows })
   $.ui.toast(`revo-flow · « ${flow.title} » : ${fin}`)
   await notify($, `« ${flow.title} » : ${fin.split('. ')[0]}`)
 }
@@ -1333,6 +1336,42 @@ async function papercutsCommand($: $, isClear: boolean): Promise<string> {
   await $.store.delete(papercutsKey(ref.cle))
   await update($, papercutsA, v => (v ? { ...v, projet: 0 } : v))
   return `revo-flow papercuts · ${ref.nom} : ${plural(n, 'papercut')} effacé${n > 1 ? 's' : ''}.`
+}
+
+const STEWARD_RAPPEL =
+  'Le fichier n’est pas commité : commite-le toi-même (/ship ne commite jamais les fichiers de .claude/). Il est lu par le suivi de /ship et /steward sur Mac et Linux, et par PR Steward dans le cloud ; pas par le suivi local sous Windows.'
+
+/** Ce que revo-flow sait du projet pour les règles maison : papercuts, et commandes (si confirmées), instables et pièges de projet.verif. */
+async function stewardEntree($: $, ref: ProjectRef): Promise<StewardEntree> {
+  const papercuts = await projectPapercuts($, ref)
+  const pv = (await graphOf($, ref).catch(() => null))?.projet.verif
+  return { papercuts, commandes: pv?.confirme ? pv.commandes : [], instables: pv?.instables ?? [], pieges: pv?.pieges ?? [] }
+}
+
+/** Le message quand il n'y a rien à écrire : fichier absent et aucune règle, ou texte inchangé ; undefined sinon. */
+function stewardRien(nom: string, existant: string | undefined, texte: string, regles: number): string | undefined {
+  if (existant === undefined && !regles) return `revo-flow steward · ${nom} : aucune règle à écrire pour l’instant (ni papercut répété, ni commande de vérification confirmée, ni test instable).`
+  if (texte === existant) return `revo-flow steward · ${nom} : ${STEWARD_PATH} est déjà à jour (${plural(regles, 'règle')}).`
+  return undefined
+}
+
+/**
+ * /revo-flow steward : écrit les règles maison de .claude/skills/steward/SKILL.md (stewardSkill) à partir des papercuts répétés du projet,
+ * de ses commandes de vérification confirmées, de ses tests instables et de ses pièges. Le texte hors du bloc généré est gardé ; écriture
+ * après confirmation (Écrire / Annuler ; sans personne à qui demander ou dialogue fermé : rien n'est écrit).
+ */
+async function stewardCommand($: $): Promise<string> {
+  const ref = await resolveProject(ioOf($)).catch(() => undefined)
+  if (!ref) return 'revo-flow steward : pas de projet git ici.'
+  const chemin = `${normalizePath(ref.racine)}/${STEWARD_PATH}`
+  const existant = await $.fs.read(chemin).then(t => (typeof t === 'string' ? t : undefined), () => undefined)
+  const { texte, regles } = stewardSkill(existant, await stewardEntree($, ref))
+  const rien = stewardRien(ref.nom, existant, texte, regles)
+  if (rien) return rien
+  const answer = await askOr($, `Écrire ${STEWARD_PATH} dans ${ref.nom} (${plural(regles, 'règle')}) ?`, ['Écrire', 'Annuler'], { headless: 'Annuler', dismissed: 'Annuler' })
+  if (answer !== 'Écrire') return `revo-flow steward · ${ref.nom} : rien n’a été écrit.`
+  await $.fs.write(chemin, texte)
+  return `revo-flow steward · ${ref.nom} : ${STEWARD_PATH} écrit (${plural(regles, 'règle')}).\n${STEWARD_RAPPEL}`
 }
 
 // ── Cache projet ─────────────────────────────────────────────────────────
@@ -5382,8 +5421,8 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'revo-flow',
       description:
-        'revo-flow <demande> : l’orchestrateur lit les specs, fait le plan, répartit les tâches entre des sous-agents et suit chacun dans le panneau · statut · panneau · stop · historique [n] : les derniers flows, leur coût et le bilan par modèle · papercuts [clear] : ce qui a gêné les agents sur ce projet · cache [projet | build [feature | --top N | --tout] | clear [feature] | mot-clé] : le graphe et les fiches de features du projet',
-      argumentHint: '<demande> | statut | panneau | stop | historique [n] | papercuts [clear] | cache [projet | build [feature|--top N|--tout] | clear [feature] | mot-clé]',
+        'revo-flow <demande> : l’orchestrateur lit les specs, fait le plan, répartit les tâches entre des sous-agents et suit chacun dans le panneau · statut · panneau · stop · historique [n] : les derniers flows, leur coût et le bilan par modèle · papercuts [clear] : ce qui a gêné les agents sur ce projet · steward : les règles maison des PR (.claude/skills/steward/SKILL.md) tirées de ce que revo-flow a appris · cache [projet | build [feature | --top N | --tout] | clear [feature] | mot-clé] : le graphe et les fiches de features du projet',
+      argumentHint: '<demande> | statut | panneau | stop | historique [n] | papercuts [clear] | steward | cache [projet | build [feature|--top N|--tout] | clear [feature] | mot-clé]',
       // statut, panneau, stop et cache répondent tout de suite, même pendant un tour ; une nouvelle demande part
       // par prompt.submit, qui attend de toute façon que la session soit libre.
       immediate: true,
@@ -5433,6 +5472,14 @@ export const register: Register = (on, options) => {
         return { text: await papercutsCommand($, pc[1] === 'clear') }
       } catch (err) {
         return { text: `revo-flow papercuts : ${errText(err)}` }
+      }
+    }
+    // `steward` : les règles maison de .claude/skills/steward/SKILL.md (suivi de /ship, PR Steward), écrites après confirmation.
+    if (word === 'steward') {
+      try {
+        return { text: await stewardCommand($) }
+      } catch (err) {
+        return { text: `revo-flow steward : ${errText(err)}` }
       }
     }
     if (word === 'stop') {

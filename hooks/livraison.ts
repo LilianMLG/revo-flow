@@ -256,14 +256,21 @@ export function defautDeGlab(json: string): string | undefined {
   }
 }
 
-/** La ligne ajoutée au rapport du flow une fois la PR ou la MR ouverte ou mise à jour. */
-export const ligneRapport = (url: string, branche: string, brouillon: boolean, existante: boolean, nom: Demande = 'PR') =>
-  `\n## Livraison\n\n${existante ? `Poussé sur la ${nom}` : brouillon ? `${nom} ouverte en brouillon` : `${nom} ouverte`} : ${url} (branche ${branche}). Le merge reste à l'utilisateur ; /ship fait la revue et le suivi.\n`
+/**
+ * Ce que /ship fait sur ce poste : la revue et le suivi (CI, conflits, commentaires), sauf sous Windows où le suivi ne
+ * démarre pas (guide Claude Ship : sous Windows, /ship ouvre la PR et la relit, mais ne la suit pas).
+ */
+const shipFait = (windows: boolean) => (windows ? 'la revue (sous Windows, pas de suivi : CI, conflits et commentaires restent à toi)' : 'la revue et le suivi')
 
-/** Le toast de fin de livraison : ce qui est fait, et /ship à taper (sur GitLab, avec la branche de base). */
-export function finLivraison(o: { nom: Demande; url: string; brouillon: boolean; existante: boolean; base: string }): string {
+/** La ligne ajoutée au rapport du flow une fois la PR ou la MR ouverte ou mise à jour. */
+export const ligneRapport = (url: string, branche: string, brouillon: boolean, existante: boolean, nom: Demande = 'PR', windows = false) =>
+  `\n## Livraison\n\n${existante ? `Poussé sur la ${nom}` : brouillon ? `${nom} ouverte en brouillon` : `${nom} ouverte`} : ${url} (branche ${branche}). Le merge reste à l'utilisateur ; /ship fait ${shipFait(windows)}.\n`
+
+/** Le toast de fin de livraison : ce qui est fait, et /ship à taper (sur GitLab, avec la branche de base ; sous Windows, sans suivi). */
+export function finLivraison(o: { nom: Demande; url: string; brouillon: boolean; existante: boolean; base: string; windows?: boolean }): string {
   const fait = o.existante ? `poussé sur la ${o.nom} ${o.url}` : `${o.nom} ${o.brouillon ? 'ouverte en brouillon' : 'ouverte'} : ${o.url}`
-  const ship = o.nom === 'MR' ? `Tape /ship pour la revue et le suivi (sur GitLab, donne-lui la branche de base ${o.base})` : 'Tape /ship pour la revue et le suivi'
+  const pour = `Tape /ship pour ${shipFait(!!o.windows)}`
+  const ship = o.nom === 'MR' ? `${pour} (sur GitLab, donne-lui la branche de base ${o.base})` : pour
   return `${fait}. ${ship} ; le merge reste à toi.`
 }
 
