@@ -1103,9 +1103,11 @@ async function livrer($: $, flow: Flow, verif: VerifJournal | undefined, g: Gate
     url = ops.lireUrl(creation.stdout) ?? ops.lireUrl(creation.sortie)
     if (!creation.ok || !url) return echec(`${ops.cli} ${ops.nom === 'MR' ? 'mr' : 'pr'} create`, creation.sortie)
   }
-  if (texteRapport) await $.fs.write(rapport, `${texteRapport.trimEnd()}\n${ligneRapport(url, cible, brouillon, !!ouverte, ops.nom)}`).catch(() => undefined)
+  // Sous Windows, le suivi de /ship ne démarre pas : le rapport et le message de fin ne le promettent pas.
+  const windows = await isWindows($)
+  if (texteRapport) await $.fs.write(rapport, `${texteRapport.trimEnd()}\n${ligneRapport(url, cible, brouillon, !!ouverte, ops.nom, windows)}`).catch(() => undefined)
   await setFlow($, f => (f.id === flow.id ? { ...f, livraison: { url, branche: cible } } : f))
-  const fin = finLivraison({ nom: ops.nom, url, brouillon, existante: !!ouverte, base })
+  const fin = finLivraison({ nom: ops.nom, url, brouillon, existante: !!ouverte, base, windows })
   $.ui.toast(`revo-flow · « ${flow.title} » : ${fin}`)
   await notify($, `« ${flow.title} » : ${fin.split('. ')[0]}`)
 }
