@@ -96,6 +96,7 @@ Run it first on a new project. It is read-only: it shows what revo-flow detected
 | `/revo-flow stop` | stop the running agents and the orchestrator's turn, after confirmation |
 | `/revo-flow doctor` | what revo-flow found on the project (read-only) |
 | `/revo-flow papercuts [clear]` | friction reports filed by agents on this project (v3.7) |
+| `/revo-flow steward` | writes `.claude/skills/steward/SKILL.md`, the PR house rules read by `/ship` and `/steward` follow-up (Mac, Linux) and by PR Steward in the cloud: papercuts seen at least twice, confirmed check commands to run before pushing, flaky tests, traps; only the generated block between markers is rewritten, your own rules are kept; written after confirmation, never committed |
 | `/revo-flow version` | the mod version |
 | `/revo-flow cache` | the project's file graph and feature sheets |
 | `/revo-flow cache build` / `clear` / `<keyword>` | rebuild, delete, or search the cache |
